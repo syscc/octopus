@@ -37,14 +37,14 @@ func TestCreateAccountTokenCreatesManagedKeyAndSyncsAccount(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&createdBody); err != nil {
 				t.Fatalf("decode create token body failed: %v", err)
 			}
-			_, _ = w.Write([]byte(`{"success":true,"message":""}`))
+			_, _ = w.Write([]byte(`{"success":true,"data":"sk-managed-created-key"}`))
 		case r.URL.Path == "/api/token/" && r.Method == http.MethodGet:
 			if r.Header.Get("Authorization") != "Bearer test-access-token" || r.Header.Get("New-API-User") != "11494" {
 				w.WriteHeader(http.StatusUnauthorized)
 				_, _ = w.Write([]byte(`{"success":false,"message":"无权进行此操作，未提供 New-Api-User"}`))
 				return
 			}
-			_, _ = w.Write([]byte(`{"data":{"items":[{"id":1,"name":"managed-created-name","key":"sk-man**********-key","group":"vip","status":1}]}}`))
+			_, _ = w.Write([]byte(`{"data":{"items":[]}}`))
 		case r.URL.Path == "/api/token/batch/keys" && r.Method == http.MethodPost:
 			batchCalled = true
 			if r.Header.Get("Authorization") != "Bearer test-access-token" || r.Header.Get("New-API-User") != "11494" {
@@ -102,8 +102,8 @@ func TestCreateAccountTokenCreatesManagedKeyAndSyncsAccount(t *testing.T) {
 	if result == nil || result.TokenCount != 1 {
 		t.Fatalf("unexpected sync result: %+v", result)
 	}
-	if !batchCalled {
-		t.Fatalf("expected create-and-sync to recover the new key from the batch endpoint")
+	if batchCalled {
+		t.Fatalf("did not expect batch endpoint when create response contains plaintext key")
 	}
 	if createdBody["group"] != "vip" {
 		t.Fatalf("expected created group to be vip, got %#v", createdBody["group"])
@@ -321,6 +321,90 @@ func TestSiteTokenCreateSucceededFromAnyRequiresExplicitPrimitiveTrue(t *testing
 	}
 	if !siteTokenCreateSucceededFromAny(true) {
 		t.Fatalf("expected boolean true primitive to be successful")
+	}
+}
+
+func TestCreatedSiteTokenExtractionRejectsUntrustedStatusValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload any
+		want    string
+	}{
+		{name: "top-level string", payload: "sk-top-level", want: ""},
+		{name: "success only", payload: map[string]any{"success": true}, want: ""},
+		{name: "message only", payload: map[string]any{"message": "sk-message"}, want: ""},
+		{name: "data message", payload: map[string]any{"data": map[string]any{"message": "sk-message"}}, want: ""},
+		{name: "data result", payload: map[string]any{"data": "result"}, want: ""},
+		{name: "data unauthorized", payload: map[string]any{"data": "unauthorized"}, want: ""},
+		{name: "masked data", payload: map[string]any{"data": "sk-cre**********-key"}, want: ""},
+		{name: "empty data", payload: map[string]any{"data": " "}, want: ""},
+		{name: "numeric key", payload: map[string]any{"data": map[string]any{"key": float64(123)}}, want: ""},
+		{name: "numeric token", payload: map[string]any{"data": map[string]any{"token": 123}}, want: ""},
+		{name: "numeric string token", payload: map[string]any{"data": "123456"}, want: "123456"},
+		{name: "list scalar", payload: map[string]any{"items": []any{"sk-list-value"}}, want: ""},
+		{name: "plaintext data", payload: map[string]any{"data": "sk-created-plain-key"}, want: "sk-created-plain-key"},
+		{name: "plaintext data key", payload: map[string]any{"data": map[string]any{"key": "sk-created-plain-key"}}, want: "sk-created-plain-key"},
+		{name: "token containing error text", payload: map[string]any{"data": "sk-error-marker-is-valid"}, want: "sk-error-marker-is-valid"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := extractSiteTokenValueFromPayload(test.payload); got != test.want {
+				t.Fatalf("expected token %q, got %q", test.want, got)
+			}
+		})
+	}
+}
+
+func TestCreatedSiteTokenResponseRejectsFailureMarkers(t *testing.T) {
+	failurePayloads := map[string]any{
+		"success false with token": map[string]any{"success": false, "data": "sk-created-plain-key"},
+		"non-zero code":            map[string]any{"code": 401, "data": "sk-created-plain-key"},
+		"non-numeric code":         map[string]any{"code": "AUTH_FAILED", "data": "sk-created-plain-key"},
+		"non-numeric error code":   map[string]any{"error_code": "TOKEN_DENIED", "data": "sk-created-plain-key"},
+		"non-empty errors":         map[string]any{"errors": []any{"denied"}, "data": "sk-created-plain-key"},
+		"conflicting success":      map[string]any{"success": true, "code": "AUTH_FAILED", "data": "sk-created-plain-key"},
+		"failed status":            map[string]any{"status": "failed", "data": "sk-created-plain-key"},
+		"unauthorized data":        map[string]any{"code": 0, "data": "unauthorized"},
+	}
+	for name, payload := range failurePayloads {
+		t.Run(name, func(t *testing.T) {
+			if siteTokenCreateSucceededFromAny(payload) {
+				t.Fatalf("expected failure response to be rejected: %#v", payload)
+			}
+			if created := createdSiteTokenFromPayload(payload, "vip", "created-name"); created != nil {
+				t.Fatalf("expected no token from failure response, got %+v", created)
+			}
+		})
+	}
+
+	for _, payload := range []map[string]any{
+		{
+			"code": 0,
+			"data": map[string]any{"id": 31, "key": "sk-created-plain-key"},
+		},
+		{
+			"code":   "0",
+			"errors": []any{},
+			"data":   "sk-created-plain-key",
+		},
+	} {
+		if !siteTokenCreateSucceededFromAny(payload) {
+			t.Fatalf("expected successful code envelope to remain valid: %#v", payload)
+		}
+	}
+	if created := createdSiteTokenFromPayload(map[string]any{
+		"status": "success",
+		"data":   "sk-created-plain-key",
+	}, "vip", "created-name"); created == nil {
+		t.Fatal("expected success status with plaintext data to remain valid")
+	}
+	if created := createdSiteTokenFromPayload(map[string]any{
+		"success": true,
+		"message": "completed without error",
+		"data":    "sk-created-plain-key",
+	}, "vip", "created-name"); created == nil {
+		t.Fatal("expected explicit success to take precedence over informational message text")
 	}
 }
 

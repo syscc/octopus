@@ -1,6 +1,6 @@
 services:
   octopus:
-    image: syscc/octopus
+    image: syscc/octopus:latest
     ports:
        - '8080:8080'
     volumes:      

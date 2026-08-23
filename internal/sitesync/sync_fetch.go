@@ -125,7 +125,7 @@ func parseManagedTokenKeys(payload map[string]any) map[string]string {
 			continue
 		}
 		for remoteID, rawValue := range values {
-			value := strings.TrimSpace(jsonString(rawValue))
+			value := siteTokenStringValue(rawValue)
 			if value == "" {
 				value = extractSiteTokenValueFromPayload(rawValue)
 			}

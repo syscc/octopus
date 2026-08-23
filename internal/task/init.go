@@ -23,6 +23,13 @@ const (
 	TaskWebDAVBackup      = "webdav_backup"
 )
 
+// ModelInfoUpdateTask refreshes the model pricing metadata.
+func ModelInfoUpdateTask() {
+	if err := price.UpdateLLMPrice(context.Background()); err != nil {
+		log.Warnf("failed to update price info: %v", err)
+	}
+}
+
 func Init() {
 	priceUpdateIntervalHours, err := op.SettingGetInt(model.SettingKeyModelInfoUpdateInterval)
 	if err != nil {
@@ -31,11 +38,7 @@ func Init() {
 	}
 	priceUpdateInterval := time.Duration(priceUpdateIntervalHours) * time.Hour
 	// 注册价格更新任务
-	Register(string(model.SettingKeyModelInfoUpdateInterval), priceUpdateInterval, true, func() {
-		if err := price.UpdateLLMPrice(context.Background()); err != nil {
-			log.Warnf("failed to update price info: %v", err)
-		}
-	})
+	Register(string(model.SettingKeyModelInfoUpdateInterval), priceUpdateInterval, true, ModelInfoUpdateTask)
 
 	// 注册基础URL延迟任务
 	Register(TaskBaseUrlDelay, 24*time.Hour, true, ChannelBaseUrlDelayTask)

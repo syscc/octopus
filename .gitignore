@@ -11,3 +11,10 @@ static/out/
 docs/
 CONTEXT.md
 .impeccable.md
+
+# Local agent/workflow artifacts
+.pi-subagents/
+.spec-workflow/
+plans/
+reports/
+.DS_Store

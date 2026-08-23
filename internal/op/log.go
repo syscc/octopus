@@ -672,31 +672,32 @@ func relayLogListCursor(ctx context.Context, filter RelayLogListFilter, cachedLo
 	if limit < 1 || limit > 100 {
 		limit = 20
 	}
-	logs := make([]model.RelayLog, 0, limit)
+
+	pendingLogs := make([]model.RelayLog, 0, len(cachedLogs))
+	pendingIDs := make(map[int64]struct{}, len(cachedLogs))
 	for _, entry := range cachedLogs {
 		if !relayLogBeforeCursor(entry, filter.BeforeTime, filter.BeforeID) {
 			continue
 		}
-		logs = append(logs, entry)
-		if len(logs) >= limit+1 {
-			break
-		}
+		pendingLogs = append(pendingLogs, entry)
+		pendingIDs[entry.ID] = struct{}{}
 	}
 
-	if enabled && len(logs) < limit+1 {
-		remaining := limit + 1 - len(logs)
+	var dbLogs []model.RelayLog
+	if enabled {
+		// Every pending candidate can consume one DB row after the cache/DB
+		// overlap is deduplicated, so over-fetch by that many rows.
+		queryLimit := limit + 1 + len(pendingIDs)
 		query := db.GetDB().WithContext(ctx)
 		query = applyRelayLogDBFilters(query, filter)
 		query = applyRelayLogCursor(query, filter.BeforeTime, filter.BeforeID)
 		query = selectRelayLogListFields(query, filter.IncludeContent)
-
-		var dbLogs []model.RelayLog
-		if err := query.Order("time DESC").Order("id DESC").Limit(remaining).Find(&dbLogs).Error; err != nil {
+		if err := query.Order("time DESC").Order("id DESC").Limit(queryLimit).Find(&dbLogs).Error; err != nil {
 			return RelayLogListResult{}, err
 		}
-		logs = appendDedupedByID(logs, cachedLogs, dbLogs)
 	}
 
+	logs := mergeRelayLogCursorLogs(pendingLogs, dbLogs, limit)
 	hasMore := len(logs) > limit
 	if hasMore {
 		logs = logs[:limit]
@@ -707,6 +708,35 @@ func relayLogListCursor(ctx context.Context, filter RelayLogListFilter, cachedLo
 		nextCursor = &RelayLogCursor{Time: last.Time, ID: last.ID}
 	}
 	return RelayLogListResult{Logs: logs, HasMore: hasMore, NextCursor: nextCursor}, nil
+}
+
+func mergeRelayLogCursorLogs(pendingLogs, dbLogs []model.RelayLog, limit int) []model.RelayLog {
+	byID := make(map[int64]model.RelayLog, len(pendingLogs)+len(dbLogs))
+	for _, entry := range pendingLogs {
+		if _, exists := byID[entry.ID]; !exists {
+			byID[entry.ID] = entry
+		}
+	}
+	for _, entry := range dbLogs {
+		if _, exists := byID[entry.ID]; !exists {
+			byID[entry.ID] = entry
+		}
+	}
+
+	all := make([]model.RelayLog, 0, len(byID))
+	for _, entry := range byID {
+		all = append(all, entry)
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].Time != all[j].Time {
+			return all[i].Time > all[j].Time
+		}
+		return all[i].ID > all[j].ID
+	})
+	if len(all) > limit+1 {
+		all = all[:limit+1]
+	}
+	return all
 }
 
 func relayLogBeforeCursor(entry model.RelayLog, beforeTime *int64, beforeID *int64) bool {

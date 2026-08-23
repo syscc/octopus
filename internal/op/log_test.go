@@ -297,6 +297,91 @@ func TestRelayLogListCursorReturnsNextCursorWithoutTotal(t *testing.T) {
 	}
 }
 
+func TestRelayLogListCursorMergesPendingAndDBByStableOrder(t *testing.T) {
+	ctx := setupSiteOpTestDB(t)
+	if err := settingRefreshCache(ctx); err != nil {
+		t.Fatalf("settingRefreshCache failed: %v", err)
+	}
+	resetRelayLogStateForTest()
+	defer resetRelayLogStateForTest()
+
+	rows := []model.RelayLog{
+		{ID: 103, Time: 201, RequestModelName: "db-overlap", Success: true},
+		{ID: 101, Time: 199, RequestModelName: "db-older", Success: true},
+	}
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&rows).Error; err != nil {
+		t.Fatalf("create relay logs failed: %v", err)
+	}
+	relayLogPendingLock.Lock()
+	relayLogPending = []model.RelayLog{
+		{ID: 103, Time: 201, RequestModelName: "pending-overlap", Success: true},
+		{ID: 102, Time: 200, RequestModelName: "pending-middle", Success: true},
+	}
+	relayLogPendingLock.Unlock()
+
+	first, err := RelayLogListWithFilter(ctx, RelayLogListFilter{Limit: 2})
+	if err != nil {
+		t.Fatalf("first cursor page failed: %v", err)
+	}
+	if !first.HasMore || first.NextCursor == nil || len(first.Logs) != 2 || first.Logs[0].ID != 103 || first.Logs[1].ID != 102 {
+		t.Fatalf("unexpected first cursor page: %+v", first)
+	}
+	if first.Logs[0].RequestModelName != "pending-overlap" {
+		t.Fatalf("expected pending version to win overlap, got %+v", first.Logs[0])
+	}
+
+	second, err := RelayLogListWithFilter(ctx, RelayLogListFilter{
+		Limit:      2,
+		BeforeTime: &first.NextCursor.Time,
+		BeforeID:   &first.NextCursor.ID,
+	})
+	if err != nil {
+		t.Fatalf("second cursor page failed: %v", err)
+	}
+	if second.HasMore || second.NextCursor != nil || len(second.Logs) != 1 || second.Logs[0].ID != 101 {
+		t.Fatalf("unexpected second cursor page: %+v", second)
+	}
+}
+
+func TestRelayLogListCursorSortsPendingByTimeAndID(t *testing.T) {
+	ctx := setupSiteOpTestDB(t)
+	if err := settingRefreshCache(ctx); err != nil {
+		t.Fatalf("settingRefreshCache failed: %v", err)
+	}
+	resetRelayLogStateForTest()
+	defer resetRelayLogStateForTest()
+
+	row := model.RelayLog{ID: 10, Time: 199, RequestModelName: "db-old", Success: true}
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&row).Error; err != nil {
+		t.Fatalf("create relay log failed: %v", err)
+	}
+	relayLogPendingLock.Lock()
+	relayLogPending = []model.RelayLog{
+		{ID: 11, Time: 200, RequestModelName: "pending-low-id", Success: true},
+		{ID: 12, Time: 200, RequestModelName: "pending-high-id", Success: true},
+	}
+	relayLogPendingLock.Unlock()
+
+	first, err := RelayLogListWithFilter(ctx, RelayLogListFilter{Limit: 2})
+	if err != nil {
+		t.Fatalf("first cursor page failed: %v", err)
+	}
+	if !first.HasMore || first.NextCursor == nil || len(first.Logs) != 2 || first.Logs[0].ID != 12 || first.Logs[1].ID != 11 {
+		t.Fatalf("pending order was not time/id descending: %+v", first)
+	}
+	second, err := RelayLogListWithFilter(ctx, RelayLogListFilter{
+		Limit:      2,
+		BeforeTime: &first.NextCursor.Time,
+		BeforeID:   &first.NextCursor.ID,
+	})
+	if err != nil {
+		t.Fatalf("second cursor page failed: %v", err)
+	}
+	if second.HasMore || len(second.Logs) != 1 || second.Logs[0].ID != 10 {
+		t.Fatalf("unexpected older cursor page: %+v", second)
+	}
+}
+
 func TestRelayLogGetReturnsFullContent(t *testing.T) {
 	ctx := setupSiteOpTestDB(t)
 	if err := settingRefreshCache(ctx); err != nil {

@@ -274,30 +274,213 @@ func siteTokenCreateSucceeded(payload map[string]any) bool {
 }
 
 func siteTokenCreateSucceededFromAny(value any) bool {
-	payload, ok := value.(map[string]any)
-	if !ok {
-		succeeded, ok := value.(bool)
-		return ok && succeeded
-	}
-	if raw, ok := payload["success"]; ok {
-		switch typed := raw.(type) {
-		case bool:
-			return typed
-		case float64:
-			return typed != 0
-		case int:
-			return typed != 0
-		case string:
-			switch strings.ToLower(strings.TrimSpace(typed)) {
-			case "1", "true", "ok", "success":
-				return true
-			case "0", "false", "fail", "failed", "error":
-				return false
-			}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case map[string]any:
+		if raw, ok := typed["success"]; ok {
+			succeeded, recognized := parseSiteTokenSuccessFlag(raw)
+			return recognized && succeeded && !siteTokenExplicitFailure(typed)
 		}
+		return !siteTokenResponseHasFailure(typed)
+	default:
 		return false
 	}
-	return true
+}
+
+func parseSiteTokenSuccessFlag(value any) (bool, bool) {
+	switch typed := value.(type) {
+	case bool:
+		return typed, true
+	case float64:
+		return typed != 0, true
+	case int:
+		return typed != 0, true
+	case int64:
+		return typed != 0, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "1", "true", "ok", "success":
+			return true, true
+		case "0", "false", "fail", "failed", "failure", "error":
+			return false, true
+		default:
+			return false, false
+		}
+	default:
+		return false, false
+	}
+}
+
+func siteTokenResponseHasFailure(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		return siteTokenFailureText(typed)
+	case []any:
+		for _, item := range typed {
+			if siteTokenResponseHasFailure(item) {
+				return true
+			}
+		}
+	case []map[string]any:
+		for _, item := range typed {
+			if siteTokenResponseHasFailure(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		if raw, ok := typed["success"]; ok {
+			if succeeded, recognized := parseSiteTokenSuccessFlag(raw); !recognized || !succeeded {
+				return true
+			}
+		}
+		if siteTokenExplicitFailure(typed) {
+			return true
+		}
+		for _, key := range []string{"message", "msg"} {
+			if raw, ok := typed[key]; ok {
+				if text, ok := raw.(string); ok && siteTokenFailureStatusText(text) {
+					return true
+				}
+			}
+		}
+		for _, key := range []string{"data", "result", "item", "items", "list", "records", "rows", "payload"} {
+			if nested, ok := typed[key]; ok && siteTokenResponseHasFailure(nested) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func siteTokenExplicitFailure(payload map[string]any) bool {
+	for _, key := range []string{"code", "error_code", "errorCode"} {
+		if raw, ok := payload[key]; ok {
+			code, recognized := parseSiteTokenResponseCode(raw)
+			if !recognized || code != 0 {
+				return true
+			}
+		}
+	}
+	if raw, ok := payload["errors"]; ok && siteTokenErrorsValue(raw) {
+		return true
+	}
+	if raw, ok := payload["status"]; ok && siteTokenStatusFailure(raw) {
+		return true
+	}
+	if raw, ok := payload["error"]; ok && siteTokenErrorValue(raw) {
+		return true
+	}
+	return false
+}
+
+func parseSiteTokenResponseCode(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case float64:
+		code := int64(typed)
+		if float64(code) != typed {
+			return 0, false
+		}
+		return code, true
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return 0, false
+		}
+		code, err := strconv.ParseInt(trimmed, 10, 64)
+		return code, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func siteTokenErrorsValue(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case bool:
+		return typed
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case []any:
+		return len(typed) > 0
+	case []map[string]any:
+		return len(typed) > 0
+	case map[string]any:
+		return len(typed) > 0
+	default:
+		return true
+	}
+}
+
+func siteTokenStatusFailure(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return !typed
+	case float64:
+		return typed == 0 || typed >= 400
+	case int:
+		return typed == 0 || typed >= 400
+	case int64:
+		return typed == 0 || typed >= 400
+	case string:
+		return siteTokenFailureStatusText(typed)
+	default:
+		return false
+	}
+}
+
+func siteTokenErrorValue(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case bool:
+		return typed
+	case string:
+		trimmed := strings.TrimSpace(strings.ToLower(typed))
+		return trimmed != "" && trimmed != "none" && trimmed != "null" && trimmed != "nil"
+	default:
+		return true
+	}
+}
+
+func siteTokenFailureText(value string) bool {
+	lowered := strings.ToLower(strings.TrimSpace(value))
+	if lowered == "" {
+		return false
+	}
+	switch lowered {
+	case "0", "false", "error", "fail", "failed", "failure", "unauthorized", "forbidden", "not found", "not_found", "not-found", "denied", "invalid", "expired", "disabled", "inactive", "success", "ok", "true", "message", "msg", "status", "result", "data", "payload", "item", "items", "list", "records", "rows":
+		return true
+	}
+	for _, prefix := range []string{"error:", "fail:", "failed:", "failure:", "unauthorized:", "forbidden:"} {
+		if strings.HasPrefix(lowered, prefix) {
+			return true
+		}
+	}
+	return strings.ContainsAny(lowered, " \t\r\n") && siteTokenFailureStatusText(lowered)
+}
+
+func siteTokenFailureStatusText(value string) bool {
+	lowered := strings.ToLower(strings.TrimSpace(value))
+	if lowered == "" {
+		return false
+	}
+	switch lowered {
+	case "0", "false", "error", "fail", "failed", "failure", "unauthorized", "forbidden", "not found", "not_found", "not-found", "denied", "invalid", "expired", "disabled", "inactive":
+		return true
+	}
+	normalized := strings.NewReplacer("_", " ", "-", " ").Replace(lowered)
+	for _, marker := range []string{"unauthorized", "forbidden", "not found", "failed", "failure", "error", "denied", "invalid token", "permission denied", "access denied", "expired"} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func slicesCompactInts(values []int) []int {
@@ -320,6 +503,9 @@ func slicesCompactInts(values []int) []int {
 }
 
 func createdSiteTokenFromPayload(payload any, groupKey string, name string) *model.SiteToken {
+	if payloadMap, ok := payload.(map[string]any); ok && !siteTokenCreateSucceededFromAny(payloadMap) {
+		return nil
+	}
 	tokenValue := extractSiteTokenValueFromPayload(payload)
 	if tokenValue == "" || model.IsMaskedSiteTokenValue(tokenValue) {
 		return nil
@@ -342,36 +528,60 @@ func createdSiteTokenFromPayload(payload any, groupKey string, name string) *mod
 }
 
 func extractSiteTokenValueFromPayload(value any) string {
+	return extractSiteTokenValue(value, false)
+}
+
+func extractSiteTokenValue(value any, allowDirectString bool) string {
 	switch typed := value.(type) {
 	case string:
-		return ""
+		if !allowDirectString {
+			return ""
+		}
+		return validSiteTokenCandidate(typed)
 	case []any:
 		for _, item := range typed {
-			if candidate := extractSiteTokenValueFromPayload(item); candidate != "" {
+			if candidate := extractSiteTokenValue(item, false); candidate != "" {
 				return candidate
 			}
 		}
 		return ""
 	case []map[string]any:
 		for _, item := range typed {
-			if candidate := extractSiteTokenValueFromPayload(item); candidate != "" {
+			if candidate := extractSiteTokenValue(item, false); candidate != "" {
 				return candidate
 			}
 		}
 		return ""
 	case map[string]any:
 		for _, key := range []string{"key", "token", "api_key", "apiKey", "channel_key", "channelKey"} {
-			if candidate := jsonString(typed[key]); candidate != "" && !model.IsMaskedSiteTokenValue(candidate) {
+			if candidate := siteTokenStringValue(typed[key]); candidate != "" {
 				return candidate
 			}
 		}
 		for _, key := range []string{"data", "result", "item", "items", "list", "records", "rows", "payload"} {
 			if nested, ok := typed[key]; ok {
-				if candidate := extractSiteTokenValueFromPayload(nested); candidate != "" {
+				allowScalar := key == "data" || key == "result" || key == "payload"
+				if candidate := extractSiteTokenValue(nested, allowScalar); candidate != "" {
 					return candidate
 				}
 			}
 		}
 	}
 	return ""
+}
+
+func siteTokenStringValue(value any) string {
+	candidate, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return validSiteTokenCandidate(candidate)
+}
+
+func validSiteTokenCandidate(value string) string {
+	candidate := strings.TrimSpace(value)
+	if candidate == "" || model.IsMaskedSiteTokenValue(candidate) || siteTokenFailureText(candidate) {
+		return ""
+	}
+	return candidate
 }

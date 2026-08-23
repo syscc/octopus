@@ -75,34 +75,42 @@ func setSetting(c *gin.Context) {
 			resp.Error(c, http.StatusBadRequest, err.Error())
 			return
 		}
-		task.Update(string(setting.Key), time.Duration(hours)*time.Hour)
+		task.Configure(string(setting.Key), time.Duration(hours)*time.Hour, true, task.ModelInfoUpdateTask)
 	case model.SettingKeySyncLLMInterval:
 		hours, err := strconv.Atoi(setting.Value)
 		if err != nil {
 			resp.Error(c, http.StatusBadRequest, err.Error())
 			return
 		}
-		task.Update(string(setting.Key), time.Duration(hours)*time.Hour)
-	case model.SettingKeySiteSyncInterval, model.SettingKeySiteCheckinInterval:
+		task.Configure(string(setting.Key), time.Duration(hours)*time.Hour, true, task.SyncModelsTask)
+	case model.SettingKeySiteSyncInterval:
 		hours, err := strconv.Atoi(setting.Value)
 		if err != nil {
 			resp.Error(c, http.StatusBadRequest, err.Error())
 			return
 		}
-		task.Update(string(setting.Key), time.Duration(hours)*time.Hour)
+		task.Configure(string(setting.Key), time.Duration(hours)*time.Hour, true, task.SiteSyncTask)
+	case model.SettingKeySiteCheckinInterval:
+		hours, err := strconv.Atoi(setting.Value)
+		if err != nil {
+			resp.Error(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		task.Configure(string(setting.Key), time.Duration(hours)*time.Hour, true, task.SiteCheckinTask)
+	case model.SettingKeyStatsSaveInterval:
+		minutes, err := strconv.Atoi(setting.Value)
+		if err != nil {
+			resp.Error(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		task.Configure(task.TaskStatsSave, time.Duration(minutes)*time.Minute, false, op.StatsSaveDBTask)
 	case model.SettingKeyWebDAVBackupInterval:
 		hours, err := strconv.Atoi(setting.Value)
 		if err != nil {
 			resp.Error(c, http.StatusBadRequest, err.Error())
 			return
 		}
-		if hours > 0 {
-			interval := time.Duration(hours) * time.Hour
-			task.Register(string(setting.Key), interval, false, task.WebDAVBackupTask)
-			task.Update(string(setting.Key), interval)
-		} else {
-			task.Update(string(setting.Key), 0)
-		}
+		task.Configure(string(setting.Key), time.Duration(hours)*time.Hour, false, task.WebDAVBackupTask)
 	case model.SettingKeyProjectedChannelAutoGroupEnabled:
 		mode, _ := model.ParseAutoGroupSettingValue(setting.Value)
 		if mode != model.AutoGroupTypeNone && projectedAutoGroupQueued.CompareAndSwap(false, true) {

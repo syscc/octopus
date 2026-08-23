@@ -76,6 +76,7 @@ jobs:
         with:
           token: ${{ github.token }}
           files: build/archives/*
+          fail_on_unmatched_files: true
           prerelease: false
           tag_name: ${{ steps.tag.outputs.TAG_NAME }}
 

@@ -238,13 +238,19 @@ build_frontend() {
     
     # Remove old static/out if exists
     if [ -d "static/out" ]; then
-        rm -rf "static/out"
+        if ! rm -rf "static/out"; then
+            log_error "Failed to remove old static/out directory"
+            return 1
+        fi
         log_info "Removed old static/out directory"
     fi
     
     # Move web/out to static/out
     if [ -d "${web_dir}/out" ]; then
-        mv "${web_dir}/out" "static/"
+        if ! mv "${web_dir}/out" "static/"; then
+            log_error "Failed to move frontend output to static/out"
+            return 1
+        fi
         log_success "Moved frontend output to static/out"
     else
         log_error "Frontend output directory not found: ${web_dir}/out"
@@ -310,145 +316,332 @@ build_standard() {
 # Post-build Functions
 # =============================================================================
 
+release_binary_names() {
+    printf '%s\n' \
+        "${APP_NAME}-linux-x86_64" \
+        "${APP_NAME}-linux-arm64" \
+        "${APP_NAME}-linux-armv7" \
+        "${APP_NAME}-linux-x86" \
+        "${APP_NAME}-windows-x86_64" \
+        "${APP_NAME}-windows-x86" \
+        "${APP_NAME}-darwin-arm64" \
+        "${APP_NAME}-darwin-x86_64"
+}
+
+release_binary_is_expected() {
+    local candidate="$1"
+    local expected
+    while IFS= read -r expected; do
+        if [ "${candidate}" = "${expected}" ]; then
+            return 0
+        fi
+    done < <(release_binary_names)
+    return 1
+}
+
+clean_release_archives() {
+    log_step "Cleaning old release archives"
+
+    local archives_dir="${OUTPUT_DIR}/archives"
+    local path
+    if [ ! -d "${archives_dir}" ]; then
+        log_error "Archives directory not found: ${archives_dir}"
+        return 1
+    fi
+    for path in "${archives_dir}"/* "${archives_dir}"/.[!.]* "${archives_dir}"/..?*; do
+        if [ -e "${path}" ] || [ -L "${path}" ]; then
+            if ! rm -rf "${path}"; then
+                log_error "Failed to remove old release artifact: ${path}"
+                return 1
+            fi
+        fi
+    done
+    log_success "Cleaned old release archives"
+}
+
 create_archives() {
     log_step "Creating distribution archives"
 
     local archives_dir="${OUTPUT_DIR}/archives"
+    local failed=0
+    local basename_file
+    local binary_name
+    local extension
+    local source_file
+    local temporary_file
+    local -a expected_binaries=()
+    while IFS= read -r binary_name; do
+        expected_binaries+=("${binary_name}")
+    done < <(release_binary_names)
 
-    # Copy documentation files to archives directory
-    cp README.md LICENSE "${archives_dir}/" 2>/dev/null || log_info "Documentation files not found, skipping"
+    if ! cp README.md LICENSE "${archives_dir}/" 2>/dev/null; then
+        log_error "Failed to copy README.md and LICENSE to ${archives_dir}"
+        return 1
+    fi
 
-    # Archive all binaries (zip format for all platforms)
-    while IFS= read -r -d '' file; do
-        local basename_file
-        basename_file=$(basename "$file")
-        local extension=""
-
-        # Add .exe extension for Windows binaries
-        if [[ "$basename_file" == *"-windows-"* ]]; then
+    for basename_file in "${expected_binaries[@]}"; do
+        source_file="${OUTPUT_DIR}/bin/${basename_file}"
+        extension=""
+        if [[ "${basename_file}" == *"-windows-"* ]]; then
             extension=".exe"
         fi
+        temporary_file="${archives_dir}/${APP_NAME}${extension}"
 
-        if ! cp "$file" "${archives_dir}/${APP_NAME}${extension}" 2>/dev/null; then
-            log_error "Failed to copy $file to ${archives_dir}/${APP_NAME}${extension}"
+        if [ ! -f "${source_file}" ]; then
+            log_error "Binary not found: ${source_file}"
+            failed=1
+            continue
+        fi
+        if ! rm -f "${archives_dir}/${basename_file}.zip"; then
+            log_error "Failed to remove old archive: ${archives_dir}/${basename_file}.zip"
+            failed=1
+            continue
+        fi
+        if ! cp "${source_file}" "${temporary_file}" 2>/dev/null; then
+            log_error "Failed to copy ${source_file} to ${temporary_file}"
+            failed=1
             continue
         fi
 
         if (cd "${archives_dir}" && zip -q "${basename_file}.zip" "${APP_NAME}${extension}" README.md LICENSE 2>/dev/null); then
-            rm -f "${archives_dir}/${APP_NAME}${extension}"
             log_success "Archived: archives/${basename_file}.zip"
         else
             log_error "Failed to create archive: ${basename_file}.zip"
-            rm -f "${archives_dir}/${APP_NAME}${extension}"
+            failed=1
         fi
-    done < <(find "${OUTPUT_DIR}/bin/" -name "${APP_NAME}-*" -type f -print0 2>/dev/null)
+        if ! rm -f "${temporary_file}"; then
+            log_error "Failed to remove temporary archive binary: ${temporary_file}"
+            failed=1
+        fi
+        if [ ! -f "${archives_dir}/${basename_file}.zip" ]; then
+            log_error "Archive was not created: ${archives_dir}/${basename_file}.zip"
+            failed=1
+        fi
+    done
 
-    # Cleanup documentation files from archives directory
-    rm -f "${archives_dir}/README.md" "${archives_dir}/LICENSE"
-
-    if ! cd .. 2>/dev/null; then
-        log_error "Failed to return to parent directory"
+    if ! rm -f "${archives_dir}/README.md" "${archives_dir}/LICENSE"; then
+        log_error "Failed to clean documentation files from ${archives_dir}"
+        failed=1
+    fi
+    if [ "${failed}" -ne 0 ]; then
         return 1
     fi
-
     log_success "Created archives in ${archives_dir}/"
 }
 
 generate_checksums() {
     log_step "Generating checksums"
 
-    local bin_dir="${OUTPUT_DIR}/bin"
+    local archives_dir="${OUTPUT_DIR}/archives"
+    local binary_name
+    local archive_name
+    local checksum_count
+    local -a expected_archives=()
+    while IFS= read -r binary_name; do
+        expected_archives+=("${binary_name}.zip")
+    done < <(release_binary_names)
 
-    if ! cd "${bin_dir}" 2>/dev/null; then
-        log_error "Failed to change to bin directory: ${bin_dir}"
+    if [ ! -d "${archives_dir}" ]; then
+        log_error "Archives directory not found: ${archives_dir}"
         return 1
     fi
+    for archive_name in "${expected_archives[@]}"; do
+        if [ ! -f "${archives_dir}/${archive_name}" ]; then
+            log_error "Expected archive not found: ${archives_dir}/${archive_name}"
+            return 1
+        fi
+    done
 
-    if ! find . -maxdepth 1 -name "${APP_NAME}-*" -type f | head -1 | grep -q .; then
-        log_info "No build artifacts found in bin directory, skipping checksums"
-        cd ../.. 2>/dev/null || true
-        return 0
-    fi
-
-    # Use appropriate checksum command based on OS
-    local checksum_cmd
     if command_exists md5sum; then
-        checksum_cmd="md5sum"
+        if ! (cd "${archives_dir}" && md5sum "${expected_archives[@]}" >md5.txt.tmp 2>/dev/null); then
+            log_error "Failed to generate archive checksums"
+            rm -f "${archives_dir}/md5.txt.tmp"
+            return 1
+        fi
     elif command_exists md5; then
-        checksum_cmd="md5 -r" # -r for BSD md5 to match md5sum format
+        if ! (cd "${archives_dir}" && md5 -r "${expected_archives[@]}" >md5.txt.tmp 2>/dev/null); then
+            log_error "Failed to generate archive checksums"
+            rm -f "${archives_dir}/md5.txt.tmp"
+            return 1
+        fi
     else
         log_error "No checksum command available (md5sum or md5)"
-        cd ../.. 2>/dev/null || true
         return 1
     fi
 
-    if find . -maxdepth 1 -name "${APP_NAME}-*" -type f -print0 | xargs -0 $checksum_cmd >md5.txt 2>/dev/null; then
-        local checksum_count=$(wc -l <md5.txt 2>/dev/null || echo "0")
-        log_success "Generated checksums for ${checksum_count} files in bin/"
-    else
-        log_error "Failed to generate checksums"
-        cd ../.. 2>/dev/null || true
+    if ! mv "${archives_dir}/md5.txt.tmp" "${archives_dir}/md5.txt"; then
+        log_error "Failed to finalize archive checksums"
+        rm -f "${archives_dir}/md5.txt.tmp"
         return 1
     fi
-
-    if ! cd ../.. 2>/dev/null; then
-        log_error "Failed to return to parent directory"
+    checksum_count=$(wc -l <"${archives_dir}/md5.txt")
+    if [ "${checksum_count}" -ne "${#expected_archives[@]}" ]; then
+        log_error "Expected ${#expected_archives[@]} archive checksum entries, found ${checksum_count}"
         return 1
     fi
+    log_success "Generated checksums for ${checksum_count} release archives"
 }
 
 prepare_docker_binaries() {
     log_step "Preparing Docker binaries"
 
     local docker_dir="${OUTPUT_DIR}/docker"
-
-    # Create docker directory under OUTPUT_DIR
-    if ! mkdir -p "${docker_dir}"; then
-        log_error "Failed to create docker directory: ${docker_dir}"
-        log_error "Current working directory: $(pwd)"
-        log_error "Directory permissions: $(ls -la . 2>/dev/null || echo 'Cannot list directory')"
-        return 1
-    fi
-
-    local platforms=(
+    local failed=0
+    local platform
+    local arch
+    local docker_platform
+    local binary_name
+    local source_file
+    local target_file
+    local -a platforms=(
         "x86_64:linux/amd64"
         "x86:linux/386"
         "armv7:linux/arm/v7"
         "arm64:linux/arm64"
     )
 
-    local copied_count=0
+    if ! mkdir -p "${docker_dir}"; then
+        log_error "Failed to create docker directory: ${docker_dir}"
+        return 1
+    fi
 
     for platform in "${platforms[@]}"; do
-        local arch="${platform%%:*}"
-        local docker_platform="${platform#*:}"
-        local binary_name="${APP_NAME}-linux-${arch}"
-        local platform_dir="${docker_dir}/${docker_platform}"
+        arch="${platform%%:*}"
+        docker_platform="${platform#*:}"
+        binary_name="${APP_NAME}-linux-${arch}"
+        source_file="${OUTPUT_DIR}/bin/${binary_name}"
+        target_file="${docker_dir}/${docker_platform}/${APP_NAME}"
 
-        if ! mkdir -p "${platform_dir}"; then
-            log_error "Failed to create directory: ${platform_dir}"
-            log_error "Docker platform: ${docker_platform}"
+        if ! mkdir -p "${docker_dir}/${docker_platform}"; then
+            log_error "Failed to create directory: ${docker_dir}/${docker_platform}"
+            failed=1
             continue
         fi
+        if [ ! -f "${source_file}" ]; then
+            log_error "Binary not found: ${source_file}"
+            failed=1
+            continue
+        fi
+        if ! cp "${source_file}" "${target_file}" 2>/dev/null; then
+            log_error "Failed to copy ${source_file} to ${target_file}"
+            failed=1
+            continue
+        fi
+        if [ ! -f "${target_file}" ]; then
+            log_error "Docker binary was not created: ${target_file}"
+            failed=1
+            continue
+        fi
+        log_success "Copied bin/${binary_name} -> docker/${docker_platform}/${APP_NAME}"
+    done
 
-        # Try to copy from binary file first
-        if [ -f "${OUTPUT_DIR}/bin/${binary_name}" ]; then
-            if cp "${OUTPUT_DIR}/bin/${binary_name}" "${platform_dir}/${APP_NAME}" 2>/dev/null; then
-                log_success "Copied bin/${binary_name} → docker/${docker_platform}/${APP_NAME}"
-                ((copied_count++))
-            else
-                log_error "Failed to copy bin/${binary_name} to ${platform_dir}/${APP_NAME}"
-            fi
-        else
-            log_warning "Binary not found: bin/${binary_name}"
+    if [ "${failed}" -ne 0 ]; then
+        return 1
+    fi
+    log_success "Prepared Docker binaries in ${docker_dir}/"
+}
+
+validate_release_artifacts() {
+    log_step "Validating release artifacts"
+
+    local failed=0
+    local binary_name
+    local archive_file_name
+    local docker_platform
+    local checksum_count
+    local archive_path
+    local archive_name
+    local path
+    local entry_name
+    local archive_count=0
+    local archives_dir="${OUTPUT_DIR}/archives"
+    local -a expected_binaries=()
+    local -a expected_archives=()
+    local -a docker_platforms=("linux/amd64" "linux/386" "linux/arm/v7" "linux/arm64")
+    while IFS= read -r binary_name; do
+        expected_binaries+=("${binary_name}")
+        expected_archives+=("${binary_name}.zip")
+    done < <(release_binary_names)
+
+    for binary_name in "${expected_binaries[@]}"; do
+        if [ ! -f "${OUTPUT_DIR}/bin/${binary_name}" ]; then
+            log_error "Missing release binary: ${OUTPUT_DIR}/bin/${binary_name}"
+            failed=1
+        fi
+        if [ ! -f "${archives_dir}/${binary_name}.zip" ]; then
+            log_error "Missing release archive: ${archives_dir}/${binary_name}.zip"
+            failed=1
+        fi
+    done
+    for docker_platform in "${docker_platforms[@]}"; do
+        if [ ! -f "${OUTPUT_DIR}/docker/${docker_platform}/${APP_NAME}" ]; then
+            log_error "Missing Docker binary: ${OUTPUT_DIR}/docker/${docker_platform}/${APP_NAME}"
+            failed=1
         fi
     done
 
-    if [ $copied_count -gt 0 ]; then
-        log_success "Prepared ${copied_count} Docker binaries in ${docker_dir}/"
+    if [ ! -f "${archives_dir}/md5.txt" ]; then
+        log_error "Missing release checksum asset: ${archives_dir}/md5.txt"
+        failed=1
     else
-        log_warning "No Docker binaries prepared"
+        checksum_count=$(wc -l <"${archives_dir}/md5.txt")
+        if [ "${checksum_count}" -ne "${#expected_archives[@]}" ]; then
+            log_error "Expected ${#expected_archives[@]} archive checksum entries, found ${checksum_count}"
+            failed=1
+        fi
+        if ! awk 'NF < 2 || length($1) != 32 || $1 !~ /^[0-9a-fA-F]+$/ { exit 1 }' "${archives_dir}/md5.txt"; then
+            log_error "Release checksum asset contains an invalid MD5 entry"
+            failed=1
+        fi
+        for archive_file_name in "${expected_archives[@]}"; do
+            if ! awk -v expected="${archive_file_name}" '$NF == expected { found = 1 } END { exit found ? 0 : 1 }' "${archives_dir}/md5.txt"; then
+                log_error "Missing checksum entry for ${archive_file_name}"
+                failed=1
+            fi
+        done
     fi
+
+    for archive_path in "${archives_dir}"/*.zip; do
+        if [ ! -f "${archive_path}" ]; then
+            continue
+        fi
+        archive_count=$((archive_count + 1))
+        archive_name="${archive_path##*/}"
+        archive_name="${archive_name%.zip}"
+        if ! release_binary_is_expected "${archive_name}"; then
+            log_error "Unexpected release archive: ${archive_path}"
+            failed=1
+        fi
+    done
+    if [ "${archive_count}" -ne "${#expected_binaries[@]}" ]; then
+        log_error "Expected ${#expected_binaries[@]} release archives, found ${archive_count}"
+        failed=1
+    fi
+
+    for path in "${archives_dir}"/* "${archives_dir}"/.[!.]* "${archives_dir}"/..?*; do
+        if [ -e "${path}" ] || [ -L "${path}" ]; then
+            entry_name="${path##*/}"
+            case "${entry_name}" in
+            md5.txt)
+                ;;
+            *.zip)
+                if [ ! -f "${path}" ]; then
+                    log_error "Release archive is not a regular file: ${path}"
+                    failed=1
+                fi
+                ;;
+            *)
+                log_error "Unexpected release archive entry: ${path}"
+                failed=1
+                ;;
+            esac
+        fi
+    done
+
+    if [ "${failed}" -ne 0 ]; then
+        return 1
+    fi
+    log_success "Release artifact manifest is complete"
 }
 
 # =============================================================================
@@ -563,6 +756,10 @@ main() {
             log_error "Failed to prepare build environment"
             exit 1
         fi
+        if ! clean_release_archives; then
+            log_error "Failed to clean old release archives"
+            exit 1
+        fi
 
         # Build frontend
         if ! build_frontend; then
@@ -578,44 +775,63 @@ main() {
 
         # Build for different platforms
         log_step "Building binaries"
+        local release_failed=0
 
         # Standard builds (pure Go, static binaries)
         if ! build_standard linux x86_64; then
             log_error "Failed to build Linux x86_64"
+            release_failed=1
         fi
         if ! build_standard linux arm64; then
             log_error "Failed to build Linux arm64"
+            release_failed=1
         fi
         if ! build_standard linux armv7; then
             log_error "Failed to build Linux armv7"
+            release_failed=1
         fi
         if ! build_standard linux x86; then
             log_error "Failed to build Linux x86"
+            release_failed=1
         fi
         if ! build_standard windows x86_64; then
             log_error "Failed to build Windows x86_64"
+            release_failed=1
         fi
         if ! build_standard windows x86; then
             log_error "Failed to build Windows x86"
+            release_failed=1
         fi
         if ! build_standard darwin arm64; then
             log_error "Failed to build Darwin arm64"
+            release_failed=1
         fi
         if ! build_standard darwin x86_64; then
-            log_error "Failed to build Darwin arm64"
+            log_error "Failed to build Darwin x86_64"
+            release_failed=1
+        fi
+
+        if [ "${release_failed}" -ne 0 ]; then
+            log_error "One or more release platform builds failed"
+            exit 1
         fi
 
         # Post-processing
         if ! prepare_docker_binaries; then
-            log_warning "Failed to prepare Docker binaries, but continuing..."
+            log_error "Failed to prepare Docker binaries"
+            exit 1
         fi
-
-        if ! generate_checksums; then
-            log_warning "Failed to generate checksums, but continuing..."
-        fi
-
         if ! create_archives; then
-            log_warning "Failed to create archives, but continuing..."
+            log_error "Failed to create archives"
+            exit 1
+        fi
+        if ! generate_checksums; then
+            log_error "Failed to generate checksums"
+            exit 1
+        fi
+        if ! validate_release_artifacts; then
+            log_error "Release artifact validation failed"
+            exit 1
         fi
 
         log_step "Build completed"
