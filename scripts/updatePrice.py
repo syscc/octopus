@@ -4,6 +4,8 @@
 生成 internal/price/presets.go 文件
 """
 
+from __future__ import annotations
+
 import json
 import re
 import urllib.request
@@ -146,50 +148,67 @@ def generate_entry(model_id: str, cost: dict) -> str:
     return f'\t"{model_id}": {{Input: {input_price}, Output: {output_price}, CacheRead: {cache_read}, CacheWrite: {cache_write}}},'
 
 
+def collect_price_entries(raw_price: dict, providers: list[str] | None = None) -> tuple[dict[str, dict], dict[str, int], list[tuple[str, str, str]]]:
+    """收集全局唯一的模型价格；重复 ID 按 provider 顺序由后者覆盖。"""
+    providers = providers or PROVIDERS
+    entries: dict[str, dict] = {}
+    sources: dict[str, str] = {}
+    provider_counts: dict[str, int] = {}
+    conflicts: list[tuple[str, str, str]] = []
+
+    for provider in providers:
+        provider_models = raw_price.get(provider)
+        if provider_models is None:
+            continue
+
+        provider_ids: set[str] = set()
+        for model_data in provider_models.get("models", {}).values():
+            model_id = str(model_data.get("id", "")).strip().lower()
+            if not model_id:
+                continue
+
+            cost = model_data.get("cost", {})
+            candidates = [model_id]
+            candidates.extend(generate_claude_aliases(model_id))
+            candidates.extend(MODEL_ALIASES.get(model_id, []))
+
+            for candidate in candidates:
+                normalized_id = candidate.strip().lower()
+                if not normalized_id or normalized_id in provider_ids:
+                    continue
+                provider_ids.add(normalized_id)
+
+                source = f"{provider}:{model_id}"
+                if normalized_id in entries and entries[normalized_id] != cost:
+                    conflicts.append((normalized_id, sources[normalized_id], source))
+                entries[normalized_id] = cost
+                sources[normalized_id] = source
+
+        provider_counts[provider] = len(provider_ids)
+
+    return entries, provider_counts, conflicts
+
+
 def main():
     print(f"Fetching price data from {LLM_PRICE_URL}...")
     raw_price = fetch_price_data()
-    
-    entries = []
-    model_count = 0
-    
+    price_entries, provider_counts, conflicts = collect_price_entries(raw_price)
+
     for provider in PROVIDERS:
         if provider not in raw_price:
             print(f"  Provider '{provider}' not found, skipping...")
             continue
-            
-        models = raw_price[provider].get("models", {})
-        provider_count = 0
-        
-        for model_data in models.values():
-            model_id = model_data.get("id", "").lower()
-            cost = model_data.get("cost", {})
-            
-            if not model_id:
-                continue
-            
-            # 添加原始模型
-            entries.append(generate_entry(model_id, cost))
-            provider_count += 1
-            
-            # 收集所有别名
-            aliases = []
-            
-            # 1. Claude 模型自动生成别名
-            aliases.extend(generate_claude_aliases(model_id))
-            
-            # 2. 静态别名映射
-            if model_id in MODEL_ALIASES:
-                aliases.extend(MODEL_ALIASES[model_id])
-            
-            # 添加别名 (去重)
-            for alias in set(aliases):
-                entries.append(generate_entry(alias.lower(), cost))
-                provider_count += 1
-            
-        print(f"  {provider}: {provider_count} models")
-        model_count += provider_count
-    
+        print(f"  {provider}: {provider_counts.get(provider, 0)} models")
+
+    for model_id, previous_source, current_source in conflicts:
+        print(f"  Warning: duplicate model ID '{model_id}', overriding {previous_source} with {current_source}")
+
+    entries = [
+        generate_entry(model_id, cost)
+        for model_id, cost in sorted(price_entries.items())
+    ]
+    model_count = len(entries)
+
     # 生成 Go 文件内容
     update_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     content = PRESETS_GO_TEMPLATE.format(
