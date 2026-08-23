@@ -596,6 +596,35 @@ func TestSiteAccountUpdateRejectsInvalidMergedCredentials(t *testing.T) {
 	}
 }
 
+func TestSiteUpdatePersistsDefaultRouteType(t *testing.T) {
+	ctx := setupSiteOpTestDB(t)
+	site := &model.Site{
+		Name:     "default-route-site",
+		Platform: model.SitePlatformAPI,
+		BaseURL:  "https://example.com",
+		Enabled:  true,
+	}
+	if err := SiteCreate(site, ctx); err != nil {
+		t.Fatalf("SiteCreate failed: %v", err)
+	}
+
+	routeType := model.SiteModelRouteTypeOpenAIResponse
+	updated, err := SiteUpdate(&model.SiteUpdateRequest{ID: site.ID, DefaultRouteType: &routeType}, ctx)
+	if err != nil {
+		t.Fatalf("SiteUpdate failed: %v", err)
+	}
+	if updated.DefaultRouteType != routeType {
+		t.Fatalf("expected default route type %q, got %q", routeType, updated.DefaultRouteType)
+	}
+	reloaded, err := SiteGet(site.ID, ctx)
+	if err != nil {
+		t.Fatalf("SiteGet failed: %v", err)
+	}
+	if reloaded.DefaultRouteType != routeType {
+		t.Fatalf("expected persisted default route type %q, got %q", routeType, reloaded.DefaultRouteType)
+	}
+}
+
 func TestSiteUpdateMergesRouteBaseURLs(t *testing.T) {
 	ctx := setupSiteOpTestDB(t)
 

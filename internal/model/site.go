@@ -19,8 +19,8 @@ const (
 	SitePlatformOneAPI    SitePlatform = "one-api"
 	SitePlatformOneHub    SitePlatform = "one-hub"
 	SitePlatformDoneHub   SitePlatform = "done-hub"
-	SitePlatformSub2API SitePlatform = "sub2api"
-	SitePlatformAPI     SitePlatform = "api"
+	SitePlatformSub2API   SitePlatform = "sub2api"
+	SitePlatformAPI       SitePlatform = "api"
 )
 
 type SiteCredentialType string
@@ -339,6 +339,7 @@ type SiteUpdateRequest struct {
 	Name               *string             `json:"name,omitempty"`
 	Platform           *SitePlatform       `json:"platform,omitempty"`
 	BaseURL            *string             `json:"base_url,omitempty"`
+	DefaultRouteType   *SiteModelRouteType `json:"default_route_type,omitempty"`
 	Enabled            *bool               `json:"enabled,omitempty"`
 	ProxyMode          *ProxyUsageMode     `json:"proxy_mode,omitempty"`
 	ProxyConfigID      *int                `json:"proxy_config_id,omitempty"`
@@ -927,6 +928,9 @@ func (s *Site) Validate() error {
 	}
 	if err := ValidateSiteTags(s.Tags); err != nil {
 		return err
+	}
+	if s.DefaultRouteType != "" && !IsProjectedSiteModelRouteType(s.DefaultRouteType) {
+		return fmt.Errorf("invalid default route type")
 	}
 	parsed, err := url.Parse(s.BaseURL)
 	if err != nil {

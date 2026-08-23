@@ -17,6 +17,8 @@ interface ToolbarViewOptionsState {
     sortOrders: Partial<Record<ToolbarPage, ToolbarSortOrder>>;
     logDateRange: LogDateRange;
     logChannelIds: number[];
+    logModelNames: string[];
+    logSourceKeyword: string;
     logKeywordMode: LogKeywordMode;
     logKeywordScope: LogKeywordScope;
 
@@ -35,6 +37,8 @@ interface ToolbarViewOptionsState {
 
     setLogDateRange: (value: LogDateRange) => void;
     setLogChannelIds: (value: number[]) => void;
+    setLogModelNames: (value: string[]) => void;
+    setLogSourceKeyword: (value: string) => void;
     setLogKeywordMode: (value: LogKeywordMode) => void;
     setLogKeywordScope: (value: LogKeywordScope) => void;
 }
@@ -47,6 +51,8 @@ export const useToolbarViewOptionsStore = create<ToolbarViewOptionsState>()(
             sortOrders: {},
             logDateRange: {},
             logChannelIds: [],
+            logModelNames: [],
+            logSourceKeyword: '',
             logKeywordMode: 'default',
             logKeywordScope: 'default',
 
@@ -81,6 +87,8 @@ export const useToolbarViewOptionsStore = create<ToolbarViewOptionsState>()(
 
             setLogDateRange: (value) => set({ logDateRange: value }),
             setLogChannelIds: (value) => set({ logChannelIds: value }),
+            setLogModelNames: (value) => set({ logModelNames: value }),
+            setLogSourceKeyword: (value) => set({ logSourceKeyword: value }),
             setLogKeywordMode: (value) => set({ logKeywordMode: value }),
             setLogKeywordScope: (value) => set({ logKeywordScope: value }),
         }),
@@ -92,6 +100,8 @@ export const useToolbarViewOptionsStore = create<ToolbarViewOptionsState>()(
                 sortOrders: state.sortOrders,
                 logDateRange: state.logDateRange,
                 logChannelIds: state.logChannelIds,
+                logModelNames: state.logModelNames,
+                logSourceKeyword: state.logSourceKeyword,
                 logKeywordMode: state.logKeywordMode,
                 logKeywordScope: state.logKeywordScope,
             }),

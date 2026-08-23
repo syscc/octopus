@@ -125,6 +125,10 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 		return
 	}
 
+	// 同协议优先：对普通候选做稳定排序；明确的 sticky/replay 渠道保持首位，
+	// 其他 OpenAI 协议渠道作为回落候选，不删除任何候选。
+	applyProtocolPreference(inboundType, iter, c.Request.Context())
+
 	// === 早期心跳 ===
 	// 在所有 forward / 重试 / 退避之前启动早期心跳协程，覆盖前置阶段（连接慢、failover、退避叠加）
 	// 期间向客户端发 SSE 注释字节，避免被 Cloudflare 在 120s 零字节阈值上判 524。
@@ -141,8 +145,8 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 		metrics.SetWSMode(dbmodel.RelayLogWSModeReplay)
 		metrics.SetWSRecovery(dbmodel.RelayLogWSRecoveryReplay)
 	}
-	responsesPassthroughRequired := internalRequest.HasOpenAIResponsesPassthrough()
-	responsesPassthroughCapableFound := false
+	responsesPassthroughRequired := requiresNativeResponsesUpstream(internalRequest)
+	var nativeResponses nativeResponsesAvailability
 
 	// 请求级上下文
 	req := &relayRequest{
@@ -188,23 +192,31 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 			log.Warnf("failed to get channel %d: %v", item.ChannelID, err)
 			iter.Skip(item.ChannelID, 0, fmt.Sprintf("channel_%d", item.ChannelID), fmt.Sprintf("channel not found: %v", err))
 			lastErr = err
+			if responsesPassthroughRequired {
+				nativeResponses.markUnavailable()
+			}
 			continue
 		}
 		if !channel.Enabled {
 			iter.Skip(channel.ID, 0, channel.Name, "channel disabled")
+			if responsesPassthroughRequired && isOpenAIProtocolChannel(channel.Type) {
+				nativeResponses.markCandidate(channel.Type)
+				nativeResponses.markUnavailable()
+			}
 			continue
 		}
 		if responsesPassthroughRequired {
-			if channel.Type == outbound.OutboundTypeOpenAIResponse {
-				responsesPassthroughCapableFound = true
-			} else {
-				iter.Skip(channel.ID, 0, channel.Name, "openai responses passthrough required")
+			nativeResponses.markCandidate(channel.Type)
+			if !isOpenAIProtocolChannel(channel.Type) {
+				iter.Skip(channel.ID, 0, channel.Name, "native openai responses upstream required")
 				continue
 			}
 		}
 
-		// 出站适配器
-		outAdapter := outbound.Get(channel.Type)
+		// 对 OpenAI Chat/Responses 渠道，本次首选出站协议由下游请求决定；
+		// Channel.Type 仅作为能力提示和端点不支持时的回落目标。
+		outboundType := outboundTypeForRequest(internalRequest, channel.Type)
+		outAdapter := outbound.Get(outboundType)
 		if outAdapter == nil {
 			iter.Skip(channel.ID, 0, channel.Name, fmt.Sprintf("unsupported channel type: %d", channel.Type))
 			continue
@@ -247,6 +259,9 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 			if len(selectOpts.ExcludeKeyIDs) == 0 {
 				iter.Skip(channel.ID, 0, channel.Name, "no available key")
 			}
+			if responsesPassthroughRequired && isOpenAIProtocolChannel(channel.Type) {
+				nativeResponses.markUnavailable()
+			}
 			continue
 		}
 
@@ -267,16 +282,18 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 				}
 
 				// 重建 outAdapter 以重置流式状态（toolIndex, toolCalls 等）
-				outAdapter = outbound.Get(channel.Type)
+				outAdapter = outbound.Get(outboundType)
 			}
 
 			// 构造尝试级上下文
 			ra := &relayAttempt{
-				relayRequest:         req,
-				outAdapter:           outAdapter,
-				channel:              channel,
-				usedKey:              usedKey,
-				firstTokenTimeOutSec: group.FirstTokenTimeOut,
+				relayRequest:          req,
+				outAdapter:            outAdapter,
+				activeOutboundType:    outboundType,
+				activeOutboundTypeSet: true,
+				channel:               channel,
+				usedKey:               usedKey,
+				firstTokenTimeOutSec:  group.FirstTokenTimeOut,
 			}
 
 			result = ra.attempt()
@@ -285,8 +302,16 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 			}
 		}
 
-		// 同通道重试耗尽后记录熔断器失败
-		if !result.Success && !result.Written && !result.Canceled && !result.ResetConversation {
+		if responsesPassthroughRequired {
+			nativeResponses.markAttempt(result, shouldTryProtocolFallbackForAttempt(internalRequest, channel.Type, result.OutboundType, result.StatusCode, result.Err))
+		}
+
+		protocolUnavailable := isOpenAIInbound(inboundType) &&
+			shouldTryProtocolFallbackForAttempt(internalRequest, channel.Type, result.OutboundType, result.StatusCode, result.Err)
+
+		// 同通道重试耗尽后记录熔断器失败。端点不存在是协议能力信息，
+		// 不能据此熔断整个渠道或改写站点模型路由。
+		if !result.Success && !result.Written && !result.Canceled && !result.ResetConversation && !protocolUnavailable {
 			failureKind := circuitFailureKind(group.RetryEnabled, result.StatusCode)
 			balancer.RecordFailure(channel.ID, usedKey.ID, internalRequest.Model, failureKind)
 			outlierwindow.Report(channel.ID, false, result.StatusCode, time.Now())
@@ -302,7 +327,8 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 			// 成功后，如果是 OpenAI Responses HTTP 请求，保存 replay 状态供后续续接
 			// 注意：exact replay 请求成功后也需要保存新状态，否则只能续接一轮
 			// 优先使用 metrics.InternalResponse（streaming 安全），避免二次 GetInternalResponse 消耗聚合器
-			if inboundType == inbound.InboundTypeOpenAIResponse &&
+			if result.OutboundType == outbound.OutboundTypeOpenAIResponse &&
+				inboundType == inbound.InboundTypeOpenAIResponse &&
 				req.internalRequest.RawAPIFormat == model.APIFormatOpenAIResponse {
 				internalResponse := metrics.InternalResponse
 				if internalResponse == nil {
@@ -364,10 +390,16 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 	}
 
 	// 所有候选通道均失败
-	if responsesPassthroughRequired && !responsesPassthroughCapableFound {
-		err := fmt.Errorf("openai responses native tools require an openai responses channel")
+	if responsesPassthroughRequired && nativeResponses.shouldReportCapabilityError() {
+		err := protocolFallbackError(internalRequest)
 		metrics.SaveWithChannelStats(c.Request.Context(), false, err, iter.Attempts(), false)
-		hb.FlushOrError(c, http.StatusBadRequest, "当前请求包含 OpenAI Responses 原生工具，仅支持 OpenAI Responses 通道直通")
+		hb.FlushOrError(c, http.StatusBadRequest, "当前请求包含 OpenAI Responses 原生能力，仅支持 OpenAI Responses 通道直通")
+		return
+	}
+	if responsesPassthroughRequired && nativeResponses.unavailableBeforeAttempt() {
+		err := fmt.Errorf("native openai responses upstream temporarily unavailable")
+		metrics.SaveWithChannelStats(c.Request.Context(), false, err, iter.Attempts(), false)
+		hb.FlushOrError(c, http.StatusServiceUnavailable, "OpenAI Responses 上游暂时不可用，请稍后重试")
 		return
 	}
 	metrics.SaveWithChannelStats(c.Request.Context(), false, lastErr, iter.Attempts(), false)
@@ -425,7 +457,7 @@ func (ra *relayAttempt) attempt() attemptResult {
 		// 会话保持：更新粘性记录
 		balancer.SetSticky(ra.apiKeyID, ra.requestModel, ra.channel.ID, ra.usedKey.ID)
 
-		return attemptResult{Success: true}
+		return attemptResult{Success: true, StatusCode: statusCode, OutboundType: ra.currentOutboundType()}
 	}
 
 	// ====== 失败 ======
@@ -437,11 +469,12 @@ func (ra *relayAttempt) attempt() attemptResult {
 		op.ChannelKeyUpdate(ra.usedKey)
 		span.End(dbmodel.AttemptFailed, statusCode, fwdErr.Error())
 		return attemptResult{
-			Success:    false,
-			Written:    written,
-			Canceled:   true,
-			Err:        fwdErr,
-			StatusCode: statusCode,
+			Success:      false,
+			Written:      written,
+			Canceled:     true,
+			Err:          fwdErr,
+			StatusCode:   statusCode,
+			OutboundType: ra.currentOutboundType(),
 		}
 	}
 
@@ -470,6 +503,7 @@ func (ra *relayAttempt) attempt() attemptResult {
 		Err:               fmt.Errorf("channel %s failed: %v", ra.channel.Name, fwdErr),
 		StatusCode:        statusCode,
 		RetryAfter:        ra.retryAfter,
+		OutboundType:      ra.currentOutboundType(),
 	}
 }
 
@@ -504,8 +538,8 @@ func parseRequest(inboundType inbound.InboundType, c *gin.Context) ([]byte, *mod
 func (ra *relayAttempt) forward() (int, error) {
 	ctx := ra.requestContext()
 
-	// 尝试上游 WebSocket（仅 OpenAI Response outbound 类型；必须是客户端 WS 入站且新开关显式启用）
-	if ra.channel.Type == outbound.OutboundTypeOpenAIResponse &&
+	// 仅当本次实际使用 Responses 出站协议时尝试上游 WebSocket。
+	if ra.currentOutboundType() == outbound.OutboundTypeOpenAIResponse &&
 		ra.internalRequest.RawAPIFormat == model.APIFormatOpenAIResponse {
 
 		shouldTryWS := false
@@ -522,7 +556,7 @@ func (ra *relayAttempt) forward() (int, error) {
 		}
 
 		if shouldTryWS {
-			statusCode, err := ra.forwardViaWS(ctx)
+			statusCode, err := ra.forwardViaWSIsolated(ctx)
 			if statusCode != -1 {
 				return statusCode, err
 			}
@@ -535,7 +569,27 @@ func (ra *relayAttempt) forward() (int, error) {
 		}
 	}
 
-	return ra.forwardViaHTTP(ctx)
+	requestSnapshot := cloneRequestForAttempt(ra.internalRequest)
+	statusCode, err := ra.forwardViaHTTPIsolated(ctx)
+	if err == nil || ra.streamPayloadWritten.Load() || !shouldTryProtocolFallbackForAttempt(requestSnapshot, ra.channel.Type, ra.currentOutboundType(), statusCode, err) {
+		return statusCode, err
+	}
+
+	fallbackType, ok := alternateOutboundType(requestSnapshot, ra.currentOutboundType())
+	if !ok || !canFallbackToOutbound(requestSnapshot, fallbackType) {
+		return statusCode, err
+	}
+	fallbackAdapter := outbound.Get(fallbackType)
+	if fallbackAdapter == nil {
+		return statusCode, err
+	}
+
+	log.Debugf("upstream protocol endpoint unavailable; retrying channel %s with protocol %d", ra.channel.Name, fallbackType)
+	ra.closeFirstTokenBudget()
+	ra.firstTokenBudget = nil
+	ra.responseCollected.Store(false)
+	ra.setOutboundType(fallbackType)
+	return ra.forwardViaHTTPIsolated(ctx)
 }
 
 // forwardViaWS attempts to forward via upstream WebSocket.
@@ -749,17 +803,63 @@ func (ra *relayAttempt) handleWSStreamResponseV2(ctx context.Context, reader *ws
 	return err
 }
 
+func cloneRequestForAttempt(req *model.InternalLLMRequest) *model.InternalLLMRequest {
+	cloned := cloneInternalRequest(req)
+	if cloned == nil {
+		return nil
+	}
+	if req.StreamOptions != nil {
+		streamOptions := *req.StreamOptions
+		cloned.StreamOptions = &streamOptions
+	}
+	if req.TransformOptions.ArrayInputs != nil {
+		arrayInputs := *req.TransformOptions.ArrayInputs
+		cloned.TransformOptions.ArrayInputs = &arrayInputs
+	}
+	return cloned
+}
+
+// forwardViaHTTPIsolated gives every protocol attempt a private request snapshot.
+// Some outbound adapters normalize request fields in place; those mutations must
+// not leak into a same-channel protocol fallback or a later channel attempt.
+func (ra *relayAttempt) forwardViaHTTPIsolated(ctx context.Context) (statusCode int, err error) {
+	originalRequest := ra.internalRequest
+	if originalRequest == nil {
+		return 0, fmt.Errorf("internal request is nil")
+	}
+	ra.internalRequest = cloneRequestForAttempt(originalRequest)
+	defer func() {
+		ra.internalRequest = originalRequest
+	}()
+	return ra.forwardViaHTTP(ctx)
+}
+
+func (ra *relayAttempt) forwardViaWSIsolated(ctx context.Context) (statusCode int, err error) {
+	originalRequest := ra.internalRequest
+	if originalRequest == nil {
+		return 0, fmt.Errorf("internal request is nil")
+	}
+	ra.internalRequest = cloneRequestForAttempt(originalRequest)
+	defer func() {
+		ra.internalRequest = originalRequest
+	}()
+	return ra.forwardViaWS(ctx)
+}
+
 // forwardViaHTTP forwards the request using traditional HTTP.
 func (ra *relayAttempt) forwardViaHTTP(ctx context.Context) (int, error) {
-	// Check for passthrough capability using interface
+	// OpenAI Responses passthrough is used only when the active outbound
+	// protocol is also Responses.
 	if pt, ok := ra.outAdapter.(model.PassthroughCapable); ok &&
+		ra.currentOutboundType() == outbound.OutboundTypeOpenAIResponse &&
 		len(ra.rawBody) > 0 &&
 		pt.CanPassthrough(ra.internalRequest.RawAPIFormat) {
-		// Additional checks for OpenAI Responses edge cases
+		// Replay/continuation requests need the normalized path. Fresh HTTP and
+		// downstream WebSocket requests may preserve native Responses bytes.
 		if ra.internalRequest.RawAPIFormat == model.APIFormatOpenAIResponse {
-			if ra.c == nil || ra.internalRequest.IsOpenAIExactReplayRequest() || requiresUpstreamWSContinuation(ra.internalRequest) {
-				// Fall through to standard path
-			} else {
+			if ra.internalRequest.IsOpenAIExactReplayRequest() || requiresUpstreamWSContinuation(ra.internalRequest) {
+				// Fall through to standard path.
+			} else if ra.c != nil || requiresNativeResponsesUpstream(ra.internalRequest) {
 				return ra.forwardViaHTTPPassthrough(ctx, pt)
 			}
 		} else {
@@ -791,9 +891,9 @@ func (ra *relayAttempt) forwardViaHTTPPassthrough(ctx context.Context, pt model.
 		return 0, err
 	}
 
-	// Copy headers
+	// Copy headers and keep the outbound protocol's JSON content type.
 	ra.copyHeaders(outboundRequest)
-	if ra.channel.Type == outbound.OutboundTypeOpenAIResponse {
+	if ra.currentOutboundType() == outbound.OutboundTypeOpenAIResponse {
 		outboundRequest.Header.Set("Content-Type", "application/json")
 	}
 
@@ -872,9 +972,9 @@ func (ra *relayAttempt) forwardViaHTTPStandard(ctx context.Context) (int, error)
 		return 0, err
 	}
 
-	// 复制请求头
+	// 复制请求头，并保持实际出站协议的 JSON Content-Type。
 	ra.copyHeaders(outboundRequest)
-	if ra.channel.Type == outbound.OutboundTypeOpenAIResponse {
+	if ra.currentOutboundType() == outbound.OutboundTypeOpenAIResponse {
 		outboundRequest.Header.Set("Content-Type", "application/json")
 	}
 
@@ -909,6 +1009,48 @@ func (ra *relayAttempt) forwardViaHTTPStandard(ctx context.Context) (int, error)
 		return 0, err
 	}
 	return response.StatusCode, nil
+}
+
+// applyProtocolPreference 按下游协议对候选做稳定排序：同协议优先，另一种
+// OpenAI 协议作为回落，其他 provider 保持在最后。它不删除候选。
+func applyProtocolPreference(inboundType inbound.InboundType, iter *balancer.Iterator, ctx context.Context) {
+	if iter == nil || iter.Len() < 2 {
+		return
+	}
+	switch inboundType {
+	case inbound.InboundTypeOpenAIChat:
+		iter.PreferProtocolRank(func(item dbmodel.GroupItem) int {
+			switch channelTypeForPreference(item.ChannelID, ctx) {
+			case outbound.OutboundTypeOpenAIChat:
+				return 0
+			case outbound.OutboundTypeOpenAIResponse:
+				return 1
+			default:
+				return 2
+			}
+		})
+	case inbound.InboundTypeOpenAIResponse:
+		iter.PreferProtocolRank(func(item dbmodel.GroupItem) int {
+			switch channelTypeForPreference(item.ChannelID, ctx) {
+			case outbound.OutboundTypeOpenAIResponse:
+				return 0
+			case outbound.OutboundTypeOpenAIChat:
+				return 1
+			default:
+				return 2
+			}
+		})
+	}
+}
+
+// channelTypeForPreference 从缓存读取通道类型，用于协议偏好排序。读不到时返回一个
+// 不参与任何偏好匹配的哨兵值，保证该类通道保持在原位置。
+func channelTypeForPreference(channelID int, ctx context.Context) outbound.OutboundType {
+	ch, err := op.ChannelGet(channelID, ctx)
+	if err != nil {
+		return outbound.OutboundType(-1)
+	}
+	return ch.Type
 }
 
 func defaultWSModeForRequest(req *model.InternalLLMRequest) dbmodel.RelayLogWSMode {

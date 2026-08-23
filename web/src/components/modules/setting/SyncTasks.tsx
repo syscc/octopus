@@ -3,6 +3,7 @@
 import { useTranslations } from 'next-intl';
 import { CalendarCheck2, CalendarSync, DollarSign, Globe2, RefreshCw, type LucideIcon } from 'lucide-react';
 import { Input } from '@/components/ui/input';
+import { Switch } from '@/components/ui/switch';
 import { Button } from '@/components/ui/button';
 import { SettingKey } from '@/api/endpoints/setting';
 import { useLastSyncTime, useSyncChannel } from '@/api/endpoints/channel';
@@ -11,7 +12,7 @@ import { useCheckinAllSites, useSiteLastCheckinTime, useSiteLastSyncTime, useSyn
 import { toast } from '@/components/common/Toast';
 import { useSettingStore } from '@/stores/setting';
 import { translateSiteMessage } from '@/components/modules/site/site-message';
-import { SettingCard, useSettingField } from './shared';
+import { SettingCard, useSettingField, useSettingToggle } from './shared';
 
 function getErrorMessage(error: unknown, fallback: string) {
     if (error instanceof Error && error.message.trim()) {
@@ -27,7 +28,7 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 // 每行一个定时任务：自动执行间隔（小时）+ 手动触发，可选展示上次执行时间
-function TaskRow({ icon: Icon, label, settingKey, last, running, runLabel, pendingLabel, onRun }: {
+function TaskRow({ icon: Icon, label, settingKey, last, running, runLabel, pendingLabel, onRun, toggle }: {
     icon: LucideIcon;
     label: string;
     settingKey: string;
@@ -36,6 +37,11 @@ function TaskRow({ icon: Icon, label, settingKey, last, running, runLabel, pendi
     runLabel: string;
     pendingLabel: string;
     onRun: () => void;
+    toggle?: {
+        label: string;
+        enabled: boolean;
+        onToggle: (checked: boolean) => void;
+    };
 }) {
     const t = useTranslations('setting');
     const field = useSettingField(settingKey);
@@ -54,6 +60,12 @@ function TaskRow({ icon: Icon, label, settingKey, last, running, runLabel, pendi
                 )}
             </div>
             <div className="flex shrink-0 items-center gap-2">
+                {toggle ? (
+                    <label className="flex items-center gap-2 text-xs text-muted-foreground" title={toggle.label}>
+                        <span className="whitespace-nowrap">{toggle.label}</span>
+                        <Switch checked={toggle.enabled} onCheckedChange={toggle.onToggle} aria-label={toggle.label} />
+                    </label>
+                ) : null}
                 <Input
                     type="number"
                     min="0"
@@ -79,6 +91,7 @@ export function SettingSyncTasks() {
     const syncChannel = useSyncChannel();
     const { data: lastSyncTime } = useLastSyncTime();
     const updatePrice = useUpdateModelPrice();
+    const modelPriceSystemProxy = useSettingToggle(SettingKey.ModelPriceUseSystemProxy);
     const { data: lastUpdateTime } = useLastUpdateTime();
     const syncAllSites = useSyncAllSites();
     const checkinAllSites = useCheckinAllSites();
@@ -119,6 +132,11 @@ export function SettingSyncTasks() {
                 running={updatePrice.isPending}
                 runLabel={t('syncTasks.llmPrice.button')}
                 pendingLabel={t('syncTasks.llmPrice.pending')}
+                toggle={{
+                    label: t('syncTasks.llmPrice.useSystemProxy'),
+                    enabled: modelPriceSystemProxy.enabled,
+                    onToggle: modelPriceSystemProxy.toggle,
+                }}
                 onRun={() => updatePrice.mutate(undefined, {
                     onSuccess: () => toast.success(t('syncTasks.llmPrice.success')),
                     onError: () => toast.error(t('syncTasks.llmPrice.failed')),

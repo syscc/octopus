@@ -1,9 +1,57 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 )
+
+func TestResponseInboundMarksUnknownFieldsAsNativeOnly(t *testing.T) {
+	inbound := &ResponseInbound{}
+	req, err := inbound.TransformRequest(context.Background(), []byte(`{
+		"model":"gpt-4o",
+		"input":"hello",
+		"future_responses_option":{"enabled":true}
+	}`))
+	if err != nil {
+		t.Fatalf("TransformRequest failed: %v", err)
+	}
+	if !req.HasOpenAIResponsesPassthrough() || req.OpenAIResponsesPassthroughReasonTextValue() != "field:future_responses_option" {
+		t.Fatalf("expected unknown field to require native Responses, got required=%t reason=%q", req.HasOpenAIResponsesPassthrough(), req.OpenAIResponsesPassthroughReasonTextValue())
+	}
+}
+
+func TestResponseInboundMapsVerbosityToChatFallback(t *testing.T) {
+	inbound := &ResponseInbound{}
+	req, err := inbound.TransformRequest(context.Background(), []byte(`{
+		"model":"gpt-5",
+		"input":"hello",
+		"text":{"verbosity":"high"}
+	}`))
+	if err != nil {
+		t.Fatalf("TransformRequest failed: %v", err)
+	}
+	if req.HasOpenAIResponsesPassthrough() {
+		t.Fatalf("expected supported verbosity to remain convertible, got reason %q", req.OpenAIResponsesPassthroughReasonTextValue())
+	}
+	if req.Verbosity == nil || *req.Verbosity != "high" {
+		t.Fatalf("expected verbosity high in internal request, got %#v", req.Verbosity)
+	}
+}
+
+func TestResponseInboundMarksReasoningInputNativeOnly(t *testing.T) {
+	inbound := &ResponseInbound{}
+	req, err := inbound.TransformRequest(context.Background(), []byte(`{
+		"model":"gpt-5",
+		"input":[{"type":"reasoning","encrypted_content":"enc"}]
+	}`))
+	if err != nil {
+		t.Fatalf("TransformRequest failed: %v", err)
+	}
+	if !req.HasOpenAIResponsesPassthrough() {
+		t.Fatal("expected reasoning input to require native Responses")
+	}
+}
 
 func TestConvertToInternalRequestPreservesRawInputItems(t *testing.T) {
 	req := &ResponsesRequest{
@@ -141,4 +189,30 @@ func TestConvertToInternalRequestNormalizesTopLevelInputFile(t *testing.T) {
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+func TestConvertToInternalRequestMarksPassthroughForImageGenerationTool(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "gpt-4o",
+		Input: ResponsesInput{Text: stringPtr("draw a cat")},
+		Tools: []ResponsesTool{{
+			Type:         "image_generation",
+			Name:         "img_gen",
+			Size:         "1024x1024",
+			OutputFormat: "png",
+		}},
+	}
+
+	internalReq, err := convertToInternalRequest(req)
+	if err != nil {
+		t.Fatalf("convertToInternalRequest failed: %v", err)
+	}
+	// image_generation 无法用 Chat Completions 表达，必须要求原生 Responses 通道，
+	// 避免工具被 Chat 出站静默丢弃。
+	if !internalReq.HasOpenAIResponsesPassthrough() {
+		t.Fatalf("expected image_generation tool to require OpenAI Responses passthrough")
+	}
+	if ext := internalReq.GetOpenAIExtensions(); !ext.ResponsesPassthroughRequired || ext.ResponsesPassthroughReason != "tool:image_generation" {
+		t.Fatalf("expected passthrough reason tool:image_generation, got %#v", ext)
+	}
 }

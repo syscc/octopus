@@ -29,32 +29,26 @@ import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
 import { useJumpStore } from '@/stores/jump';
 
-export function CardContent({ channel, stats }: { channel: Channel; stats: StatsMetricsFormatted }) {
-    const { setIsOpen } = useMorphingDialog();
-    const updateChannel = useUpdateChannel();
-    const deleteChannel = useDeleteChannel();
-    const requestJump = useJumpStore((state) => state.requestJump);
-    const [isEditing, setIsEditing] = useState(false);
-    const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
-    const [formData, setFormData] = useState<ChannelFormData>({
+function createChannelFormData(channel: Channel): ChannelFormData {
+    return {
         name: channel.name,
         type: channel.type,
         enabled: channel.enabled,
-        base_urls: channel.base_urls?.length ? channel.base_urls : [{ url: '', delay: 0 }],
-        custom_header: channel.custom_header ?? [],
+        base_urls: channel.base_urls?.length ? channel.base_urls.map((item) => ({ ...item })) : [{ url: '', delay: 0 }],
+        custom_header: (channel.custom_header ?? []).map((item) => ({ ...item })),
         ws_mode: channel.ws_mode ?? 'inherit',
         proxy_mode: channel.proxy_mode ?? 'direct',
         proxy_config_id: channel.proxy_config_id ?? null,
         param_override: channel.param_override ?? '',
         keys: channel.keys.length > 0
-            ? channel.keys.map((k) => ({
-                id: k.id,
-                enabled: k.enabled,
-                channel_key: k.channel_key,
-                status_code: k.status_code,
-                last_use_time_stamp: k.last_use_time_stamp,
-                total_cost: k.total_cost,
-                remark: k.remark,
+            ? channel.keys.map((key) => ({
+                id: key.id,
+                enabled: key.enabled,
+                channel_key: key.channel_key,
+                status_code: key.status_code,
+                last_use_time_stamp: key.last_use_time_stamp,
+                total_cost: key.total_cost,
+                remark: key.remark,
             }))
             : [{ enabled: true, channel_key: '', remark: '' }],
         model: channel.model,
@@ -62,7 +56,17 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
         auto_sync: channel.auto_sync,
         auto_group: channel.auto_group,
         match_regex: channel.match_regex ?? '',
-    });
+    };
+}
+
+export function CardContent({ channel, stats }: { channel: Channel; stats: StatsMetricsFormatted }) {
+    const { setIsOpen } = useMorphingDialog();
+    const updateChannel = useUpdateChannel();
+    const deleteChannel = useDeleteChannel();
+    const requestJump = useJumpStore((state) => state.requestJump);
+    const [isEditing, setIsEditing] = useState(false);
+    const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
+    const [formData, setFormData] = useState<ChannelFormData>(() => createChannelFormData(channel));
     const t = useTranslations('channel.detail');
     const tProxy = useTranslations('proxyPool');
 
@@ -155,6 +159,16 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
                 setIsOpen(false);
             }
         });
+    };
+
+    const beginEditing = () => {
+        setFormData(createChannelFormData(channel));
+        setIsEditing(true);
+    };
+
+    const cancelEditing = () => {
+        setFormData(createChannelFormData(channel));
+        setIsEditing(false);
     };
 
     const handleDeleteClick = () => {
@@ -485,7 +499,7 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
                             {!channel.managed ? (
                                 <div className="grid gap-3 sm:grid-cols-2 pt-2">
                                     <Button
-                                        onClick={() => (isConfirmingDelete ? setIsConfirmingDelete(false) : setIsEditing(true))}
+                                        onClick={() => (isConfirmingDelete ? setIsConfirmingDelete(false) : beginEditing())}
                                         variant={isConfirmingDelete ? 'secondary' : 'default'}
                                         className="w-full rounded-2xl h-12"
                                     >
@@ -516,7 +530,7 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
                                 isPending={updateChannel.isPending}
                                 submitText={t('actions.save')}
                                 pendingText={t('actions.saving')}
-                                onCancel={() => setIsEditing(false)}
+                                onCancel={cancelEditing}
                                 cancelText={t('actions.cancel')}
                                 idPrefix="channel"
                             />

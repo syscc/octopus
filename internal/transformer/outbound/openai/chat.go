@@ -155,6 +155,9 @@ func chatPromptCacheKey(request *model.InternalLLMRequest) *string {
 	if request.PromptCacheKey != nil {
 		return request.PromptCacheKey
 	}
+	if request.RawAPIFormat == model.APIFormatOpenAIResponse && request.ResponsesPromptCacheKey != nil {
+		return request.ResponsesPromptCacheKey
+	}
 	key, _ := derivedAnthropicCacheMetadata(request)
 	return key
 }

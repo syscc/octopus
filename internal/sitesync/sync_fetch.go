@@ -3,7 +3,9 @@ package sitesync
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/bestruirui/octopus/internal/apperror"
@@ -25,14 +27,20 @@ type siteModelFetchResult struct {
 }
 
 func fetchManagementTokens(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string) ([]model.SiteToken, error) {
-	payload, err := requestJSONWithManagedAccessToken(ctx, siteRecord, "GET", buildSiteURL(siteRecord.BaseURL, "/api/token/?p=0&size=100"), nil, accessToken, account)
+	payload, err := requestJSONWithManagedAccessToken(ctx, siteRecord, http.MethodGet, buildSiteURL(siteRecord.BaseURL, "/api/token/?p=0&size=100"), nil, accessToken, account)
 	if err != nil {
 		return nil, err
 	}
 	items := parseTokenItems(payload)
+	resolvedKeys := fetchMaskedManagedTokenKeys(ctx, siteRecord, account, accessToken, items, nil)
 	tokens := make([]model.SiteToken, 0, len(items))
 	for index, item := range items {
 		tokenValue := strings.TrimSpace(jsonString(item["key"]))
+		if model.IsMaskedSiteTokenValue(tokenValue) {
+			if remoteID, ok := siteTokenRemoteID(item); ok {
+				tokenValue = firstNonEmptyString(resolvedKeys[strconv.Itoa(remoteID)], tokenValue)
+			}
+		}
 		if tokenValue == "" {
 			continue
 		}
@@ -41,6 +49,107 @@ func fetchManagementTokens(ctx context.Context, siteRecord *model.Site, account 
 		tokens = append(tokens, model.SiteToken{Name: firstNonEmptyString(strings.TrimSpace(jsonString(item["name"])), fmt.Sprintf("token-%d", index+1)), Token: tokenValue, GroupKey: groupKey, GroupName: groupName, Enabled: parseEnabledFlag(item["status"]), Source: "sync", IsDefault: index == 0})
 	}
 	return tokens, nil
+}
+
+func fetchMaskedManagedTokenKeys(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, items []map[string]any, extraHeaders map[string]string) map[string]string {
+	ids := make([]int, 0, len(items))
+	seen := make(map[int]struct{}, len(items))
+	for _, item := range items {
+		if !model.IsMaskedSiteTokenValue(jsonString(item["key"])) {
+			continue
+		}
+		remoteID, ok := siteTokenRemoteID(item)
+		if !ok {
+			continue
+		}
+		if _, ok := seen[remoteID]; ok {
+			continue
+		}
+		seen[remoteID] = struct{}{}
+		ids = append(ids, remoteID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	request := func(method string, path string, body any) (map[string]any, error) {
+		requestURL := buildSiteURL(siteRecord.BaseURL, path)
+		if len(extraHeaders) > 0 {
+			return requestJSONWithManagedHeaders(ctx, siteRecord, method, requestURL, body, accessToken, extraHeaders, account)
+		}
+		return requestJSONWithManagedAccessToken(ctx, siteRecord, method, requestURL, body, accessToken, account)
+	}
+
+	resolved := make(map[string]string, len(ids))
+	if payload, err := request(http.MethodPost, "/api/token/batch/keys", map[string]any{"ids": ids}); err == nil {
+		for key, value := range parseManagedTokenKeys(payload) {
+			resolved[key] = value
+		}
+	}
+
+	for _, remoteID := range ids {
+		key := strconv.Itoa(remoteID)
+		if value := strings.TrimSpace(resolved[key]); value != "" && !model.IsMaskedSiteTokenValue(value) {
+			continue
+		}
+		for _, detail := range []struct {
+			method string
+			path   string
+		}{
+			{method: http.MethodPost, path: "/api/token/" + key + "/key"},
+			{method: http.MethodGet, path: "/api/token/" + key},
+		} {
+			payload, err := request(detail.method, detail.path, nil)
+			if err != nil {
+				continue
+			}
+			value := extractSiteTokenValueFromPayload(payload)
+			if value != "" && !model.IsMaskedSiteTokenValue(value) {
+				resolved[key] = value
+				break
+			}
+		}
+	}
+	return resolved
+}
+
+func parseManagedTokenKeys(payload map[string]any) map[string]string {
+	resolved := make(map[string]string)
+	candidates := []any{
+		nestedValue(payload, "data", "keys"),
+		payload["keys"],
+	}
+	for _, candidate := range candidates {
+		values, ok := candidate.(map[string]any)
+		if !ok {
+			continue
+		}
+		for remoteID, rawValue := range values {
+			value := strings.TrimSpace(jsonString(rawValue))
+			if value == "" {
+				value = extractSiteTokenValueFromPayload(rawValue)
+			}
+			if value == "" || model.IsMaskedSiteTokenValue(value) {
+				continue
+			}
+			resolved[remoteID] = value
+		}
+	}
+	return resolved
+}
+
+func siteTokenRemoteID(item map[string]any) (int, bool) {
+	for _, key := range []string{"id", "token_id", "tokenId", "key_id", "keyId"} {
+		value := strings.TrimSpace(jsonString(item[key]))
+		if value == "" {
+			continue
+		}
+		remoteID, err := strconv.Atoi(value)
+		if err == nil && remoteID > 0 {
+			return remoteID, true
+		}
+	}
+	return 0, false
 }
 
 func fetchManagementGroups(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string) ([]model.SiteUserGroup, error) {
@@ -563,7 +672,7 @@ func stringSliceContainsFold(values []string, target string) bool {
 func sitePlatformUsesV1ModelEndpoint(site *model.Site) bool {
 	if site.Platform == model.SitePlatformAPI {
 		rt := site.ResolveDefaultRouteType()
-		return rt == model.SiteModelRouteTypeOpenAIChat || rt == ""
+		return rt == model.SiteModelRouteTypeOpenAIChat || rt == model.SiteModelRouteTypeOpenAIResponse || rt == ""
 	}
 	return true
 }

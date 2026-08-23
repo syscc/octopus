@@ -553,11 +553,16 @@ func TestHandlerRejectsResponsesNativeToolsWithoutResponsesChannel(t *testing.T)
 	gin.SetMode(gin.TestMode)
 	ctx := setupRelayTestDB(t)
 
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"endpoint not found"}`, http.StatusNotFound)
+	}))
+	defer upstream.Close()
+
 	channel := &model.Channel{
 		Name:     "relay-openai-chat-only",
 		Type:     outbound.OutboundTypeOpenAIChat,
 		Enabled:  true,
-		BaseUrls: []model.BaseUrl{{URL: "https://example.com/v1"}},
+		BaseUrls: []model.BaseUrl{{URL: upstream.URL + "/v1"}},
 		Model:    "gpt-4o",
 		Keys:     []model.ChannelKey{{Enabled: true, ChannelKey: "test-key"}},
 	}

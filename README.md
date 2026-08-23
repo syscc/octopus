@@ -36,20 +36,20 @@
 Run directly:
 
 ```bash
-docker run -d --name octopus -v /path/to/data:/app/data -p 8080:8080 hureru/octopus
+docker run -d --name octopus -v /path/to/data:/app/data -p 8080:8080 syscc/octopus
 ```
 
 Or use docker compose:
 
 ```bash
-wget https://raw.githubusercontent.com/Hureru/octopus/refs/heads/dev/docker-compose.yml
+wget https://raw.githubusercontent.com/syscc/octopus/refs/heads/main/docker-compose.yml
 docker compose up -d
 ```
 
 
 ### 📦 Download from Release
 
-Download the binary for your platform from [Releases](https://github.com/Hureru/octopus/releases), then run:
+Download the binary for your platform from [Releases](https://github.com/syscc/octopus/releases), then run:
 
 ```bash
 ./octopus start
@@ -64,7 +64,7 @@ Download the binary for your platform from [Releases](https://github.com/Hureru/
 
 ```bash
 # Clone the repository
-git clone https://github.com/Hureru/octopus.git
+git clone https://github.com/syscc/octopus.git
 cd octopus
 # Build frontend
 cd web && pnpm install && pnpm run build && cd ..

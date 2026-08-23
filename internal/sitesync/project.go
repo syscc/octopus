@@ -529,6 +529,8 @@ func platformOutboundType(site *model.Site) outbound.OutboundType {
 			return outbound.OutboundTypeAnthropic
 		case model.SiteModelRouteTypeGemini:
 			return outbound.OutboundTypeGemini
+		case model.SiteModelRouteTypeOpenAIResponse:
+			return outbound.OutboundTypeOpenAIResponse
 		default:
 			return outbound.OutboundTypeOpenAIChat
 		}

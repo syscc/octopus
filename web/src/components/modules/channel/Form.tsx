@@ -16,6 +16,12 @@ import { useTranslations } from 'next-intl';
 import { useEffect, useRef, useState } from 'react';
 import { RefreshCw, X, Plus } from 'lucide-react';
 
+const OPENAI_CHANNEL_TYPE_VALUE = 'openai';
+
+function isOpenAIChannelType(type: ChannelType) {
+    return type === ChannelType.OpenAIChat || type === ChannelType.OpenAIResponse;
+}
+
 export interface ChannelKeyFormItem {
     id?: number;
     enabled: boolean;
@@ -100,6 +106,20 @@ export function ChannelForm({
         : [];
     const [inputValue, setInputValue] = useState('');
     const inputRef = useRef<HTMLInputElement>(null);
+    const lastOpenAITypeRef = useRef<ChannelType | null>(
+        isOpenAIChannelType(formData.type) ? formData.type : null,
+    );
+
+    const isOpenAIChannel = isOpenAIChannelType(formData.type);
+
+    // Keep the last concrete OpenAI storage value while the user temporarily
+    // inspects another provider. This lets an existing type=1 channel return
+    // to OpenAI without being silently normalized to type=0.
+    useEffect(() => {
+        if (isOpenAIChannel) {
+            lastOpenAITypeRef.current = formData.type;
+        }
+    }, [formData.type, isOpenAIChannel]);
 
     const fetchModel = useFetchModel();
 
@@ -245,15 +265,24 @@ export function ChannelForm({
                         {t('type')}
                     </label>
                     <Select
-                        value={String(formData.type)}
-                        onValueChange={(value) => onFormDataChange({ ...formData, type: Number(value) as ChannelType })}
+                        value={isOpenAIChannel ? OPENAI_CHANNEL_TYPE_VALUE : String(formData.type)}
+                        onValueChange={(value) => {
+                            if (value === OPENAI_CHANNEL_TYPE_VALUE) {
+                                const type = lastOpenAITypeRef.current ?? ChannelType.OpenAIChat;
+                                onFormDataChange({ ...formData, type });
+                                return;
+                            }
+                            if (isOpenAIChannel) {
+                                lastOpenAITypeRef.current = formData.type;
+                            }
+                            onFormDataChange({ ...formData, type: Number(value) as ChannelType });
+                        }}
                     >
                         <SelectTrigger id={`${idPrefix}-type`} className="rounded-xl w-full border border-border px-4 py-2 text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
                             <SelectValue />
                         </SelectTrigger>
                         <SelectContent className='rounded-xl'>
-                            <SelectItem className='rounded-xl' value={String(ChannelType.OpenAIChat)}>{t('typeOpenAIChat')}</SelectItem>
-                            <SelectItem className='rounded-xl' value={String(ChannelType.OpenAIResponse)}>{t('typeOpenAIResponse')}</SelectItem>
+                            <SelectItem className='rounded-xl' value={OPENAI_CHANNEL_TYPE_VALUE}>{t('typeOpenAI')}</SelectItem>
                             <SelectItem className='rounded-xl' value={String(ChannelType.Anthropic)}>{t('typeAnthropic')}</SelectItem>
                             <SelectItem className='rounded-xl' value={String(ChannelType.Gemini)}>{t('typeGemini')}</SelectItem>
                             <SelectItem className='rounded-xl' value={String(ChannelType.Volcengine)}>{t('typeVolcengine')}</SelectItem>
@@ -477,7 +506,7 @@ export function ChannelForm({
                     </AccordionTrigger>
                     <AccordionContent className="pt-4 px-4 pb-4 space-y-4 border-t">
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            {formData.type === ChannelType.OpenAIResponse ? (
+                            {isOpenAIChannel ? (
                                 <div className="space-y-2">
                                     <label htmlFor={`${idPrefix}-ws-mode`} className="text-sm font-medium text-card-foreground">
                                         {t('wsMode')}

@@ -92,11 +92,13 @@
                     "slowHint": "Contains mode (especially over content) is slower; pair with a time range."
                 },
                 "channel": {
-                    "title": "Channel",
-                    "searchPlaceholder": "Search channels...",
+                    "title": "Channels and models",
+                    "searchPlaceholder": "Search channels or models...",
+                    "clearSearch": "Clear search",
+                    "models": "Models",
                     "manualGroup": "Manual channels",
                     "siteFallback": "Site #{id}",
-                    "empty": "No channels found"
+                    "empty": "No channels or models found"
                 }
             }
         }
@@ -439,6 +441,7 @@
             },
             "llmPrice": {
                 "label": "Model price update",
+                "useSystemProxy": "System proxy",
                 "button": "Update Now",
                 "pending": "Updating...",
                 "success": "Price updated successfully",
@@ -883,6 +886,7 @@
             "modelSelected": "Selected Models",
             "modelNoSelected": "No models selected",
             "modelClearAll": "Clear All",
+            "typeOpenAI": "OpenAI",
             "typeOpenAIChat": "OpenAI Chat",
             "typeOpenAIResponse": "OpenAI Response",
             "typeOpenAIEmbedding": "OpenAI Embedding",

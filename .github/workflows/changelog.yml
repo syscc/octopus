@@ -23,7 +23,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{secrets.ACTION_TOKEN}}
 
-      - name: Merge dev to master branch
+      - name: Merge main to master branch
         run: |
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'github-actions@github.com'
@@ -32,8 +32,8 @@ jobs:
           else
             git checkout master
           fi
-          git fetch origin dev
-          git merge origin/dev
+          git fetch origin main
+          git merge origin/main
           git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}
           git push origin master --force
         env:

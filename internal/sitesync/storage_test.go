@@ -310,6 +310,49 @@ func TestMergePersistedSiteTokensDemotesReadyTokenWhenMaskedPatternMismatches(t 
 	}
 }
 
+func TestMergePersistedSiteTokensRestoresCreatedPlaintextKey(t *testing.T) {
+	now := time.Unix(1711929600, 0)
+	existing := []model.SiteToken{{
+		ID:            12,
+		SiteAccountID: 9,
+		Name:          "created-name",
+		Token:         "sk-cre**********-key",
+		GroupKey:      "vip",
+		GroupName:     "VIP",
+		Enabled:       false,
+		ValueStatus:   model.SiteTokenValueStatusMaskedPending,
+		Source:        "sync",
+	}}
+	incoming := []model.SiteToken{{
+		Name:        "created-name",
+		Token:       "sk-created-plain-key",
+		GroupKey:    "vip",
+		GroupName:   "VIP",
+		Enabled:     true,
+		ValueStatus: model.SiteTokenValueStatusReady,
+		Source:      siteTokenSourceCreated,
+	}}
+
+	merged := mergePersistedSiteTokens(9, existing, incoming, now)
+	if len(merged) != 1 {
+		t.Fatalf("expected exactly one merged token, got %+v", merged)
+	}
+	if merged[0].Token != "sk-created-plain-key" || merged[0].ValueStatus != model.SiteTokenValueStatusReady {
+		t.Fatalf("expected created plaintext key to replace masked value, got %+v", merged[0])
+	}
+	if !merged[0].Enabled {
+		t.Fatalf("expected created plaintext key to be enabled")
+	}
+
+	incoming[0].Source = "sync"
+	incoming[0].Token = "sk-cre**********-key"
+	incoming[0].ValueStatus = model.SiteTokenValueStatusMaskedPending
+	ordinary := mergePersistedSiteTokens(9, existing, incoming, now)
+	if len(ordinary) != 1 || ordinary[0].ValueStatus != model.SiteTokenValueStatusMaskedPending || ordinary[0].Enabled {
+		t.Fatalf("expected ordinary masked sync to preserve disabled masked pending state, got %+v", ordinary)
+	}
+}
+
 func TestPersistSyncSnapshotPreservesGroupProjectionDisabled(t *testing.T) {
 	ctx := setupProjectTestDB(t)
 	_, account := createProjectionFixture(t, ctx)

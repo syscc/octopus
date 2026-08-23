@@ -1,6 +1,6 @@
 services:
   octopus:
-    image: hureru/octopus
+    image: syscc/octopus
     ports:
        - '8080:8080'
     volumes:      

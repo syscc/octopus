@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/samber/lo"
@@ -82,7 +83,215 @@ func (i *ResponseInbound) TransformRequest(ctx context.Context, body []byte) (*m
 
 	i.truncation = req.Truncation
 
-	return convertToInternalRequest(&req)
+	internalRequest, err := convertToInternalRequest(&req)
+	if err != nil {
+		return nil, err
+	}
+	if field := firstUnsupportedResponsesJSONField(body); field != "" {
+		internalRequest.MarkOpenAIResponsesPassthroughRequired("field:" + field)
+	}
+	return internalRequest, nil
+}
+
+func firstUnsupportedResponsesJSONField(body []byte) string {
+	var request map[string]json.RawMessage
+	if err := json.Unmarshal(body, &request); err != nil {
+		return "<invalid>"
+	}
+	if field := firstUnexpectedJSONKey(request, "", []string{
+		"model", "instructions", "input", "tools", "tool_choice", "parallel_tool_calls",
+		"stream", "text", "store", "service_tier", "user", "metadata", "max_output_tokens",
+		"temperature", "top_p", "reasoning", "include", "top_logprobs", "truncation",
+		"previous_response_id", "background", "prompt", "prompt_cache_key",
+		"prompt_cache_retention", "safety_identifier", "max_tool_calls", "conversation",
+		"context_management", "stream_options",
+	}); field != "" {
+		return field
+	}
+	if field := inspectResponsesTextJSON(request["text"]); field != "" {
+		return field
+	}
+	if field := inspectResponsesReasoningJSON(request["reasoning"]); field != "" {
+		return field
+	}
+	if field := inspectResponsesToolsJSON(request["tools"]); field != "" {
+		return field
+	}
+	if field := inspectResponsesToolChoiceJSON(request["tool_choice"]); field != "" {
+		return field
+	}
+	return inspectResponsesInputJSON(request["input"], "input")
+}
+
+func firstUnexpectedJSONKey(object map[string]json.RawMessage, prefix string, allowed []string) string {
+	if len(object) == 0 {
+		return ""
+	}
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		allowedSet[key] = struct{}{}
+	}
+	keys := make([]string, 0, len(object))
+	for key := range object {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, ok := allowedSet[key]; ok {
+			continue
+		}
+		if prefix == "" {
+			return key
+		}
+		return prefix + "." + key
+	}
+	return ""
+}
+
+func inspectResponsesTextJSON(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var text map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return "text"
+	}
+	if field := firstUnexpectedJSONKey(text, "text", []string{"format", "verbosity"}); field != "" {
+		return field
+	}
+	formatRaw := text["format"]
+	if len(formatRaw) == 0 || string(formatRaw) == "null" {
+		return ""
+	}
+	var format map[string]json.RawMessage
+	if err := json.Unmarshal(formatRaw, &format); err != nil {
+		return "text.format"
+	}
+	return firstUnexpectedJSONKey(format, "text.format", []string{"type", "name", "schema"})
+}
+
+func inspectResponsesReasoningJSON(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var reasoning map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &reasoning); err != nil {
+		return "reasoning"
+	}
+	return firstUnexpectedJSONKey(reasoning, "reasoning", []string{"effort", "max_tokens", "summary", "generate_summary"})
+}
+
+func inspectResponsesToolsJSON(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var tools []json.RawMessage
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return "tools"
+	}
+	for index, toolRaw := range tools {
+		var tool map[string]json.RawMessage
+		if err := json.Unmarshal(toolRaw, &tool); err != nil {
+			return fmt.Sprintf("tools[%d]", index)
+		}
+		var toolType string
+		_ = json.Unmarshal(tool["type"], &toolType)
+		if toolType != "function" {
+			continue
+		}
+		if field := firstUnexpectedJSONKey(tool, fmt.Sprintf("tools[%d]", index), []string{"type", "name", "description", "parameters", "strict"}); field != "" {
+			return field
+		}
+	}
+	return ""
+}
+
+func inspectResponsesToolChoiceJSON(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var mode string
+	if json.Unmarshal(raw, &mode) == nil {
+		return ""
+	}
+	var choice map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &choice); err != nil {
+		return "tool_choice"
+	}
+	return firstUnexpectedJSONKey(choice, "tool_choice", []string{"mode", "type", "name"})
+}
+
+func inspectResponsesInputJSON(raw json.RawMessage, prefix string) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return ""
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return prefix
+	}
+	for index, itemRaw := range items {
+		if field := inspectResponsesInputItemJSON(itemRaw, fmt.Sprintf("%s[%d]", prefix, index)); field != "" {
+			return field
+		}
+	}
+	return ""
+}
+
+func inspectResponsesInputItemJSON(raw json.RawMessage, prefix string) string {
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return prefix
+	}
+	var itemType string
+	_ = json.Unmarshal(item["type"], &itemType)
+	var allowed []string
+	switch itemType {
+	case "", "message":
+		allowed = []string{"type", "role", "content"}
+	case "input_text", "text", "output_text":
+		allowed = []string{"type", "role", "text"}
+	case "input_image":
+		allowed = []string{"type", "role", "image_url", "detail"}
+	case "input_file":
+		allowed = []string{"type", "role", "file_id", "filename", "file_data", "file_url"}
+	case "input_audio":
+		allowed = []string{"type", "role", "input_audio"}
+	case "function_call":
+		allowed = []string{"type", "call_id", "name", "arguments"}
+	case "function_call_output":
+		allowed = []string{"type", "call_id", "output"}
+	case "reasoning":
+		return prefix + ".type"
+	default:
+		return prefix + ".type"
+	}
+	if field := firstUnexpectedJSONKey(item, prefix, allowed); field != "" {
+		return field
+	}
+	if itemType == "message" || itemType == "" {
+		if field := inspectResponsesInputJSON(item["content"], prefix+".content"); field != "" {
+			return field
+		}
+	}
+	if itemType == "function_call_output" {
+		if field := inspectResponsesInputJSON(item["output"], prefix+".output"); field != "" {
+			return field
+		}
+	}
+	if itemType == "input_audio" {
+		var audio map[string]json.RawMessage
+		if err := json.Unmarshal(item["input_audio"], &audio); err != nil {
+			return prefix + ".input_audio"
+		}
+		if field := firstUnexpectedJSONKey(audio, prefix+".input_audio", []string{"data", "format"}); field != "" {
+			return field
+		}
+	}
+	return ""
 }
 
 func (i *ResponseInbound) TransformResponse(ctx context.Context, response *model.InternalLLMResponse) ([]byte, error) {
@@ -1165,6 +1374,9 @@ func convertToInternalRequest(req *ResponsesRequest) (*model.InternalLLMRequest,
 		TransformerMetadata: map[string]string{},
 		Include:             append([]string(nil), req.Include...),
 	}
+	if req.Text != nil {
+		chatReq.Verbosity = req.Text.Verbosity
+	}
 
 	if req.Input.Text == nil && len(req.Input.Items) > 0 {
 		chatReq.TransformOptions.ArrayInputs = lo.ToPtr(true)
@@ -1261,6 +1473,8 @@ func convertToInternalRequest(req *ResponsesRequest) (*model.InternalLLMRequest,
 	return chatReq, nil
 }
 
+// markOpenAIResponsesPassthroughIfNeeded performs semantic checks after the
+// raw-JSON allowlist has rejected unknown or structurally lossy fields.
 func markOpenAIResponsesPassthroughIfNeeded(req *ResponsesRequest, chatReq *model.InternalLLMRequest) {
 	if req == nil || chatReq == nil {
 		return
@@ -1276,8 +1490,12 @@ func markOpenAIResponsesPassthroughIfNeeded(req *ResponsesRequest, chatReq *mode
 func firstUnsupportedResponsesToolType(tools []ResponsesTool) string {
 	for _, tool := range tools {
 		switch tool.Type {
-		case "function", "image_generation":
+		case "function":
 			continue
+		case "image_generation":
+			// image_generation 无法用 OpenAI Chat Completions 表达（Chat 出站会静默丢弃
+			// 非 function 工具），为避免原生 Responses 能力静默丢失，强制要求 Responses 通道。
+			return "image_generation"
 		case "":
 			return "<empty>"
 		default:
@@ -1303,8 +1521,13 @@ func firstUnsupportedResponsesTopLevelItemType(item *ResponsesItem) string {
 	if item == nil {
 		return ""
 	}
+	if item.ItemReference != nil && strings.TrimSpace(*item.ItemReference) != "" {
+		return "item_reference"
+	}
 	switch item.Type {
-	case "", "message", "input_text", "input_image", "input_file", "input_audio", "function_call", "function_call_output", "reasoning":
+	case "", "message", "input_text", "input_image", "input_file", "input_audio", "function_call", "function_call_output":
+	case "reasoning":
+		return "reasoning"
 	default:
 		return item.Type
 	}

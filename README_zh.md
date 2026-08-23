@@ -36,20 +36,20 @@
 直接运行
 
 ```bash
-docker run -d --name octopus -v /path/to/data:/app/data -p 8080:8080 hureru/octopus
+docker run -d --name octopus -v /path/to/data:/app/data -p 8080:8080 syscc/octopus
 ```
 
 或者使用 docker compose 运行
 
 ```bash
-wget https://raw.githubusercontent.com/Hureru/octopus/refs/heads/dev/docker-compose.yml
+wget https://raw.githubusercontent.com/syscc/octopus/refs/heads/main/docker-compose.yml
 docker compose up -d
 ```
 
 
 ### 📦 从 Release 下载
 
-从 [Releases](https://github.com/Hureru/octopus/releases) 下载对应平台的二进制文件，然后运行：
+从 [Releases](https://github.com/syscc/octopus/releases) 下载对应平台的二进制文件，然后运行：
 
 ```bash
 ./octopus start
@@ -64,7 +64,7 @@ docker compose up -d
 
 ```bash
 # 克隆项目
-git clone https://github.com/Hureru/octopus.git
+git clone https://github.com/syscc/octopus.git
 cd octopus
 # 构建前端
 cd web && pnpm install && pnpm run build && cd ..

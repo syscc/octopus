@@ -24,6 +24,10 @@ func init() {
 				Handle(listLog),
 		).
 		AddRoute(
+			router.NewRoute("/channel-ids", http.MethodGet).
+				Handle(listLogChannelIDs),
+		).
+		AddRoute(
 			router.NewRoute("/site-action-targets", http.MethodGet).
 				Handle(getLogSiteActionTargets),
 		).
@@ -47,12 +51,23 @@ func init() {
 		)
 }
 
+func listLogChannelIDs(c *gin.Context) {
+	channelIDs, err := op.RelayLogChannelIDs(c.Request.Context())
+	if err != nil {
+		resp.Error(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	resp.Success(c, channelIDs)
+}
+
 func listLog(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 	startTimeStr := c.Query("start_time")
 	endTimeStr := c.Query("end_time")
 	channelIDsStr := c.Query("channel_ids")
+	modelNamesStr := c.Query("model_names")
+	sourceKeyword := c.Query("source_keyword")
 	status := op.RelayLogStatusFilter(strings.TrimSpace(c.Query("status")))
 	keyword := c.Query("keyword")
 	keywordScope := op.RelayLogKeywordScope(strings.TrimSpace(c.Query("keyword_scope")))
@@ -149,10 +164,22 @@ func listLog(c *gin.Context) {
 		}
 	}
 
+	var modelNames []string
+	if modelNamesStr != "" {
+		for _, item := range strings.Split(modelNamesStr, ",") {
+			item = strings.TrimSpace(item)
+			if item != "" {
+				modelNames = append(modelNames, item)
+			}
+		}
+	}
+
 	result, err := op.RelayLogListWithFilter(c.Request.Context(), op.RelayLogListFilter{
 		StartTime:      startTime,
 		EndTime:        endTime,
 		ChannelIDs:     channelIDs,
+		ModelNames:     modelNames,
+		SourceKeyword:  sourceKeyword,
 		Status:         status,
 		Keyword:        keyword,
 		KeywordScope:   keywordScope,

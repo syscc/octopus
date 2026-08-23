@@ -105,16 +105,16 @@ If your provider isn't a relay site but gave you a Base URL + Key directly (e.g.
 
 **Docker run:**
 ```bash
-docker run -d --name octopus -v /path/to/data:/app/data -p 8080:8080 hureru/octopus
+docker run -d --name octopus -v /path/to/data:/app/data -p 8080:8080 syscc/octopus
 ```
 
 **docker compose:**
 ```bash
-wget https://raw.githubusercontent.com/Hureru/octopus/refs/heads/dev/docker-compose.yml
+wget https://raw.githubusercontent.com/syscc/octopus/refs/heads/main/docker-compose.yml
 docker compose up -d
 ```
 
-> ⚠️ **You must use the `hureru/octopus` image** (the version with Site functionality). If you use `bestrui/octopus` or other upstream images, you won't see the "Sites" page. For Release binaries and building from source, see [README.md](README.md).
+> **You must use the `syscc/octopus` image** (the version with Site functionality). If you use `bestruirui/octopus` or other upstream images, you won't see the "Sites" page. For Release binaries and building from source, see [README.md](README.md).
 
 ### 4.2 First Login
 
@@ -556,6 +556,6 @@ First confirm the **upstream provider itself** is configured correctly (the same
 
 <div align="center">
 
-For questions not covered in this guide, feel free to open an [Issue on GitHub](https://github.com/Hureru/octopus) or discuss on the [LinuxDO thread](https://linux.do/t/topic/2160826).
+For questions not covered in this guide, feel free to open an [Issue on GitHub](https://github.com/syscc/octopus) or discuss on the [LinuxDO thread](https://linux.do/t/topic/2160826).
 
 </div>

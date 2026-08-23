@@ -12,6 +12,7 @@ const (
 	SettingKeyProxyURL                         SettingKey = "proxy_url"
 	SettingKeyStatsSaveInterval                SettingKey = "stats_save_interval"                  // 将统计信息写入数据库的周期(分钟)
 	SettingKeyModelInfoUpdateInterval          SettingKey = "model_info_update_interval"           // 模型信息更新间隔(小时)
+	SettingKeyModelPriceUseSystemProxy         SettingKey = "model_price_use_system_proxy"         // 模型价格更新是否使用系统代理
 	SettingKeySyncLLMInterval                  SettingKey = "sync_llm_interval"                    // LLM 同步间隔(小时)
 	SettingKeySiteSyncInterval                 SettingKey = "site_sync_interval"                   // 站点账号同步间隔(小时)
 	SettingKeySiteCheckinInterval              SettingKey = "site_checkin_interval"                // 站点自动签到间隔(小时)
@@ -40,13 +41,13 @@ const (
 	SettingKeyOutlierReapMinutes               SettingKey = "outlier_reap_minutes"                 // POR 窗口内存回收 TTL(分钟)
 	SettingKeyOutlierCFRecoverMinutes          SettingKey = "outlier_cf_recover_minutes"           // POR CF 退役渠道恢复探活冷却(分钟)
 	SettingKeyApiBaseUrl                       SettingKey = "api_base_url"                         // 对外服务基础地址，用于一键导出客户端配置，为空时不显示导出入口
-	SettingKeyWebDAVURL                        SettingKey = "webdav_url"                            // WebDAV 服务器地址
-	SettingKeyWebDAVUsername                   SettingKey = "webdav_username"                       // WebDAV 用户名
-	SettingKeyWebDAVPassword                   SettingKey = "webdav_password"                       // WebDAV 密码
-	SettingKeyWebDAVBackupPath                 SettingKey = "webdav_backup_path"                    // WebDAV 远程备份目录
-	SettingKeyWebDAVBackupInterval             SettingKey = "webdav_backup_interval"                // WebDAV 自动备份间隔(小时)，0=禁用
-	SettingKeyWebDAVRetentionCount             SettingKey = "webdav_retention_count"                // WebDAV 保留备份份数
-	SettingKeyWebDAVIncludeStats               SettingKey = "webdav_include_stats"                  // WebDAV 备份是否包含统计数据
+	SettingKeyWebDAVURL                        SettingKey = "webdav_url"                           // WebDAV 服务器地址
+	SettingKeyWebDAVUsername                   SettingKey = "webdav_username"                      // WebDAV 用户名
+	SettingKeyWebDAVPassword                   SettingKey = "webdav_password"                      // WebDAV 密码
+	SettingKeyWebDAVBackupPath                 SettingKey = "webdav_backup_path"                   // WebDAV 远程备份目录
+	SettingKeyWebDAVBackupInterval             SettingKey = "webdav_backup_interval"               // WebDAV 自动备份间隔(小时)，0=禁用
+	SettingKeyWebDAVRetentionCount             SettingKey = "webdav_retention_count"               // WebDAV 保留备份份数
+	SettingKeyWebDAVIncludeStats               SettingKey = "webdav_include_stats"                 // WebDAV 备份是否包含统计数据
 )
 
 type Setting struct {
@@ -60,6 +61,7 @@ func DefaultSettings() []Setting {
 		{Key: SettingKeyStatsSaveInterval, Value: "10"},               // 默认10分钟保存一次统计信息
 		{Key: SettingKeyCORSAllowOrigins, Value: ""},                  // CORS 默认不允许跨域，设置为 "*" 才允许所有来源
 		{Key: SettingKeyModelInfoUpdateInterval, Value: "24"},         // 默认24小时更新一次模型信息
+		{Key: SettingKeyModelPriceUseSystemProxy, Value: "false"},     // 模型价格更新默认直连
 		{Key: SettingKeySyncLLMInterval, Value: "24"},                 // 默认24小时同步一次LLM
 		{Key: SettingKeySiteSyncInterval, Value: "12"},                // 默认12小时同步一次站点账号信息
 		{Key: SettingKeySiteCheckinInterval, Value: "24"},             // 默认24小时自动签到一次
@@ -76,24 +78,24 @@ func DefaultSettings() []Setting {
 		{Key: SettingKeyProjectedChannelAutoGroupEnabled, Value: "0"}, // 默认不强制站点投影渠道自动分组
 		{Key: SettingKeyJWTSecret, Value: ""},                         // 为空时自动生成
 		{Key: SettingKeyStatsSiteModelBackfilled, Value: "false"},
-		{Key: SettingKeyOutlierRetireEnabled, Value: "false"}, // 默认关闭被动离群退役，保守上线
-		{Key: SettingKeyOutlierRetireInterval, Value: "2"},    // 默认每 2 分钟评估一次
-		{Key: SettingKeyOutlierWindowCapacity, Value: "20"},   // 评估取最近 20 条
-		{Key: SettingKeyOutlierWindowMinutes, Value: "10"},    // 时间窗 10 分钟
-		{Key: SettingKeyOutlierMinSamples, Value: "8"},        // 样本不足 8 条直接 PASS
-		{Key: SettingKeyOutlierFailRatePct, Value: "85"},      // 失败率 ≥85% 才候选
-		{Key: SettingKeyOutlierConsecFails, Value: "10"},      // 连续失败 ≥10 次
-		{Key: SettingKeyOutlierRecoverStreak, Value: "2"},     // 连续探活成功 2 次恢复
-		{Key: SettingKeyOutlierReapMinutes, Value: "30"},      // 窗口 30 分钟无流量回收
-		{Key: SettingKeyOutlierCFRecoverMinutes, Value: "30"}, // CF 退役渠道 30 分钟后才探活恢复
-		{Key: SettingKeyApiBaseUrl, Value: ""},                  // 默认为空，不显示客户端导出入口
-		{Key: SettingKeyWebDAVURL, Value: ""},                   // 默认为空，未配置
-		{Key: SettingKeyWebDAVUsername, Value: ""},              // 默认为空
-		{Key: SettingKeyWebDAVPassword, Value: ""},              // 默认为空
+		{Key: SettingKeyOutlierRetireEnabled, Value: "false"},        // 默认关闭被动离群退役，保守上线
+		{Key: SettingKeyOutlierRetireInterval, Value: "2"},           // 默认每 2 分钟评估一次
+		{Key: SettingKeyOutlierWindowCapacity, Value: "20"},          // 评估取最近 20 条
+		{Key: SettingKeyOutlierWindowMinutes, Value: "10"},           // 时间窗 10 分钟
+		{Key: SettingKeyOutlierMinSamples, Value: "8"},               // 样本不足 8 条直接 PASS
+		{Key: SettingKeyOutlierFailRatePct, Value: "85"},             // 失败率 ≥85% 才候选
+		{Key: SettingKeyOutlierConsecFails, Value: "10"},             // 连续失败 ≥10 次
+		{Key: SettingKeyOutlierRecoverStreak, Value: "2"},            // 连续探活成功 2 次恢复
+		{Key: SettingKeyOutlierReapMinutes, Value: "30"},             // 窗口 30 分钟无流量回收
+		{Key: SettingKeyOutlierCFRecoverMinutes, Value: "30"},        // CF 退役渠道 30 分钟后才探活恢复
+		{Key: SettingKeyApiBaseUrl, Value: ""},                       // 默认为空，不显示客户端导出入口
+		{Key: SettingKeyWebDAVURL, Value: ""},                        // 默认为空，未配置
+		{Key: SettingKeyWebDAVUsername, Value: ""},                   // 默认为空
+		{Key: SettingKeyWebDAVPassword, Value: ""},                   // 默认为空
 		{Key: SettingKeyWebDAVBackupPath, Value: "/octopus-backups"}, // 默认远程目录
-		{Key: SettingKeyWebDAVBackupInterval, Value: "0"},       // 默认禁用自动备份
-		{Key: SettingKeyWebDAVRetentionCount, Value: "10"},      // 默认保留10份
-		{Key: SettingKeyWebDAVIncludeStats, Value: "true"},      // 默认包含统计数据
+		{Key: SettingKeyWebDAVBackupInterval, Value: "0"},            // 默认禁用自动备份
+		{Key: SettingKeyWebDAVRetentionCount, Value: "10"},           // 默认保留10份
+		{Key: SettingKeyWebDAVIncludeStats, Value: "true"},           // 默认包含统计数据
 	}
 }
 
@@ -128,7 +130,7 @@ func (s *Setting) Validate() error {
 			return fmt.Errorf("setting value must be non-negative")
 		}
 		return nil
-	case SettingKeyRelayLogKeepEnabled, SettingKeyResponsesWSEnabled, SettingKeyGroupHealthEnabled, SettingKeyStatsSiteModelBackfilled, SettingKeyOutlierRetireEnabled, SettingKeyWebDAVIncludeStats:
+	case SettingKeyRelayLogKeepEnabled, SettingKeyResponsesWSEnabled, SettingKeyGroupHealthEnabled, SettingKeyStatsSiteModelBackfilled, SettingKeyOutlierRetireEnabled, SettingKeyWebDAVIncludeStats, SettingKeyModelPriceUseSystemProxy:
 		if s.Value != "true" && s.Value != "false" {
 			return fmt.Errorf("setting value must be true or false")
 		}

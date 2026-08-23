@@ -146,6 +146,13 @@ func SiteUpdate(req *model.SiteUpdateRequest, ctx context.Context) (*model.Site,
 		merged.BaseURL = *req.BaseURL
 		selectFields = append(selectFields, "base_url")
 	}
+	if req.DefaultRouteType != nil {
+		if !model.IsProjectedSiteModelRouteType(*req.DefaultRouteType) {
+			return nil, fmt.Errorf("invalid default route type")
+		}
+		merged.DefaultRouteType = *req.DefaultRouteType
+		selectFields = append(selectFields, "default_route_type")
+	}
 	if req.Enabled != nil {
 		merged.Enabled = *req.Enabled
 		selectFields = append(selectFields, "enabled")
@@ -208,6 +215,9 @@ func SiteUpdate(req *model.SiteUpdateRequest, ctx context.Context) (*model.Site,
 	}
 	if req.BaseURL != nil {
 		updates.BaseURL = merged.BaseURL
+	}
+	if req.DefaultRouteType != nil {
+		updates.DefaultRouteType = merged.DefaultRouteType
 	}
 	if req.Enabled != nil {
 		updates.Enabled = merged.Enabled

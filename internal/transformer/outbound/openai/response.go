@@ -566,6 +566,9 @@ func anthropicCacheMetadataForResponses(req *model.InternalLLMRequest) (*string,
 	if req.ResponsesPromptCacheKey != nil || req.PromptCacheRetention != nil {
 		return req.ResponsesPromptCacheKey, req.PromptCacheRetention
 	}
+	if req.RawAPIFormat == model.APIFormatOpenAIChatCompletion && req.PromptCacheKey != nil {
+		return req.PromptCacheKey, nil
+	}
 
 	return derivedAnthropicCacheMetadata(req)
 }
@@ -885,9 +888,17 @@ func ConvertToResponsesRequest(req *model.InternalLLMRequest) *ResponsesRequest 
 		ParallelToolCalls:    req.ParallelToolCalls,
 		PromptCacheKey:       promptCacheKey,
 		PromptCacheRetention: promptCacheRetention,
+		SafetyIdentifier:     req.SafetyIdentifier,
 	}
 
-	// Convert instructions from system messages
+	// MaxOutputTokens is the Responses spelling of the shared completion cap.
+	// When a Chat request falls back to Responses, preserve max_tokens when the
+	// newer max_completion_tokens field is not already set.
+	if result.MaxOutputTokens == nil {
+		result.MaxOutputTokens = req.MaxTokens
+	}
+
+	// Convert instructions from system/developer messages.
 	result.Instructions = convertInstructionsFromMessages(req.Messages)
 
 	// Convert input from messages or preserve original array items when available.
@@ -956,7 +967,9 @@ func ConvertToResponsesRequest(req *model.InternalLLMRequest) *ResponsesRequest 
 	if result.PromptCacheRetention == nil {
 		result.PromptCacheRetention = responsesOptions.PromptCacheRetention
 	}
-	result.SafetyIdentifier = responsesOptions.SafetyIdentifier
+	if result.SafetyIdentifier == nil {
+		result.SafetyIdentifier = responsesOptions.SafetyIdentifier
+	}
 	result.MaxToolCalls = responsesOptions.MaxToolCalls
 	result.Conversation = responsesOptions.Conversation
 	result.ContextManagement = responsesOptions.ContextManagement

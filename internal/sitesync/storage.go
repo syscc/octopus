@@ -126,7 +126,11 @@ func persistSyncSnapshot(ctx context.Context, accountID int, snapshot *syncSnaps
 				copyPersistedGroupSyncState(&snapshot.groups[i], *existing)
 			}
 		}
-		mergedTokens := mergePersistedSiteTokens(accountID, existingTokens, snapshot.tokens, now)
+		incomingTokens := snapshot.tokens
+		if snapshot.createdToken != nil {
+			incomingTokens = mergeCreatedSiteTokenIntoSyncedTokens(incomingTokens, snapshot.createdToken)
+		}
+		mergedTokens := mergePersistedSiteTokens(accountID, existingTokens, incomingTokens, now)
 		incomingModels := preparePersistedSyncModels(accountID, snapshot.models, existingModelMap, now)
 		finalModels := mergePersistedSiteModelsByGroup(existingModels, incomingModels, snapshot.groupResults)
 
@@ -408,7 +412,11 @@ func mergeReadyIncomingSiteToken(incoming model.SiteToken, existingTokens []mode
 			continue
 		}
 		incoming.ID = existing.ID
-		incoming.Enabled = existing.Enabled
+		if existing.ValueStatus == model.SiteTokenValueStatusMaskedPending {
+			incoming.Enabled = true
+		} else {
+			incoming.Enabled = existing.Enabled
+		}
 		if existing.ID != 0 {
 			usedExistingIDs[existing.ID] = struct{}{}
 		}

@@ -125,6 +125,7 @@ import {
     platformLabel,
     routeSourceLabel,
     routeTypeLabel,
+    routeTypeTargetLabel,
     summarizeHistory,
 } from './utils';
 import { useJumpStore, type JumpTarget, type PendingJump, type SiteChannelJumpTarget, isSiteChannelJumpTarget } from '@/stores/jump';
@@ -542,7 +543,8 @@ function collectSiteSummary(card: SiteChannelCard) {
         }
 
         for (const route of account.route_summaries) {
-            routeCounts.set(route.route_type, (routeCounts.get(route.route_type) ?? 0) + route.count);
+            const routeType = route.route_type === 'openai_response' ? 'openai_chat' : route.route_type;
+            routeCounts.set(routeType, (routeCounts.get(routeType) ?? 0) + route.count);
         }
     }
 
@@ -588,8 +590,8 @@ function collectSiteRuntimeSummary(card: SiteChannelCard) {
 }
 
 const SHORT_ROUTE_LABEL: Partial<Record<SiteModelRouteType, string>> = {
-    openai_chat: 'Chat',
-    openai_response: 'Response',
+    openai_chat: 'OpenAI',
+    openai_response: 'OpenAI',
     openai_embedding: 'Embedding',
 };
 
@@ -934,7 +936,7 @@ function MoveRoutePopover({
                                         : 'hover:bg-muted',
                                 )}
                             >
-                                <span>{routeTypeLabel(routeType)}</span>
+                                <span>{routeTypeTargetLabel(routeType)}</span>
                                 {routeType === currentRouteType ? <Check className="size-4" /> : null}
                             </button>
                         ))}
@@ -2252,7 +2254,7 @@ function SiteAccountPanel({
                                     <SelectContent className="rounded-xl">
                                         {SITE_ROUTE_COLUMN_ORDER.map((routeType) => (
                                             <SelectItem key={routeType} value={routeType}>
-                                                {routeTypeLabel(routeType)}
+                                                {routeTypeTargetLabel(routeType)}
                                             </SelectItem>
                                         ))}
                                     </SelectContent>
@@ -2428,7 +2430,7 @@ function SiteAccountPanel({
                                 <SelectTrigger className="h-10 rounded-xl bg-background"><SelectValue /></SelectTrigger>
                                 <SelectContent className="rounded-xl">
                                     {SITE_ROUTE_COLUMN_ORDER.map((routeType) => (
-                                        <SelectItem key={routeType} value={routeType}>{routeTypeLabel(routeType)}</SelectItem>
+                                        <SelectItem key={routeType} value={routeType}>{routeTypeTargetLabel(routeType)}</SelectItem>
                                     ))}
                                 </SelectContent>
                             </Select>

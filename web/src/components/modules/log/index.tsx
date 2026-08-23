@@ -15,6 +15,8 @@ type LogFilters = {
     keywordMode: LogKeywordMode;
     keywordScope: LogKeywordScope;
     channelIds: number[];
+    modelNames: string[];
+    sourceKeyword: string;
     startTime?: number;
     endTime?: number;
 };
@@ -34,6 +36,8 @@ function filtersActive(filters: LogFilters) {
     return (
         !!filters.keyword.trim() ||
         filters.channelIds.length > 0 ||
+        filters.modelNames.length > 0 ||
+        !!filters.sourceKeyword.trim() ||
         !!filters.startTime ||
         !!filters.endTime
     );
@@ -54,6 +58,8 @@ export function Log() {
     const lastHandledRefreshRequestIdRef = useRef(refreshRequestId);
     const logDateRange = useToolbarViewOptionsStore((s) => s.logDateRange);
     const logChannelIds = useToolbarViewOptionsStore((s) => s.logChannelIds);
+    const logModelNames = useToolbarViewOptionsStore((s) => s.logModelNames);
+    const logSourceKeyword = useToolbarViewOptionsStore((s) => s.logSourceKeyword);
     const logKeywordMode = useToolbarViewOptionsStore((s) => s.logKeywordMode);
     const logKeywordScope = useToolbarViewOptionsStore((s) => s.logKeywordScope);
     const filters = useMemo<LogFilters>(() => ({
@@ -61,9 +67,11 @@ export function Log() {
         keywordMode: logKeywordMode,
         keywordScope: logKeywordScope,
         channelIds: logChannelIds,
+        modelNames: logModelNames,
+        sourceKeyword: logSourceKeyword,
         startTime: logDateRange.start,
         endTime: logDateRange.end,
-    }), [logDateRange.end, logDateRange.start, logChannelIds, searchTerm, logKeywordMode, logKeywordScope]);
+    }), [logDateRange.end, logDateRange.start, logChannelIds, logModelNames, logSourceKeyword, searchTerm, logKeywordMode, logKeywordScope]);
     const debouncedFilters = useDebouncedValue(filters, 200);
     const filterMode = filtersActive(debouncedFilters);
     const logFilters = useMemo(() => ({
@@ -71,6 +79,8 @@ export function Log() {
         keyword_mode: debouncedFilters.keyword.trim() ? debouncedFilters.keywordMode : undefined,
         keyword_scope: debouncedFilters.keyword.trim() ? debouncedFilters.keywordScope : undefined,
         channel_ids: debouncedFilters.channelIds.length > 0 ? debouncedFilters.channelIds : undefined,
+        model_names: debouncedFilters.modelNames.length > 0 ? debouncedFilters.modelNames : undefined,
+        source_keyword: debouncedFilters.sourceKeyword.trim() || undefined,
         start_time: debouncedFilters.startTime,
         end_time: debouncedFilters.endTime,
     }), [debouncedFilters]);

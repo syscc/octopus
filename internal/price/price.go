@@ -38,7 +38,7 @@ func UpdateLLMPrice(ctx context.Context) error {
 	defer func() {
 		log.Debugf("update LLM price task finished, update time: %s", time.Since(startTime))
 	}()
-	client, err := client.GetHTTPClientSystemProxy(false)
+	httpClient, err := client.GetHTTPClientSystemProxy(useModelPriceSystemProxy())
 	if err != nil {
 		return err
 	}
@@ -47,7 +47,7 @@ func UpdateLLMPrice(ctx context.Context) error {
 		return err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -78,6 +78,15 @@ func UpdateLLMPrice(ctx context.Context) error {
 	llmPriceLock.Unlock()
 	lastUpdateTime = time.Now()
 	return nil
+}
+
+func useModelPriceSystemProxy() bool {
+	enabled, err := op.SettingGetBool(model.SettingKeyModelPriceUseSystemProxy)
+	if err != nil {
+		log.Warnf("failed to read model price system proxy setting, using direct connection: %v", err)
+		return false
+	}
+	return enabled
 }
 
 func GetLastUpdateTime() time.Time {

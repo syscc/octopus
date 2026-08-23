@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { CalendarIcon, Check, ChevronDown, Filter, Search, X } from 'lucide-react';
 import type { Matcher } from 'react-day-picker';
@@ -11,6 +11,9 @@ import { Badge } from '@/components/ui/badge';
 import { buttonVariants } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useChannelList } from '@/api/endpoints/channel';
+import { useGroupList } from '@/api/endpoints/group';
+import { useLogChannelIDs } from '@/api/endpoints/log';
+import { useModelChannelList, useModelList } from '@/api/endpoints/model';
 import { useSiteChannelList } from '@/api/endpoints/site-channel';
 import { SettingKey, useSettingValue } from '@/api/endpoints/setting';
 import { useToolbarViewOptionsStore } from '@/components/modules/toolbar/view-options-store';
@@ -146,22 +149,29 @@ export function LogFilterPopover() {
     const t = useTranslations('toolbar');
     const logDateRange = useToolbarViewOptionsStore((s) => s.logDateRange);
     const logChannelIds = useToolbarViewOptionsStore((s) => s.logChannelIds);
+    const logModelNames = useToolbarViewOptionsStore((s) => s.logModelNames);
+    const logSourceKeyword = useToolbarViewOptionsStore((s) => s.logSourceKeyword);
     const logKeywordMode = useToolbarViewOptionsStore((s) => s.logKeywordMode);
     const logKeywordScope = useToolbarViewOptionsStore((s) => s.logKeywordScope);
     const setLogDateRange = useToolbarViewOptionsStore((s) => s.setLogDateRange);
     const setLogChannelIds = useToolbarViewOptionsStore((s) => s.setLogChannelIds);
+    const setLogModelNames = useToolbarViewOptionsStore((s) => s.setLogModelNames);
+    const setLogSourceKeyword = useToolbarViewOptionsStore((s) => s.setLogSourceKeyword);
     const setLogKeywordMode = useToolbarViewOptionsStore((s) => s.setLogKeywordMode);
     const setLogKeywordScope = useToolbarViewOptionsStore((s) => s.setLogKeywordScope);
     const { value: logKeepPeriodValue } = useSettingValue(SettingKey.RelayLogKeepPeriod, '0');
     const { data: channels } = useChannelList();
+    const { data: logChannelIDs } = useLogChannelIDs();
+    const { data: groups = [] } = useGroupList();
+    const { data: modelChannels = [] } = useModelChannelList();
+    const { data: pricedModels = [] } = useModelList();
     const { data: sites } = useSiteChannelList({ includeHistory: false });
 
-    const [search, setSearch] = useState('');
     const [expanded, setExpanded] = useState<Set<string>>(new Set(['__manual__']));
 
     const logKeepPeriod = Number.parseInt(logKeepPeriodValue, 10) || 0;
 
-    const groups = useMemo<ChannelGroup[]>(() => {
+    const channelGroups = useMemo<ChannelGroup[]>(() => {
         if (!channels) return [];
         const siteNameById = new Map<number, string>();
         for (const site of sites ?? []) siteNameById.set(site.site_id, site.site_name);
@@ -202,10 +212,30 @@ export function LogFilterPopover() {
         return result;
     }, [channels, sites, t]);
 
+    const visibleChannelGroups = useMemo<ChannelGroup[]>(() => {
+        if (!logChannelIDs) return [];
+        const usedChannelIDs = new Set(logChannelIDs);
+        return channelGroups
+            .map((group) => ({
+                ...group,
+                channels: group.channels.filter((channel) => usedChannelIDs.has(channel.id)),
+            }))
+            .filter((group) => group.channels.length > 0);
+    }, [channelGroups, logChannelIDs]);
+
+    useEffect(() => {
+        if (!logChannelIDs) return;
+        const usedChannelIDs = new Set(logChannelIDs);
+        const nextChannelIds = logChannelIds.filter((id) => usedChannelIDs.has(id));
+        if (nextChannelIds.length !== logChannelIds.length) {
+            setLogChannelIds(nextChannelIds);
+        }
+    }, [logChannelIDs, logChannelIds, setLogChannelIds]);
+
     const filteredGroups = useMemo(() => {
-        const term = search.trim().toLowerCase();
-        if (!term) return groups;
-        return groups
+        const term = logSourceKeyword.trim().toLowerCase();
+        if (!term) return visibleChannelGroups;
+        return visibleChannelGroups
             .map((g) => {
                 const matchesGroup = g.label.toLowerCase().includes(term);
                 const matchedChannels = matchesGroup
@@ -214,9 +244,46 @@ export function LogFilterPopover() {
                 return { ...g, channels: matchedChannels };
             })
             .filter((g) => g.channels.length > 0);
-    }, [groups, search]);
+    }, [logSourceKeyword, visibleChannelGroups]);
 
     const selectedSet = useMemo(() => new Set(logChannelIds), [logChannelIds]);
+
+    const modelOptions = useMemo(() => {
+        const names = new Map<string, string>();
+        const addModel = (name: string) => {
+            const trimmed = name.trim();
+            if (trimmed && !names.has(trimmed.toLowerCase())) names.set(trimmed.toLowerCase(), trimmed);
+        };
+        for (const group of groups) {
+            addModel(group.name);
+            for (const item of group.items ?? []) addModel(item.model_name);
+        }
+        for (const item of modelChannels) addModel(item.name);
+        for (const item of pricedModels) addModel(item.name);
+        for (const channel of channels ?? []) {
+            for (const name of `${channel.raw.model},${channel.raw.custom_model}`.split(',')) addModel(name);
+        }
+        for (const name of logModelNames) addModel(name);
+        return Array.from(names.values()).sort((a, b) => a.localeCompare(b));
+    }, [channels, groups, logModelNames, modelChannels, pricedModels]);
+
+    const selectedModelSet = useMemo(
+        () => new Set(logModelNames.map((name) => name.trim().toLowerCase()).filter(Boolean)),
+        [logModelNames],
+    );
+
+    const visibleModelOptions = useMemo(() => {
+        const term = logSourceKeyword.trim().toLowerCase();
+        if (!term) return modelOptions.filter((name) => selectedModelSet.has(name.toLowerCase()));
+        return modelOptions.filter((name) => name.toLowerCase().includes(term));
+    }, [logSourceKeyword, modelOptions, selectedModelSet]);
+
+    const toggleModel = (name: string) => {
+        const normalized = name.trim().toLowerCase();
+        const next = logModelNames.filter((selected) => selected.trim().toLowerCase() !== normalized);
+        if (next.length === logModelNames.length) next.push(name);
+        setLogModelNames(next);
+    };
 
     const toggleChannel = (id: number) => {
         const next = new Set(selectedSet);
@@ -244,9 +311,10 @@ export function LogFilterPopover() {
     const handleClear = () => {
         setLogDateRange({});
         setLogChannelIds([]);
+        setLogModelNames([]);
         setLogKeywordMode('default');
         setLogKeywordScope('default');
-        setSearch('');
+        setLogSourceKeyword('');
     };
 
     const startDisabled = useMemo<Matcher[]>(() => {
@@ -286,6 +354,8 @@ export function LogFilterPopover() {
     const keywordScopeActive = hasKeyword && logKeywordScope === 'content';
     const activeCount =
         (dateActive ? 1 : 0) +
+        (logSourceKeyword.trim() ? 1 : 0) +
+        (logModelNames.length > 0 ? 1 : 0) +
         (logChannelIds.length > 0 ? 1 : 0) +
         (keywordModeActive || keywordScopeActive ? 1 : 0);
 
@@ -315,7 +385,7 @@ export function LogFilterPopover() {
                 align="end"
                 side="bottom"
                 sideOffset={8}
-                className="w-[20rem] rounded-2xl border border-border/60 bg-card p-3 shadow-xl"
+                className="max-h-[calc(100vh-2rem)] w-[20rem] overflow-y-auto rounded-2xl border border-border/60 bg-card p-3 shadow-xl"
             >
                 <div className="flex flex-col gap-3">
                     <div className="flex items-center justify-between">
@@ -396,9 +466,9 @@ export function LogFilterPopover() {
                     <div className="grid gap-2">
                         <div className="flex items-center justify-between">
                             <p className="text-xs font-medium text-muted-foreground">{t('popover.logFilter.channel.title')}</p>
-                            {logChannelIds.length > 0 ? (
+                            {(logChannelIds.length > 0 || logModelNames.length > 0) ? (
                                 <Badge variant="secondary" className="h-5 px-1.5 text-[10px] font-semibold tabular-nums">
-                                    {logChannelIds.length}
+                                    {logChannelIds.length + logModelNames.length}
                                 </Badge>
                             ) : null}
                         </div>
@@ -406,91 +476,131 @@ export function LogFilterPopover() {
                             <Search className="size-3.5 shrink-0 text-muted-foreground" />
                             <input
                                 type="text"
-                                value={search}
-                                onChange={(e) => setSearch(e.target.value)}
+                                value={logSourceKeyword}
+                                onChange={(e) => setLogSourceKeyword(e.target.value)}
                                 placeholder={t('popover.logFilter.channel.searchPlaceholder')}
                                 className="w-full bg-transparent text-xs outline-none placeholder:text-muted-foreground"
                             />
+                            {logSourceKeyword ? (
+                                <button
+                                    type="button"
+                                    aria-label={t('popover.logFilter.channel.clearSearch')}
+                                    onClick={() => setLogSourceKeyword('')}
+                                    className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                                >
+                                    <X className="size-3" />
+                                </button>
+                            ) : null}
                         </div>
-                        <div className="max-h-60 overflow-auto rounded-lg border border-border/60">
-                            {filteredGroups.length === 0 ? (
+                        <div className="max-h-72 overflow-auto rounded-lg border border-border/60">
+                            {visibleModelOptions.length === 0 && filteredGroups.length === 0 ? (
                                 <p className="px-3 py-4 text-center text-xs text-muted-foreground">
                                     {t('popover.logFilter.channel.empty')}
                                 </p>
                             ) : (
-                                filteredGroups.map((group) => {
-                                    const ids = group.channels.map((c) => c.id);
-                                    const selectedInGroup = ids.filter((id) => selectedSet.has(id)).length;
-                                    const allSelected = selectedInGroup === ids.length;
-                                    const isExpanded = expanded.has(group.key) || !!search.trim();
-
-                                    return (
-                                        <div key={group.key} className="border-b border-border/40 last:border-b-0">
-                                            <div className="flex items-center gap-1 px-2 py-1.5 hover:bg-muted/30">
-                                                <button
-                                                    type="button"
-                                                    onClick={() => toggleExpanded(group.key)}
-                                                    className="flex size-5 items-center justify-center rounded text-muted-foreground hover:text-foreground"
-                                                >
-                                                    <ChevronDown
-                                                        className={cn('size-3.5 transition-transform', isExpanded ? '' : '-rotate-90')}
-                                                    />
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    onClick={() => toggleGroup(group)}
-                                                    className="flex flex-1 items-center gap-2 text-left"
-                                                >
-                                                    <span
-                                                        className={cn(
-                                                            'flex size-3.5 shrink-0 items-center justify-center rounded border transition-colors',
-                                                            allSelected
-                                                                ? 'border-primary bg-primary text-primary-foreground'
-                                                                : selectedInGroup > 0
-                                                                    ? 'border-primary/60 bg-primary/30'
-                                                                    : 'border-border',
-                                                        )}
+                                <>
+                                    {visibleModelOptions.length > 0 ? (
+                                        <div className="border-b border-border/40 last:border-b-0">
+                                            <p className="px-2.5 py-1.5 text-[10px] font-medium text-muted-foreground">
+                                                {t('popover.logFilter.channel.models')}
+                                            </p>
+                                            {visibleModelOptions.map((name) => {
+                                                const checked = selectedModelSet.has(name.trim().toLowerCase());
+                                                return (
+                                                    <button
+                                                        key={name}
+                                                        type="button"
+                                                        onClick={() => toggleModel(name)}
+                                                        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-muted/40"
                                                     >
-                                                        {allSelected ? <Check className="size-2.5" /> : selectedInGroup > 0 ? <span className="size-1.5 rounded-sm bg-primary" /> : null}
-                                                    </span>
-                                                    <span className="flex-1 truncate text-xs font-semibold text-foreground">
-                                                        {group.label}
-                                                    </span>
-                                                    <span className="text-[10px] tabular-nums text-muted-foreground">
-                                                        {selectedInGroup}/{ids.length}
-                                                    </span>
-                                                </button>
-                                            </div>
-                                            {isExpanded ? (
-                                                <div className="flex flex-col">
-                                                    {group.channels.map((channel) => {
-                                                        const checked = selectedSet.has(channel.id);
-                                                        return (
-                                                            <button
-                                                                key={channel.id}
-                                                                type="button"
-                                                                onClick={() => toggleChannel(channel.id)}
-                                                                className="flex items-center gap-2 px-2 py-1.5 pl-8 text-left hover:bg-muted/40"
-                                                            >
-                                                                <span
-                                                                    className={cn(
-                                                                        'flex size-3.5 shrink-0 items-center justify-center rounded border transition-colors',
-                                                                        checked
-                                                                            ? 'border-primary bg-primary text-primary-foreground'
-                                                                            : 'border-border',
-                                                                    )}
-                                                                >
-                                                                    {checked ? <Check className="size-2.5" /> : null}
-                                                                </span>
-                                                                <span className="flex-1 truncate text-xs text-foreground">{channel.name}</span>
-                                                            </button>
-                                                        );
-                                                    })}
-                                                </div>
-                                            ) : null}
+                                                        <span
+                                                            className={cn(
+                                                                'flex size-3.5 shrink-0 items-center justify-center rounded border transition-colors',
+                                                                checked ? 'border-primary bg-primary text-primary-foreground' : 'border-border',
+                                                            )}
+                                                        >
+                                                            {checked ? <Check className="size-2.5" /> : null}
+                                                        </span>
+                                                        <span className="min-w-0 flex-1 truncate text-xs text-foreground">{name}</span>
+                                                    </button>
+                                                );
+                                            })}
                                         </div>
-                                    );
-                                })
+                                    ) : null}
+                                    {filteredGroups.map((group) => {
+                                        const ids = group.channels.map((c) => c.id);
+                                        const selectedInGroup = ids.filter((id) => selectedSet.has(id)).length;
+                                        const allSelected = selectedInGroup === ids.length;
+                                        const isExpanded = expanded.has(group.key) || !!logSourceKeyword.trim();
+
+                                        return (
+                                            <div key={group.key} className="border-b border-border/40 last:border-b-0">
+                                                <div className="flex items-center gap-1 px-2 py-1.5 hover:bg-muted/30">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => toggleExpanded(group.key)}
+                                                        className="flex size-5 items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                                                    >
+                                                        <ChevronDown
+                                                            className={cn('size-3.5 transition-transform', isExpanded ? '' : '-rotate-90')}
+                                                        />
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => toggleGroup(group)}
+                                                        className="flex flex-1 items-center gap-2 text-left"
+                                                    >
+                                                        <span
+                                                            className={cn(
+                                                                'flex size-3.5 shrink-0 items-center justify-center rounded border transition-colors',
+                                                                allSelected
+                                                                    ? 'border-primary bg-primary text-primary-foreground'
+                                                                    : selectedInGroup > 0
+                                                                        ? 'border-primary/60 bg-primary/30'
+                                                                        : 'border-border',
+                                                            )}
+                                                        >
+                                                            {allSelected ? <Check className="size-2.5" /> : selectedInGroup > 0 ? <span className="size-1.5 rounded-sm bg-primary" /> : null}
+                                                        </span>
+                                                        <span className="flex-1 truncate text-xs font-semibold text-foreground">
+                                                            {group.label}
+                                                        </span>
+                                                        <span className="text-[10px] tabular-nums text-muted-foreground">
+                                                            {selectedInGroup}/{ids.length}
+                                                        </span>
+                                                    </button>
+                                                </div>
+                                                {isExpanded ? (
+                                                    <div className="flex flex-col">
+                                                        {group.channels.map((channel) => {
+                                                            const checked = selectedSet.has(channel.id);
+                                                            return (
+                                                                <button
+                                                                    key={channel.id}
+                                                                    type="button"
+                                                                    onClick={() => toggleChannel(channel.id)}
+                                                                    className="flex items-center gap-2 px-2 py-1.5 pl-8 text-left hover:bg-muted/40"
+                                                                >
+                                                                    <span
+                                                                        className={cn(
+                                                                            'flex size-3.5 shrink-0 items-center justify-center rounded border transition-colors',
+                                                                            checked
+                                                                                ? 'border-primary bg-primary text-primary-foreground'
+                                                                                : 'border-border',
+                                                                        )}
+                                                                    >
+                                                                        {checked ? <Check className="size-2.5" /> : null}
+                                                                    </span>
+                                                                    <span className="flex-1 truncate text-xs text-foreground">{channel.name}</span>
+                                                                </button>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                ) : null}
+                                            </div>
+                                        );
+                                    })}
+                                </>
                             )}
                         </div>
                     </div>

@@ -478,8 +478,9 @@ export function useCreateSiteChannelKey(siteId: number, accountId: number) {
             apiClient.post<SiteChannelAccountServer>(getAccountPath(siteId, accountId, '/keys'), payload),
         onSuccess: (account) => {
             const normalizedAccount = normalizeSiteChannelAccount(account);
-            queryClient.setQueryData<SiteChannelCard[]>(['site-channel', 'list'], (cards) =>
-                replaceSiteChannelAccount(cards, siteId, normalizedAccount),
+            queryClient.setQueriesData<SiteChannelCard[]>(
+                { queryKey: ['site-channel', 'list'] },
+                (cards) => replaceSiteChannelAccount(cards, siteId, normalizedAccount),
             );
             invalidateSiteChannelQueries(queryClient);
         },

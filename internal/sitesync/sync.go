@@ -26,21 +26,96 @@ func isAlreadyCheckedInMessage(message string) bool {
 }
 
 func syncAccountState(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount) (*syncSnapshot, error) {
+	return syncAccountStateWithCreatedToken(ctx, siteRecord, account, nil)
+}
+
+func syncAccountStateWithCreatedToken(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, createdToken *model.SiteToken) (*syncSnapshot, error) {
 	if siteRecord == nil || account == nil {
 		return nil, fmt.Errorf("site or account is nil")
 	}
 	switch siteRecord.Platform {
 	case model.SitePlatformAnyRouter:
-		return syncAnyRouter(ctx, siteRecord, account)
+		return syncAnyRouterWithCreatedToken(ctx, siteRecord, account, createdToken)
 	case model.SitePlatformNewAPI, model.SitePlatformOneAPI, model.SitePlatformOneHub, model.SitePlatformDoneHub:
-		return syncManagementPlatform(ctx, siteRecord, account)
+		return syncManagementPlatformWithCreatedToken(ctx, siteRecord, account, createdToken)
 	case model.SitePlatformSub2API:
-		return syncSub2API(ctx, siteRecord, account)
+		return syncSub2APIWithCreatedToken(ctx, siteRecord, account, createdToken)
 	case model.SitePlatformAPI:
 		return syncOfficialPlatform(ctx, siteRecord, account)
 	default:
 		return nil, newUnsupportedSitePlatformError(siteRecord.Platform)
 	}
+}
+
+func mergeCreatedSiteTokenIntoSyncedTokens(tokens []model.SiteToken, created *model.SiteToken) []model.SiteToken {
+	if created == nil {
+		return tokens
+	}
+	createdValue := strings.TrimSpace(created.Token)
+	if createdValue == "" || model.IsMaskedSiteTokenValue(createdValue) {
+		return tokens
+	}
+
+	createdCopy := *created
+	createdCopy.Token = createdValue
+	createdCopy.GroupKey = model.NormalizeSiteGroupKey(createdCopy.GroupKey)
+	createdCopy.GroupName = model.NormalizeSiteGroupName(createdCopy.GroupKey, createdCopy.GroupName)
+	createdCopy.Name = strings.TrimSpace(createdCopy.Name)
+	createdCopy.ValueStatus = model.SiteTokenValueStatusReady
+	createdCopy.Source = siteTokenSourceCreated
+	if createdCopy.Name == "" {
+		createdCopy.Name = "created"
+	}
+
+	result := append([]model.SiteToken(nil), tokens...)
+	exactIndex := -1
+	for index := range result {
+		result[index].GroupKey = model.NormalizeSiteGroupKey(result[index].GroupKey)
+		result[index].GroupName = model.NormalizeSiteGroupName(result[index].GroupKey, result[index].GroupName)
+		if result[index].GroupKey != createdCopy.GroupKey || normalizeSiteTokenName(result[index].Name) != normalizeSiteTokenName(createdCopy.Name) {
+			continue
+		}
+		if exactIndex >= 0 {
+			exactIndex = -2
+			break
+		}
+		exactIndex = index
+	}
+	if exactIndex >= 0 {
+		return replaceCreatedSiteToken(result, exactIndex, createdCopy)
+	}
+
+	maskIndex := -1
+	for index := range result {
+		item := result[index]
+		if item.GroupKey != createdCopy.GroupKey || !model.IsMaskedSiteTokenValue(item.Token) || !siteMaskedTokenMatches(createdCopy.Token, item.Token) {
+			continue
+		}
+		if maskIndex >= 0 {
+			maskIndex = -2
+			break
+		}
+		maskIndex = index
+	}
+	if maskIndex >= 0 {
+		return replaceCreatedSiteToken(result, maskIndex, createdCopy)
+	}
+
+	return append(result, createdCopy)
+}
+
+func replaceCreatedSiteToken(tokens []model.SiteToken, index int, created model.SiteToken) []model.SiteToken {
+	if index < 0 || index >= len(tokens) {
+		return append(tokens, created)
+	}
+	if groupName := strings.TrimSpace(tokens[index].GroupName); groupName != "" {
+		created.GroupName = tokens[index].GroupName
+	}
+	created.Enabled = tokens[index].Enabled
+	created.IsDefault = tokens[index].IsDefault
+	created.ID = tokens[index].ID
+	tokens[index] = created
+	return tokens
 }
 
 func checkinAccountState(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount) (*model.SiteCheckinResult, string, error) {
@@ -78,6 +153,10 @@ func checkinAccountState(ctx context.Context, siteRecord *model.Site, account *m
 }
 
 func syncManagementPlatform(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount) (*syncSnapshot, error) {
+	return syncManagementPlatformWithCreatedToken(ctx, siteRecord, account, nil)
+}
+
+func syncManagementPlatformWithCreatedToken(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, createdToken *model.SiteToken) (*syncSnapshot, error) {
 	if account.CredentialType == model.SiteCredentialTypeAPIKey {
 		return syncWithDirectToken(ctx, siteRecord, account, resolveDirectToken(account), "manual")
 	}
@@ -91,6 +170,7 @@ func syncManagementPlatform(ctx context.Context, siteRecord *model.Site, account
 	if err != nil {
 		return nil, err
 	}
+	tokens = mergeCreatedSiteTokenIntoSyncedTokens(tokens, createdToken)
 	groups, err := fetchManagementGroups(ctx, siteRecord, account, accessToken)
 	if err != nil {
 		groups = nil
@@ -172,6 +252,10 @@ func syncManagementPlatform(ctx context.Context, siteRecord *model.Site, account
 }
 
 func syncSub2API(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount) (*syncSnapshot, error) {
+	return syncSub2APIWithCreatedToken(ctx, siteRecord, account, nil)
+}
+
+func syncSub2APIWithCreatedToken(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, createdToken *model.SiteToken) (*syncSnapshot, error) {
 	if account.CredentialType == model.SiteCredentialTypeUsernamePassword {
 		return nil, fmt.Errorf("sub2api does not support username/password login")
 	}
@@ -183,17 +267,17 @@ func syncSub2API(ctx context.Context, siteRecord *model.Site, account *model.Sit
 	if err != nil {
 		return nil, err
 	}
-	snapshot, err := syncSub2APIWithAccessToken(ctx, siteRecord, account, accessToken)
+	snapshot, err := syncSub2APIWithAccessToken(ctx, siteRecord, account, accessToken, createdToken)
 	if err != nil && shouldRetrySub2APIAfterRefresh(err, account) {
 		refreshedToken, refreshErr := ensureFreshSub2APIAccessToken(ctx, siteRecord, account, true)
 		if refreshErr == nil && stripBearerPrefix(refreshedToken) != stripBearerPrefix(accessToken) {
-			return syncSub2APIWithAccessToken(ctx, siteRecord, account, refreshedToken)
+			return syncSub2APIWithAccessToken(ctx, siteRecord, account, refreshedToken, createdToken)
 		}
 	}
 	return snapshot, err
 }
 
-func syncSub2APIWithAccessToken(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string) (*syncSnapshot, error) {
+func syncSub2APIWithAccessToken(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, createdToken *model.SiteToken) (*syncSnapshot, error) {
 	accessToken = stripBearerPrefix(accessToken)
 	if accessToken == "" {
 		return nil, newAccessTokenRequiredError()
@@ -202,6 +286,7 @@ func syncSub2APIWithAccessToken(ctx context.Context, siteRecord *model.Site, acc
 	if err != nil {
 		return nil, err
 	}
+	tokens = mergeCreatedSiteTokenIntoSyncedTokens(tokens, createdToken)
 	if len(tokens) == 0 && strings.TrimSpace(account.APIKey) != "" {
 		tokens = append(tokens, model.SiteToken{Name: "default", Token: strings.TrimSpace(account.APIKey), GroupKey: model.SiteDefaultGroupKey, GroupName: model.SiteDefaultGroupName, Enabled: true, Source: "fallback", IsDefault: true})
 	}

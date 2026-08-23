@@ -1,13 +1,98 @@
 package relay
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	dbmodel "github.com/bestruirui/octopus/internal/model"
+	"github.com/bestruirui/octopus/internal/op"
 	"github.com/bestruirui/octopus/internal/relay/balancer"
+	"github.com/bestruirui/octopus/internal/transformer/inbound"
 	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
+	"github.com/bestruirui/octopus/internal/transformer/outbound"
 )
+
+func TestNewWSRelayRequestCopiesRawBody(t *testing.T) {
+	ctx := setupRelayTestDB(t)
+	channel := &dbmodel.Channel{
+		Name:     "ws-raw-body",
+		Type:     outbound.OutboundTypeOpenAIChat,
+		Enabled:  true,
+		BaseUrls: []dbmodel.BaseUrl{{URL: "https://unused.invalid/v1"}},
+		Model:    "upstream-model",
+		Keys:     []dbmodel.ChannelKey{{Enabled: true, ChannelKey: "key"}},
+	}
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	group := &dbmodel.Group{Name: "ws-raw-body-group", Mode: dbmodel.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := op.GroupItemAdd(&dbmodel.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "upstream-model"}, ctx); err != nil {
+		t.Fatalf("add group item: %v", err)
+	}
+
+	content := "hello"
+	execution := &transformerModel.InternalLLMRequest{
+		Model:        group.Name,
+		RawAPIFormat: transformerModel.APIFormatOpenAIResponse,
+		Messages: []transformerModel.Message{{
+			Role:    "user",
+			Content: transformerModel.MessageContent{Content: &content},
+		}},
+	}
+	rawBody := []byte(`{"model":"ws-raw-body-group","input":"hello","future_field":true}`)
+	req, _, err := newWSRelayRequest(context.Background(), nil, inbound.Get(inbound.InboundTypeOpenAIResponse), 1, group.Name, execution, execution, nil, rawBody)
+	if err != nil {
+		t.Fatalf("newWSRelayRequest failed: %v", err)
+	}
+	rawBody[0] = 'x'
+	if string(req.rawBody) != `{"model":"ws-raw-body-group","input":"hello","future_field":true}` {
+		t.Fatalf("expected copied raw body, got %q", req.rawBody)
+	}
+}
+
+func TestNewWSRelayRequestDropsRawBodyForExactReplay(t *testing.T) {
+	ctx := setupRelayTestDB(t)
+	channel := &dbmodel.Channel{
+		Name:     "ws-exact-replay",
+		Type:     outbound.OutboundTypeOpenAIResponse,
+		Enabled:  true,
+		BaseUrls: []dbmodel.BaseUrl{{URL: "https://unused.invalid/v1"}},
+		Model:    "upstream-model",
+		Keys:     []dbmodel.ChannelKey{{Enabled: true, ChannelKey: "key"}},
+	}
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	group := &dbmodel.Group{Name: "ws-exact-replay-group", Mode: dbmodel.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := op.GroupItemAdd(&dbmodel.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "upstream-model"}, ctx); err != nil {
+		t.Fatalf("add group item: %v", err)
+	}
+
+	content := "hello"
+	execution := &transformerModel.InternalLLMRequest{
+		Model:        group.Name,
+		RawAPIFormat: transformerModel.APIFormatOpenAIResponse,
+		Messages: []transformerModel.Message{{
+			Role:    "user",
+			Content: transformerModel.MessageContent{Content: &content},
+		}},
+	}
+	execution.MarkOpenAIExactReplayRequest()
+	req, _, err := newWSRelayRequest(context.Background(), nil, inbound.Get(inbound.InboundTypeOpenAIResponse), 1, group.Name, execution, execution, nil, []byte(`{"previous_response_id":"stale"}`))
+	if err != nil {
+		t.Fatalf("newWSRelayRequest failed: %v", err)
+	}
+	if len(req.rawBody) != 0 {
+		t.Fatalf("expected exact replay to rebuild payload instead of using stale raw body, got %q", req.rawBody)
+	}
+}
 
 func TestResolveWSConversationStateFallsBackToStoredState(t *testing.T) {
 	resetWSConversationStateStore()
@@ -15,10 +100,10 @@ func TestResolveWSConversationStateFallsBackToStoredState(t *testing.T) {
 
 	stored := &wsConversationState{
 		DownstreamSessionID: "ws_a",
-		RequestModel:   "gpt-5.4",
-		ChannelID:      11,
-		ChannelKeyID:   22,
-		LastResponseID: "resp_saved",
+		RequestModel:        "gpt-5.4",
+		ChannelID:           11,
+		ChannelKeyID:        22,
+		LastResponseID:      "resp_saved",
 	}
 	storeWSConversationState(7, "gpt-5.4", stored, time.Minute)
 
@@ -53,9 +138,9 @@ func TestResolveWSConversationStateDoesNotRestoreStoredStateForFreshConnection(t
 
 	storeWSConversationState(7, "gpt-5.4", &wsConversationState{
 		DownstreamSessionID: "ws_a",
-		RequestModel:   "gpt-5.4",
-		LastResponseID: "resp_saved",
-		Transcript:     []transformerModel.Message{{Role: "assistant"}},
+		RequestModel:        "gpt-5.4",
+		LastResponseID:      "resp_saved",
+		Transcript:          []transformerModel.Message{{Role: "assistant"}},
 	}, time.Minute)
 
 	resolved := resolveWSConversationState(7, "gpt-5.4", nil, false, "ws_b")
@@ -70,9 +155,9 @@ func TestResolveWSConversationStateRestoresStoredStateForContinuation(t *testing
 
 	storeWSConversationState(7, "gpt-5.4", &wsConversationState{
 		DownstreamSessionID: "ws_a",
-		RequestModel:   "gpt-5.4",
-		LastResponseID: "resp_saved",
-		Transcript:     []transformerModel.Message{{Role: "assistant"}},
+		RequestModel:        "gpt-5.4",
+		LastResponseID:      "resp_saved",
+		Transcript:          []transformerModel.Message{{Role: "assistant"}},
 	}, time.Minute)
 
 	local := &wsConversationState{RequestModel: "other-model"}
@@ -97,8 +182,8 @@ func TestResolveWSConversationStateIsSessionScoped(t *testing.T) {
 
 	storeWSConversationState(7, "gpt-5.4", &wsConversationState{
 		DownstreamSessionID: "ws_a",
-		RequestModel:       "gpt-5.4",
-		LastResponseID:     "resp_saved",
+		RequestModel:        "gpt-5.4",
+		LastResponseID:      "resp_saved",
 	}, time.Minute)
 
 	if resolved := resolveWSConversationState(7, "gpt-5.4", nil, true, "ws_b"); resolved != nil {

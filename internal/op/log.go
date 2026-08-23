@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -436,6 +437,8 @@ type RelayLogListFilter struct {
 	StartTime      *int
 	EndTime        *int
 	ChannelIDs     []int
+	ModelNames     []string
+	SourceKeyword  string
 	Status         RelayLogStatusFilter
 	Keyword        string
 	KeywordScope   RelayLogKeywordScope
@@ -481,6 +484,55 @@ type RelayLogFilterError struct {
 }
 
 func (e *RelayLogFilterError) Error() string { return e.Message }
+
+// RelayLogChannelIDs 返回日志中实际出现过的顶层渠道 ID。
+// 日志保留开启时合并数据库历史与尚未落库的 pending；关闭时仅使用 recent 内存缓存。
+func RelayLogChannelIDs(ctx context.Context) ([]int, error) {
+	enabled, err := SettingGetBool(model.SettingKeyRelayLogKeepEnabled)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[int]struct{})
+	if enabled {
+		relayLogPendingLock.Lock()
+		for _, entry := range relayLogPending {
+			if entry.ChannelId > 0 {
+				seen[entry.ChannelId] = struct{}{}
+			}
+		}
+		relayLogPendingLock.Unlock()
+
+		var dbChannelIDs []int
+		if err := db.GetDB().WithContext(ctx).
+			Model(&model.RelayLog{}).
+			Where("channel_id > ?", 0).
+			Distinct("channel_id").
+			Pluck("channel_id", &dbChannelIDs).Error; err != nil {
+			return nil, err
+		}
+		for _, channelID := range dbChannelIDs {
+			if channelID > 0 {
+				seen[channelID] = struct{}{}
+			}
+		}
+	} else {
+		relayLogRecentLock.Lock()
+		for _, entry := range relayLogRecent {
+			if entry.ChannelId > 0 {
+				seen[entry.ChannelId] = struct{}{}
+			}
+		}
+		relayLogRecentLock.Unlock()
+	}
+
+	channelIDs := make([]int, 0, len(seen))
+	for channelID := range seen {
+		channelIDs = append(channelIDs, channelID)
+	}
+	sort.Ints(channelIDs)
+	return channelIDs, nil
+}
 
 // RelayLogList 查询日志列表，支持可选的时间范围和渠道ID过滤
 // startTime 和 endTime 为 nil 时表示不限制时间范围
@@ -529,6 +581,8 @@ func RelayLogListWithFilter(ctx context.Context, filter RelayLogListFilter) (Rel
 		filter.PageSize = 20
 	}
 	filter.Keyword = strings.TrimSpace(filter.Keyword)
+	filter.ModelNames = normalizeRelayLogModelNames(filter.ModelNames)
+	filter.SourceKeyword = strings.ToLower(strings.TrimSpace(filter.SourceKeyword))
 
 	// Resolve effective keyword mode and apply guardrails for slow contains
 	// search before any DB work.
@@ -830,6 +884,12 @@ func relayLogMatchesFilter(relayLog model.RelayLog, filter RelayLogListFilter, c
 	if len(channelSet) > 0 && !logMatchesChannels(relayLog, channelSet) {
 		return false
 	}
+	if len(filter.ModelNames) > 0 && !logMatchesModels(relayLog, filter.ModelNames) {
+		return false
+	}
+	if filter.SourceKeyword != "" && !logMatchesSourceKeyword(relayLog, filter.SourceKeyword) {
+		return false
+	}
 	if filter.Status == RelayLogStatusSuccess && !relayLog.Success {
 		return false
 	}
@@ -851,6 +911,13 @@ func applyRelayLogDBFilters(query *gorm.DB, filter RelayLogListFilter) *gorm.DB 
 	}
 	if len(filter.ChannelIDs) > 0 {
 		query = query.Where("channel_id IN ?", filter.ChannelIDs)
+	}
+	if len(filter.ModelNames) > 0 {
+		query = query.Where("(LOWER(request_model_name) IN ? OR LOWER(actual_model_name) IN ?)", filter.ModelNames, filter.ModelNames)
+	}
+	if filter.SourceKeyword != "" {
+		like := "%" + escapeLikeKeyword(filter.SourceKeyword) + "%"
+		query = query.Where("(LOWER(channel_name) LIKE ? ESCAPE '#' OR LOWER(request_model_name) LIKE ? ESCAPE '#' OR LOWER(actual_model_name) LIKE ? ESCAPE '#')", like, like, like)
 	}
 	if filter.Status == RelayLogStatusSuccess {
 		query = query.Where("success = ?", true)
@@ -904,7 +971,46 @@ func escapeLikeKeyword(s string) string {
 	return s
 }
 
-// logMatchesChannels 检查日志是否属于指定的渠道集合。
+func normalizeRelayLogModelNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(names))
+	result := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// logMatchesModels 检查日志的请求模型或实际模型是否命中筛选。
+func logMatchesModels(relayLog model.RelayLog, modelNames []string) bool {
+	requestModel := strings.ToLower(strings.TrimSpace(relayLog.RequestModelName))
+	actualModel := strings.ToLower(strings.TrimSpace(relayLog.ActualModelName))
+	for _, modelName := range modelNames {
+		if modelName == requestModel || modelName == actualModel {
+			return true
+		}
+	}
+	return false
+}
+
+// logMatchesSourceKeyword 检查渠道名、请求模型或实际模型是否包含渠道/模型搜索词。
+func logMatchesSourceKeyword(relayLog model.RelayLog, keyword string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(relayLog.ChannelName)), keyword) ||
+		strings.Contains(strings.ToLower(strings.TrimSpace(relayLog.RequestModelName)), keyword) ||
+		strings.Contains(strings.ToLower(strings.TrimSpace(relayLog.ActualModelName)), keyword)
+}
+
 // 仅匹配顶层 ChannelId，保持与 DB 查询 channel_id IN ? 一致，
 // 避免缓存与 DB 分页/计数语义偏差。
 func logMatchesChannels(log model.RelayLog, channelSet map[int]struct{}) bool {

@@ -90,6 +90,110 @@ func TestSyncManagementPlatformDiscoversNewAPIUserID(t *testing.T) {
 	}
 }
 
+func TestSyncManagementPlatformRestoresMaskedKeysFromBatchEndpoint(t *testing.T) {
+	batchCalled := false
+	detailCalled := false
+	platformUserID := 7788
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/token/" && r.Method == http.MethodGet:
+			if r.Header.Get("Authorization") != "Bearer test-access-token" || r.Header.Get("New-API-User") != "7788" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"success":false,"message":"unauthorized"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"data":{"items":[{"id":41,"name":"primary","key":"sk-rest**********-key","group":"vip","status":1}]}}`))
+		case r.URL.Path == "/api/token/batch/keys" && r.Method == http.MethodPost:
+			batchCalled = true
+			if r.Header.Get("Authorization") != "Bearer test-access-token" || r.Header.Get("New-API-User") != "7788" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"success":false,"message":"unauthorized"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"success":true,"data":{"keys":{"41":"sk-restored-key"}}}`))
+		case r.URL.Path == "/api/token/41" && r.Method == http.MethodGet:
+			detailCalled = true
+			_, _ = w.Write([]byte(`{"data":{"key":"sk-restored-key"}}`))
+		case r.URL.Path == "/api/user/self/groups":
+			_, _ = w.Write([]byte(`{"data":[{"id":"vip","name":"VIP"}]}`))
+		case r.URL.Path == "/api/user/self":
+			_, _ = w.Write([]byte(`{"success":true,"data":{"id":7788,"quota":1000000,"used_quota":0}}`))
+		case r.URL.Path == "/models":
+			if r.Header.Get("Authorization") != "Bearer sk-restored-key" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-4o-mini"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	snapshot, err := syncManagementPlatform(context.Background(), &model.Site{
+		Platform: model.SitePlatformNewAPI,
+		BaseURL:  server.URL,
+	}, &model.SiteAccount{
+		Name:           "managed-user",
+		CredentialType: model.SiteCredentialTypeAccessToken,
+		AccessToken:    "test-access-token",
+		PlatformUserID: &platformUserID,
+		Enabled:        true,
+		AutoSync:       true,
+	})
+	if err != nil {
+		t.Fatalf("syncManagementPlatform returned error: %v", err)
+	}
+	if !batchCalled {
+		t.Fatalf("expected masked key batch endpoint to be called")
+	}
+	if detailCalled {
+		t.Fatalf("expected detail endpoint not to be needed after batch success")
+	}
+	if len(snapshot.tokens) != 1 || snapshot.tokens[0].Token != "sk-restored-key" {
+		t.Fatalf("expected masked key to be restored from batch response, got %+v", snapshot.tokens)
+	}
+	if len(snapshot.models) != 1 || snapshot.models[0].ModelName != "gpt-4o-mini" {
+		t.Fatalf("expected restored key to be used for model discovery, got %+v", snapshot.models)
+	}
+}
+
+func TestFetchMaskedManagedTokenKeysFallsBackToDetailEndpoint(t *testing.T) {
+	batchCalls := 0
+	detailCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/token/batch/keys":
+			batchCalls++
+			http.NotFound(w, r)
+		case r.URL.Path == "/api/token/41/key" && r.Method == http.MethodPost:
+			detailCalls++
+			_, _ = w.Write([]byte(`{"data":{"key":"sk-detail-restored-key"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	resolved := fetchMaskedManagedTokenKeys(context.Background(), &model.Site{
+		Platform: model.SitePlatformOneAPI,
+		BaseURL:  server.URL,
+	}, &model.SiteAccount{
+		CredentialType: model.SiteCredentialTypeAccessToken,
+		AccessToken:    "test-access-token",
+	}, "test-access-token", []map[string]any{{"id": 41, "key": "sk-detail**********-key"}}, nil)
+	if batchCalls != 1 || detailCalls != 1 {
+		t.Fatalf("expected one batch and one detail request, got batch=%d detail=%d", batchCalls, detailCalls)
+	}
+	if resolved["41"] != "sk-detail-restored-key" {
+		t.Fatalf("expected detail endpoint to restore key, got %+v", resolved)
+	}
+}
+
 func TestSyncManagementPlatformUsesStoredNewAPIUserID(t *testing.T) {
 	userSelfCalls := 0
 

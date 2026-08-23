@@ -85,8 +85,9 @@ export function routeTypeLabel(routeType: SiteModelRouteType) {
     switch (routeType) {
         case 'unknown':
             return '未识别端点';
+        case 'openai_chat':
         case 'openai_response':
-            return 'OpenAI Response';
+            return 'OpenAI';
         case 'anthropic':
             return 'Anthropic';
         case 'gemini':
@@ -96,7 +97,20 @@ export function routeTypeLabel(routeType: SiteModelRouteType) {
         case 'openai_embedding':
             return 'OpenAI Embedding';
         default:
+            return 'OpenAI';
+    }
+}
+
+// Active route selectors keep the protocol distinction so moving a model or
+// adding a manual route cannot accidentally choose the wrong endpoint.
+export function routeTypeTargetLabel(routeType: SiteModelRouteType) {
+    switch (routeType) {
+        case 'openai_chat':
             return 'OpenAI Chat';
+        case 'openai_response':
+            return 'OpenAI Responses';
+        default:
+            return routeTypeLabel(routeType);
     }
 }
 

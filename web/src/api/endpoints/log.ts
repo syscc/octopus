@@ -103,6 +103,8 @@ export interface LogListParams {
     start_time?: number;
     end_time?: number;
     channel_ids?: number[];
+    model_names?: string[];
+    source_keyword?: string;
     status?: LogStatusFilter;
     keyword?: string;
     keyword_scope?: LogKeywordScope;
@@ -123,6 +125,12 @@ const logFiltersKey = (filters?: UseLogsOptions['filters']) => ({
     start_time: filters?.start_time ?? null,
     end_time: filters?.end_time ?? null,
     channel_ids: filters?.channel_ids?.filter((id) => id > 0).sort((a, b) => a - b) ?? [],
+    model_names: Array.from(new Set(
+        (filters?.model_names ?? [])
+            .map((name) => name.trim().toLowerCase())
+            .filter(Boolean),
+    )).sort(),
+    source_keyword: filters?.source_keyword?.trim().toLowerCase() ?? '',
     status: filters?.status && filters.status !== 'all' ? filters.status : 'all',
     keyword: filters?.keyword?.trim() ?? '',
     keyword_scope: filters?.keyword_scope ?? 'default',
@@ -134,6 +142,14 @@ function appendLogListParams(params: URLSearchParams, filters?: UseLogsOptions['
     if (filters?.end_time) params.set('end_time', String(filters.end_time));
     const channelIds = filters?.channel_ids?.filter((id) => id > 0) ?? [];
     if (channelIds.length > 0) params.set('channel_ids', channelIds.join(','));
+    const modelNames = Array.from(new Set(
+        (filters?.model_names ?? [])
+            .map((name) => name.trim())
+            .filter(Boolean),
+    ));
+    if (modelNames.length > 0) params.set('model_names', modelNames.join(','));
+    const sourceKeyword = filters?.source_keyword?.trim();
+    if (sourceKeyword) params.set('source_keyword', sourceKeyword);
     if (filters?.status && filters.status !== 'all') params.set('status', filters.status);
     const keyword = filters?.keyword?.trim();
     if (keyword) params.set('keyword', keyword);
@@ -222,6 +238,20 @@ export function useLogSiteActionTargets(ids: number[], enabled = true) {
     });
 }
 
+export function useLogChannelIDs() {
+    return useQuery({
+        queryKey: ['logs', 'channel-ids'],
+        queryFn: async () => apiClient.get<number[] | null>('/api/v1/log/channel-ids'),
+        select: (data) => Array.from(new Set(
+            (data ?? []).filter((id) => Number.isInteger(id) && id > 0),
+        )).sort((a, b) => a - b),
+        staleTime: 0,
+        refetchInterval: 30000,
+        refetchOnMount: 'always',
+        refetchOnWindowFocus: false,
+    });
+}
+
 export function useClearLogs() {
     const queryClient = useQueryClient();
 
@@ -232,6 +262,7 @@ export function useClearLogs() {
         onSuccess: () => {
             logger.log('日志清空成功');
             queryClient.invalidateQueries({ queryKey: ['logs'] });
+            queryClient.invalidateQueries({ queryKey: ['logs', 'channel-ids'] });
         },
         onError: (error) => {
             logger.error('日志清空失败:', error);
@@ -369,6 +400,13 @@ export function useLogs(options: UseLogsOptions = {}) {
                 eventSource.onmessage = (event) => {
                     try {
                         const log: RelayLog = JSON.parse(event.data);
+                        if (log.channel > 0) {
+                            queryClient.setQueryData<number[]>(['logs', 'channel-ids'], (old) => {
+                                const channelIDs = new Set(old ?? []);
+                                channelIDs.add(log.channel);
+                                return Array.from(channelIDs).sort((a, b) => a - b);
+                            });
+                        }
                         queryClient.setQueryData(
                             logsInfiniteQueryKey(pageSize, filters),
                             (old: InfiniteData<CursorPage, LogCursor | null> | undefined) => {

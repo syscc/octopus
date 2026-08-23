@@ -34,6 +34,10 @@ var (
 )
 
 func syncAnyRouter(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount) (*syncSnapshot, error) {
+	return syncAnyRouterWithCreatedToken(ctx, siteRecord, account, nil)
+}
+
+func syncAnyRouterWithCreatedToken(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, createdToken *model.SiteToken) (*syncSnapshot, error) {
 	if account.CredentialType == model.SiteCredentialTypeAPIKey {
 		return syncWithDirectToken(ctx, siteRecord, account, resolveDirectToken(account), "manual")
 	}
@@ -48,6 +52,7 @@ func syncAnyRouter(ctx context.Context, siteRecord *model.Site, account *model.S
 	if err != nil {
 		return nil, err
 	}
+	tokens = mergeCreatedSiteTokenIntoSyncedTokens(tokens, createdToken)
 	if len(tokens) == 0 && account.CredentialType == model.SiteCredentialTypeAccessToken && strings.TrimSpace(account.AccessToken) != "" {
 		tokens = append(tokens, model.SiteToken{
 			Name:      "default",
@@ -215,7 +220,9 @@ func fetchAnyRouterManagementTokens(ctx context.Context, siteRecord *model.Site,
 	if err != nil {
 		return nil, err
 	}
-	if tokens := buildSiteTokensFromPayload(payload); len(tokens) > 0 {
+	items := parseTokenItems(payload)
+	resolvedKeys := fetchMaskedManagedTokenKeys(ctx, siteRecord, account, accessToken, items, managedUserIDHeaders(userID))
+	if tokens := buildSiteTokensFromPayload(payload, resolvedKeys); len(tokens) > 0 {
 		return tokens, nil
 	}
 
@@ -522,7 +529,9 @@ func fetchAnyRouterTokensByCookie(ctx context.Context, siteRecord *model.Site, a
 			if err != nil {
 				continue
 			}
-			if tokens := buildSiteTokensFromPayload(payload); len(tokens) > 0 {
+			items := parseTokenItems(payload)
+			resolvedKeys := fetchMaskedManagedTokenKeys(ctx, siteRecord, account, accessToken, items, managedUserIDHeaders(candidateUserID))
+			if tokens := buildSiteTokensFromPayload(payload, resolvedKeys); len(tokens) > 0 {
 				return tokens, nil
 			}
 		}
@@ -572,11 +581,16 @@ func fetchAnyRouterGroupsByCookie(ctx context.Context, siteRecord *model.Site, a
 	return nil, terminalErr
 }
 
-func buildSiteTokensFromPayload(payload map[string]any) []model.SiteToken {
+func buildSiteTokensFromPayload(payload map[string]any, resolvedKeys map[string]string) []model.SiteToken {
 	items := parseTokenItems(payload)
 	tokens := make([]model.SiteToken, 0, len(items))
 	for index, item := range items {
 		tokenValue := strings.TrimSpace(jsonString(item["key"]))
+		if model.IsMaskedSiteTokenValue(tokenValue) {
+			if remoteID, ok := siteTokenRemoteID(item); ok {
+				tokenValue = firstNonEmptyString(resolvedKeys[strconv.Itoa(remoteID)], tokenValue)
+			}
+		}
 		if tokenValue == "" {
 			continue
 		}

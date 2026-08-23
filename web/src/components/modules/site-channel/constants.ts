@@ -38,8 +38,9 @@ export function getRouteTypeTone(routeType: SiteModelRouteType) {
             return 'border-cyan-500/30 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300';
         case 'openai_embedding':
             return 'border-fuchsia-500/30 bg-fuchsia-500/10 text-fuchsia-700 dark:text-fuchsia-300';
+        case 'openai_chat':
         case 'openai_response':
-            return 'border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300';
+            return 'border-primary/20 bg-primary/10 text-primary';
         default:
             return 'border-primary/20 bg-primary/10 text-primary';
     }

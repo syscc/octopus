@@ -9,10 +9,42 @@ import (
 	"github.com/bestruirui/octopus/internal/transformer/model"
 )
 
+// TestConvertToResponsesRequestPreservesChatFallbackFields verifies the
+// fields needed when a Chat request falls back to a Responses upstream.
+func TestConvertToResponsesRequestPreservesChatFallbackFields(t *testing.T) {
+	content := "follow the instructions"
+	cacheKey := "chat-cache-key"
+	safetyID := "chat-safety-id"
+	maxTokens := int64(321)
+	req := &model.InternalLLMRequest{
+		Model:        "gpt-5",
+		RawAPIFormat: model.APIFormatOpenAIChatCompletion,
+		Messages: []model.Message{
+			{Role: "developer", Content: model.MessageContent{Content: &content}},
+			{Role: "user", Content: model.MessageContent{Content: stringPtr("hello")}},
+		},
+		MaxTokens:        &maxTokens,
+		PromptCacheKey:   &cacheKey,
+		SafetyIdentifier: &safetyID,
+	}
+
+	wire := ConvertToResponsesRequest(req)
+	if wire.MaxOutputTokens == nil || *wire.MaxOutputTokens != maxTokens {
+		t.Fatalf("expected max_tokens to map to max_output_tokens, got %#v", wire.MaxOutputTokens)
+	}
+	if wire.PromptCacheKey == nil || *wire.PromptCacheKey != cacheKey {
+		t.Fatalf("expected Chat prompt_cache_key to survive Responses fallback, got %#v", wire.PromptCacheKey)
+	}
+	if wire.SafetyIdentifier == nil || *wire.SafetyIdentifier != safetyID {
+		t.Fatalf("expected Chat safety_identifier to survive Responses fallback, got %#v", wire.SafetyIdentifier)
+	}
+	if wire.Instructions != content {
+		t.Fatalf("expected developer instruction to survive Responses fallback, got %q", wire.Instructions)
+	}
+}
+
 // TestConvertToResponsesRequestForwardsVerbosity verifies O-M8: the gpt-5
-// verbosity knob on the internal request lands on
-// ResponsesRequest.Text.Verbosity regardless of whether ResponseFormat is
-// set, and is omitted when the caller leaves it unset or blank.
+// verbosity knob on the internal request lands on ResponsesRequest.Text.Verbosity.
 func TestConvertToResponsesRequestForwardsVerbosity(t *testing.T) {
 	v := "high"
 	req := &model.InternalLLMRequest{

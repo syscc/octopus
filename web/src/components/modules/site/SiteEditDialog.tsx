@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { useTranslations } from 'next-intl';
 import { Plus, X, XIcon } from 'lucide-react';
 import {
@@ -63,6 +63,12 @@ type SiteFormState = {
 
 const AUTO_DETECT_VALUE = '__auto__';
 
+const OPENAI_DEFAULT_ROUTE_TYPE_VALUE = 'openai';
+
+function isOpenAIDefaultRouteType(routeType: string) {
+    return routeType === 'openai_chat' || routeType === 'openai_response';
+}
+
 const ROUTE_BASE_URL_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
     { value: 'openai_chat', label: 'OpenAI Chat' },
     { value: 'openai_response', label: 'OpenAI Responses' },
@@ -73,7 +79,7 @@ const ROUTE_BASE_URL_OPTIONS: ReadonlyArray<{ value: string; label: string }> = 
 ];
 
 const DEFAULT_ROUTE_TYPE_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
-    { value: 'openai_chat', label: 'OpenAI Chat' },
+    { value: OPENAI_DEFAULT_ROUTE_TYPE_VALUE, label: 'OpenAI' },
     { value: 'anthropic', label: 'Anthropic' },
     { value: 'gemini', label: 'Gemini' },
 ];
@@ -201,6 +207,17 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
     const [siteForm, setSiteForm] = useState<SiteFormState>(() =>
         site ? createSiteForm(site) : createEmptySiteForm(),
     );
+    const lastOpenAIDefaultRouteTypeRef = useRef<string>(
+        isOpenAIDefaultRouteType(site?.default_route_type ?? 'openai_chat')
+            ? (site?.default_route_type ?? 'openai_chat')
+            : 'openai_chat',
+    );
+
+    useEffect(() => {
+        if (isOpenAIDefaultRouteType(siteForm.default_route_type)) {
+            lastOpenAIDefaultRouteTypeRef.current = siteForm.default_route_type;
+        }
+    }, [siteForm.default_route_type]);
 
     const handleSubmit = useCallback(
         async (event: FormEvent<HTMLFormElement>) => {
@@ -438,11 +455,15 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                                     </Tooltip>
                                 </div>
                                 <Select
-                                    value={siteForm.default_route_type}
+                                    value={isOpenAIDefaultRouteType(siteForm.default_route_type)
+                                        ? OPENAI_DEFAULT_ROUTE_TYPE_VALUE
+                                        : siteForm.default_route_type}
                                     onValueChange={(value) =>
                                         setSiteForm((current) => ({
                                             ...current,
-                                            default_route_type: value,
+                                            default_route_type: value === OPENAI_DEFAULT_ROUTE_TYPE_VALUE
+                                                ? lastOpenAIDefaultRouteTypeRef.current
+                                                : value,
                                         }))
                                     }
                                 >
@@ -637,7 +658,7 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                                             {siteForm.route_base_urls.map((item, index) => (
                                                 <div key={`site-route-${index}`} className="flex items-center gap-2">
                                                     <Select
-                                                        value={item.route_type || undefined}
+                                                        value={item.route_type}
                                                         onValueChange={(value) =>
                                                             setSiteForm((current) => ({
                                                                 ...current,

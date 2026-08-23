@@ -15,6 +15,7 @@ export const SettingKey = {
     ProxyURL: 'proxy_url',
     StatsSaveInterval: 'stats_save_interval',
     ModelInfoUpdateInterval: 'model_info_update_interval',
+    ModelPriceUseSystemProxy: 'model_price_use_system_proxy',
     SyncLLMInterval: 'sync_llm_interval',
     SiteSyncInterval: 'site_sync_interval',
     SiteCheckinInterval: 'site_checkin_interval',

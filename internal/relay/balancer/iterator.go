@@ -2,6 +2,7 @@ package balancer
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/bestruirui/octopus/internal/model"
@@ -75,6 +76,34 @@ func NewIteratorWithPreference(group model.Group, apiKeyID int, requestModel str
 		stickyKeyID: stickyKeyID,
 		modelName:   requestModel,
 	}
+}
+
+// PreferProtocolRank 稳定地按协议/能力等级重排候选。明确的 sticky 候选保持首位，
+// 其余候选按 rank 稳定排序；这样协议偏好不会破坏会话连续性。
+func (it *Iterator) PreferProtocolRank(rank func(item model.GroupItem) int) {
+	if it == nil || len(it.candidates) < 2 || rank == nil {
+		return
+	}
+
+	stickyIdx := it.stickyIdx
+	if stickyIdx >= 0 && stickyIdx < len(it.candidates) {
+		stickyItem := it.candidates[stickyIdx]
+		rest := make([]model.GroupItem, 0, len(it.candidates)-1)
+		rest = append(rest, it.candidates[:stickyIdx]...)
+		rest = append(rest, it.candidates[stickyIdx+1:]...)
+		sort.SliceStable(rest, func(i, j int) bool {
+			return rank(rest[i]) < rank(rest[j])
+		})
+		it.candidates[0] = stickyItem
+		copy(it.candidates[1:], rest)
+		it.stickyIdx = 0
+	} else {
+		sort.SliceStable(it.candidates, func(i, j int) bool {
+			return rank(it.candidates[i]) < rank(it.candidates[j])
+		})
+		it.stickyIdx = -1
+	}
+	it.index = -1
 }
 
 // Next 移动到下一个候选，返回 false 表示遍历完成

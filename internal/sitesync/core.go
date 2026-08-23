@@ -18,6 +18,7 @@ type syncSnapshot struct {
 	tokens       []model.SiteToken
 	models       []model.SiteModel
 	groupResults []siteGroupSyncResult
+	createdToken *model.SiteToken
 	status       model.SiteExecutionStatus
 	balance      float64
 	balanceUsed  float64
@@ -31,12 +32,16 @@ type siteBatchAccount struct {
 }
 
 func SyncAccount(ctx context.Context, accountID int) (*model.SiteSyncResult, error) {
+	return syncAccountWithCreatedToken(ctx, accountID, nil)
+}
+
+func syncAccountWithCreatedToken(ctx context.Context, accountID int, createdToken *model.SiteToken) (*model.SiteSyncResult, error) {
 	siteRecord, account, err := loadSiteAccount(ctx, accountID)
 	if err != nil {
 		return nil, sanitizeSiteError(err)
 	}
 
-	snapshot, syncErr := syncAccountState(ctx, siteRecord, account)
+	snapshot, syncErr := syncAccountStateWithCreatedToken(ctx, siteRecord, account, createdToken)
 	if snapshot == nil && syncErr != nil {
 		message := sanitizeSiteStatusMessage(syncErr)
 		updateErr := updateAccountSyncState(ctx, account.ID, model.SiteExecutionStatusFailed, message, "")
@@ -47,6 +52,10 @@ func SyncAccount(ctx context.Context, accountID int) (*model.SiteSyncResult, err
 			log.Warnf("failed to mark site account projection stale (account=%d): %v", account.ID, staleErr)
 		}
 		return nil, sanitizeSiteError(syncErr)
+	}
+	if snapshot != nil && createdToken != nil {
+		snapshot.createdToken = createdToken
+		snapshot.tokens = mergeCreatedSiteTokenIntoSyncedTokens(snapshot.tokens, createdToken)
 	}
 
 	if err := persistSyncSnapshot(ctx, account.ID, snapshot); err != nil {

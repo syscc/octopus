@@ -34,6 +34,11 @@ func TestBuildProjectedChannelBaseURL(t *testing.T) {
 			expected: "https://example.com/openai/v1",
 		},
 		{
+			name:     "api platform with responses default appends v1",
+			site:     &model.Site{Platform: model.SitePlatformAPI, DefaultRouteType: model.SiteModelRouteTypeOpenAIResponse, BaseURL: "https://example.com/responses"},
+			expected: "https://example.com/responses/v1",
+		},
+		{
 			name:     "api platform with anthropic default appends v1",
 			site:     &model.Site{Platform: model.SitePlatformAPI, DefaultRouteType: model.SiteModelRouteTypeAnthropic, BaseURL: "https://api.anthropic.com"},
 			expected: "https://api.anthropic.com/v1",

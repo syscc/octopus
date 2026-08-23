@@ -27,6 +27,7 @@ const (
 type wsRelayResult struct {
 	Success           bool
 	ResponseID        string
+	OutboundType      outbound.OutboundType
 	ResetConversation bool
 	Written           bool
 	Canceled          bool
@@ -256,7 +257,7 @@ func processWSResponseCreate(
 			apiKeyID, requestModel, failedPreviousResponseID, result.ResetConversation)
 		balancer.DeleteSticky(apiKeyID, requestModel)
 		replayedRequest := conversationState.BuildReplayRequest(originalRequest)
-		replayReq, replayGroup, replayErr := newWSRelayRequest(ctx, conn, inAdapter, apiKeyID, requestModel, replayedRequest, originalRequest, preferredSticky, bodyBytes)
+		replayReq, replayGroup, replayErr := newWSRelayRequest(ctx, conn, inAdapter, apiKeyID, requestModel, replayedRequest, originalRequest, preferredSticky, nil)
 		if replayErr == nil {
 			replayReq.metrics.SetWSMode(dbmodel.RelayLogWSModeReplay)
 			replayReq.metrics.SetWSRecovery(dbmodel.RelayLogWSRecoveryReplay)
@@ -268,6 +269,13 @@ func processWSResponseCreate(
 
 	result = finalizeWSRelay(ctx, conn, req, result)
 	if result.Success {
+		if result.OutboundType == outbound.OutboundTypeOpenAIChat {
+			// Chat fallback has no native Responses continuation anchor. Do not
+			// persist a synthetic response_id that would make the next turn look
+			// continuable through Responses.
+			deleteWSConversationState(apiKeyID, requestModel, downstreamSessionID)
+			return nil
+		}
 		if conversationState == nil {
 			conversationState = &wsConversationState{DownstreamSessionID: downstreamSessionID}
 		}
@@ -342,7 +350,7 @@ func bestEffortWarmupUpstreamWS(
 			lastErr = err
 			continue
 		}
-		if !channel.Enabled || channel.Type != outbound.OutboundTypeOpenAIResponse {
+		if !channel.Enabled || !isOpenAIProtocolChannel(channel.Type) {
 			continue
 		}
 
@@ -426,6 +434,11 @@ func newWSRelayRequest(
 	if iter.Len() == 0 {
 		return nil, nil, fmt.Errorf("no available channel")
 	}
+	applyProtocolPreference(inbound.InboundTypeOpenAIResponse, iter, ctx)
+
+	if executionRequest != nil && executionRequest.IsOpenAIExactReplayRequest() {
+		rawBody = nil
+	}
 
 	return &relayRequest{
 		c:               nil,
@@ -438,6 +451,7 @@ func newWSRelayRequest(
 		groupID:         group.ID,
 		groupSessionTTL: group.SessionKeepTime,
 		iter:            iter,
+		rawBody:         append([]byte(nil), rawBody...),
 		streamWriter:    NewWSStreamWriter(ctx, conn),
 	}, &group, nil
 }
@@ -470,6 +484,8 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 
 	var lastErr error
 	var lastResult attemptResult
+	nativeResponsesRequired := requiresNativeResponsesUpstream(req.internalRequest)
+	var nativeResponses nativeResponsesAvailability
 	maxChannelAttempts := req.iter.Len()
 	if replayExact && maxChannelAttempts > 3 {
 		maxChannelAttempts = 3
@@ -499,14 +515,30 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 		if err != nil {
 			req.iter.Skip(item.ChannelID, 0, fmt.Sprintf("channel_%d", item.ChannelID), fmt.Sprintf("channel not found: %v", err))
 			lastErr = err
+			if nativeResponsesRequired {
+				nativeResponses.markUnavailable()
+			}
 			continue
 		}
 		if !channel.Enabled {
 			req.iter.Skip(channel.ID, 0, channel.Name, "channel disabled")
+			if nativeResponsesRequired && isOpenAIProtocolChannel(channel.Type) {
+				nativeResponses.markCandidate(channel.Type)
+				nativeResponses.markUnavailable()
+			}
 			continue
 		}
 
-		outAdapter := outbound.Get(channel.Type)
+		if nativeResponsesRequired {
+			nativeResponses.markCandidate(channel.Type)
+			if !isOpenAIProtocolChannel(channel.Type) {
+				req.iter.Skip(channel.ID, 0, channel.Name, "native openai responses upstream required")
+				continue
+			}
+		}
+
+		outboundType := outboundTypeForRequest(req.internalRequest, channel.Type)
+		outAdapter := outbound.Get(outboundType)
 		if outAdapter == nil {
 			req.iter.Skip(channel.ID, 0, channel.Name, fmt.Sprintf("unsupported channel type: %d", channel.Type))
 			continue
@@ -540,6 +572,9 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 			if len(selectOpts.ExcludeKeyIDs) == 0 {
 				req.iter.Skip(channel.ID, 0, channel.Name, "no available key")
 			}
+			if nativeResponsesRequired && isOpenAIProtocolChannel(channel.Type) {
+				nativeResponses.markUnavailable()
+			}
 			continue
 		}
 
@@ -566,11 +601,13 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 			}
 
 			ra := &relayAttempt{
-				relayRequest:         req,
-				outAdapter:           outAdapter,
-				channel:              channel,
-				usedKey:              usedKey,
-				firstTokenTimeOutSec: group.FirstTokenTimeOut,
+				relayRequest:          req,
+				outAdapter:            outAdapter,
+				activeOutboundType:    outboundType,
+				activeOutboundTypeSet: true,
+				channel:               channel,
+				usedKey:               usedKey,
+				firstTokenTimeOutSec:  group.FirstTokenTimeOut,
 			}
 
 			result = ra.attempt()
@@ -579,7 +616,12 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 			}
 		}
 
-		if !result.Success && !result.Written && !result.Canceled && !result.ResetConversation {
+		if nativeResponsesRequired {
+			nativeResponses.markAttempt(result, shouldTryProtocolFallbackForAttempt(req.internalRequest, channel.Type, result.OutboundType, result.StatusCode, result.Err))
+		}
+		protocolUnavailable := shouldTryProtocolFallbackForAttempt(req.internalRequest, channel.Type, result.OutboundType, result.StatusCode, result.Err)
+
+		if !result.Success && !result.Written && !result.Canceled && !result.ResetConversation && !protocolUnavailable {
 			failureKind := circuitFailureKind(group.RetryEnabled, result.StatusCode)
 			if replayExact && result.StatusCode == http.StatusServiceUnavailable && isNoAvailableAccountError(relayErrorMessage(result.Err)) {
 				failureKind = balancer.FailureHard
@@ -592,7 +634,7 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 			if req.metrics.InternalResponse != nil {
 				respID = req.metrics.InternalResponse.ID
 			}
-			return wsRelayResult{Success: true, ResponseID: respID}
+			return wsRelayResult{Success: true, ResponseID: respID, OutboundType: result.OutboundType}
 		}
 		if result.ResetConversation {
 			if publicErr, ok := classifyWSPublicError(result.Err, result.StatusCode); ok {
@@ -607,6 +649,22 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 		lastResult = result
 	}
 
+	if nativeResponsesRequired && nativeResponses.shouldReportCapabilityError() {
+		publicErr := wsPublicError{
+			Status:  http.StatusBadRequest,
+			Code:    "native_responses_required",
+			Message: "当前请求包含 OpenAI Responses 原生能力，仅支持 OpenAI Responses 通道直通",
+		}
+		return wsRelayResult{Err: protocolFallbackError(req.internalRequest), PublicError: &publicErr}
+	}
+	if nativeResponsesRequired && nativeResponses.unavailableBeforeAttempt() {
+		publicErr := wsPublicError{
+			Status:  http.StatusServiceUnavailable,
+			Code:    "native_responses_unavailable",
+			Message: "OpenAI Responses 上游暂时不可用，请稍后重试",
+		}
+		return wsRelayResult{Err: fmt.Errorf("native openai responses upstream temporarily unavailable"), PublicError: &publicErr}
+	}
 	if publicErr, ok := classifyWSPublicError(lastErr, lastResult.StatusCode); ok {
 		return wsRelayResult{ResetConversation: publicErr.ResetConversation, Err: lastErr, PublicError: &publicErr}
 	}
