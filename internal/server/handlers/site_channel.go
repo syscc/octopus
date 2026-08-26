@@ -15,6 +15,7 @@ import (
 	"github.com/bestruirui/octopus/internal/server/resp"
 	"github.com/bestruirui/octopus/internal/server/router"
 	sitesvc "github.com/bestruirui/octopus/internal/site"
+	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/gin-gonic/gin"
 )
 
@@ -35,6 +36,7 @@ func init() {
 		AddRoute(router.NewRoute("/:siteId/account/:accountId/model-routes", http.MethodPut).Handle(updateSiteChannelModelRoutes)).
 		AddRoute(router.NewRoute("/:siteId/account/:accountId/model-disabled", http.MethodPut).Handle(updateSiteChannelModelDisabled)).
 		AddRoute(router.NewRoute("/:siteId/account/:accountId/projected-channel-settings", http.MethodPut).Handle(updateSiteProjectedChannelSettings)).
+		AddRoute(router.NewRoute("/:siteId/account/:accountId/group-channel", http.MethodPut).Handle(updateSiteGroupChannel)).
 		AddRoute(router.NewRoute("/:siteId/account/:accountId/manual-models", http.MethodPost).Handle(addSiteManualModels)).
 		AddRoute(router.NewRoute("/:siteId/account/:accountId/manual-models/delete", http.MethodPost).Handle(deleteSiteManualModel)).
 		AddRoute(router.NewRoute("/:siteId/account/:accountId/model-routes/reset", http.MethodPost).Handle(resetSiteChannelModelRoutes))
@@ -238,6 +240,56 @@ func updateSiteProjectedChannelSettings(c *gin.Context) {
 	if err := op.UpdateSiteProjectedChannelSettings(siteID, accountID, req, c.Request.Context()); err != nil {
 		status := siteChannelMutationErrorStatus(err)
 		resp.ErrorWithAppError(c, status, apperror.Wrap(op.CodeSiteChannelProjectedSettingsFailed, "site projected channel settings update failed", err).WithStatus(status))
+		return
+	}
+	data, err := op.SiteChannelAccountGet(siteID, accountID, c.Request.Context())
+	if err != nil {
+		resp.Error(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	resp.Success(c, data)
+}
+
+func updateSiteGroupChannel(c *gin.Context) {
+	siteID, accountID, ok := parseSiteChannelIDs(c)
+	if !ok {
+		return
+	}
+	var req model.SiteGroupChannelUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.InvalidJSON(c)
+		return
+	}
+	previousAccount, err := op.SiteChannelAccountGet(siteID, accountID, c.Request.Context())
+	if err != nil {
+		resp.Error(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	groupKey := model.NormalizeSiteGroupKey(req.GroupKey)
+	var previousDisabled bool
+	var previousFound bool
+	for _, group := range previousAccount.Groups {
+		if model.NormalizeSiteGroupKey(group.GroupKey) == groupKey {
+			previousDisabled = group.ChannelDisabled
+			previousFound = true
+			break
+		}
+	}
+	if err := op.UpdateSiteGroupChannel(siteID, accountID, &req, c.Request.Context()); err != nil {
+		status := siteChannelMutationErrorStatus(err)
+		resp.ErrorWithAppError(c, status, apperror.Wrap(op.CodeSiteChannelProjectedSettingsFailed, "site group channel update failed", err).WithStatus(status))
+		return
+	}
+	if err := reprojectSiteChannelAccount(c.Request.Context(), accountID); err != nil {
+		if previousFound && previousDisabled != req.ChannelDisabled {
+			rollback := &model.SiteGroupChannelUpdateRequest{GroupKey: groupKey, ChannelDisabled: previousDisabled}
+			if rollbackErr := op.UpdateSiteGroupChannel(siteID, accountID, rollback, c.Request.Context()); rollbackErr != nil {
+				log.Warnf("failed to rollback site channel disabled state (account=%d): %v", accountID, rollbackErr)
+			} else if reprojectionErr := reprojectSiteChannelAccount(c.Request.Context(), accountID); reprojectionErr != nil {
+				log.Warnf("failed to restore site channel projection after rollback (account=%d): %v", accountID, reprojectionErr)
+			}
+		}
+		resp.ErrorWithAppError(c, http.StatusInternalServerError, apperror.Wrap(op.CodeSiteChannelProjectFailed, "site channel project failed", err).WithStatus(http.StatusInternalServerError))
 		return
 	}
 	data, err := op.SiteChannelAccountGet(siteID, accountID, c.Request.Context())

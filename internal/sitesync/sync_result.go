@@ -218,6 +218,20 @@ func finalizeSiteGroupSyncResults(
 	return results
 }
 
+func preserveHistoricalSiteGroupResults(results []siteGroupSyncResult) []siteGroupSyncResult {
+	preserved := make([]siteGroupSyncResult, 0, len(results))
+	for _, item := range results {
+		switch item.Status {
+		case siteGroupSyncStatusRemoved, siteGroupSyncStatusMissingKey, siteGroupSyncStatusEmpty:
+			item.Status = siteGroupSyncStatusUnresolved
+			item.Authoritative = false
+			item.Message = "本次分组发现不完整，已保留历史投影"
+		}
+		preserved = append(preserved, item)
+	}
+	return preserved
+}
+
 func isSuspendedGroupSyncStatus(status siteGroupSyncStatus) bool {
 	switch status {
 	case siteGroupSyncStatusEmpty, siteGroupSyncStatusMissingKey:

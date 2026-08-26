@@ -79,11 +79,13 @@ function TristateCheckbox({
     onChange,
     ariaLabel,
     className,
+    disabled = false,
 }: {
     state: 'unchecked' | 'partial' | 'checked';
     onChange: (next: boolean) => void;
     ariaLabel: string;
     className?: string;
+    disabled?: boolean;
 }) {
     const ref = useRef<HTMLInputElement>(null);
     useEffect(() => {
@@ -94,6 +96,7 @@ function TristateCheckbox({
             ref={ref}
             type="checkbox"
             checked={state === 'checked'}
+            disabled={disabled}
             aria-label={ariaLabel}
             onClick={(event) => event.stopPropagation()}
             onChange={(event) => onChange(event.target.checked)}
@@ -179,6 +182,7 @@ function ChannelRow({
                 state={selected ? 'checked' : 'unchecked'}
                 onChange={onSelectedChange}
                 ariaLabel={source.channel_name}
+                disabled={!source.enabled}
             />
             <span
                 className={cn(
@@ -210,7 +214,7 @@ function ChannelRow({
                 </TooltipProvider>
             ) : null}
             <ModelPreview source={source} />
-            <Select value={String(mode)} onValueChange={(value) => onModeChange(Number(value) as AutoGroupType)}>
+            <Select disabled={!source.enabled} value={String(mode)} onValueChange={(value) => onModeChange(Number(value) as AutoGroupType)}>
                 <SelectTrigger
                     size="sm"
                     className={cn(
@@ -342,6 +346,7 @@ export function GroupAutoGroupDialogContent() {
         setSelection((current) => {
             const updated = new Set(current);
             for (const source of group.sources) {
+                if (!source.enabled) continue;
                 if (next) updated.add(source.channel_id);
                 else updated.delete(source.channel_id);
             }
@@ -504,14 +509,15 @@ export function GroupAutoGroupDialogContent() {
                                 ) : (
                                     groups.map((group) => {
                                         const isExpanded = expanded.has(group.key) || !!normalizedKeyword;
-                                        const groupConfigured = group.sources.filter(
+                                        const enabledSources = group.sources.filter((s) => s.enabled);
+                                        const groupConfigured = enabledSources.filter(
                                             (s) => (modes[s.channel_id] ?? AutoGroupType.None) !== AutoGroupType.None,
                                         ).length;
-                                        const groupSelected = group.sources.filter((s) => selection.has(s.channel_id)).length;
+                                        const groupSelected = enabledSources.filter((s) => selection.has(s.channel_id)).length;
                                         const groupState: 'unchecked' | 'partial' | 'checked' =
                                             groupSelected === 0
                                                 ? 'unchecked'
-                                                : groupSelected === group.sources.length
+                                                : groupSelected === enabledSources.length
                                                     ? 'checked'
                                                     : 'partial';
                                         return (
@@ -521,6 +527,7 @@ export function GroupAutoGroupDialogContent() {
                                                         state={groupState}
                                                         onChange={(next) => setGroupSelection(group, next)}
                                                         ariaLabel={group.label}
+                                                        disabled={enabledSources.length === 0}
                                                     />
                                                     <button
                                                         type="button"
@@ -538,7 +545,7 @@ export function GroupAutoGroupDialogContent() {
                                                         </span>
                                                         {groupConfigured > 0 ? (
                                                             <span className="text-[10px] tabular-nums text-primary">
-                                                                {groupConfigured}/{group.sources.length}
+                                                                {groupConfigured}/{enabledSources.length}
                                                             </span>
                                                         ) : (
                                                             <span className="text-[10px] tabular-nums text-muted-foreground">

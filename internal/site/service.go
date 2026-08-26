@@ -44,6 +44,10 @@ func CheckinAllWithOptions(ctx context.Context, opts sitesync.SiteBatchOptions) 
 	return sitesync.CheckinAllWithOptions(ctx, opts)
 }
 
+func CheckinRandomDue(ctx context.Context) sitesync.SiteBatchSummary {
+	return sitesync.CheckinRandomDue(ctx)
+}
+
 func LastSyncAllTime() time.Time {
 	return sitesync.LastSyncAllTime()
 }

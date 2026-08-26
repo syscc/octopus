@@ -10,6 +10,16 @@ export const SITE_ROUTE_COLUMN_ORDER: SiteModelRouteType[] = [
     'openai_embedding',
 ];
 
+// Manual model creation uses the stable Chat Completions route by default;
+// Responses remains available for synced models and explicit route changes.
+export const MANUAL_MODEL_ROUTE_TYPES: SiteModelRouteType[] = [
+    'openai_chat',
+    'anthropic',
+    'gemini',
+    'volcengine',
+    'openai_embedding',
+];
+
 export const SITE_ROUTE_DISPLAY_ORDER: SiteModelRouteType[] = [
     ...SITE_ROUTE_COLUMN_ORDER,
     'unknown',

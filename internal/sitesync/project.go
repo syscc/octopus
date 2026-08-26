@@ -119,7 +119,6 @@ func ProjectAccount(ctx context.Context, accountID int) ([]int, error) {
 		groupModels := modelsByGroup[groupKey]
 		modelBuckets := partitionSiteModelsByRouteType(groupModels, shouldSplit, siteRecord)
 		proxyMode, proxyConfigID := resolveSiteAccountProxy(siteRecord, account)
-		enabled := siteRecord.Enabled && account.Enabled && hasUsableToken(groupTokens)
 		for routeType, bucketModels := range modelBuckets {
 			if len(bucketModels) == 0 {
 				continue
@@ -131,7 +130,7 @@ func ProjectAccount(ctx context.Context, accountID int) ([]int, error) {
 			channelPayload := model.Channel{
 				Name:          buildManagedChannelName(siteRecord, account, group, obType),
 				Type:          obType,
-				Enabled:       enabled,
+				Enabled:       siteRecord.Enabled && account.Enabled && !group.ChannelDisabled && hasUsableToken(groupTokens),
 				BaseUrls:      baseUrls,
 				Keys:          buildChannelKeys(groupTokens, siteRecord.Platform),
 				Model:         strings.Join(modelNames, ","),

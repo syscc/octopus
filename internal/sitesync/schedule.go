@@ -11,37 +11,36 @@ import (
 	"github.com/bestruirui/octopus/internal/op"
 )
 
-func buildNextRandomCheckinAt(account *model.SiteAccount, now time.Time) *time.Time {
+func buildRandomCheckinDueAt(account *model.SiteAccount, baseline time.Time) *time.Time {
 	if account == nil || !account.Enabled || !account.AutoCheckin || !account.RandomCheckin {
 		return nil
+	}
+
+	windowMinutes := account.CheckinRandomWindowMinutes
+	if windowMinutes < 0 {
+		windowMinutes = 0
+	}
+	dueAt := baseline
+	if windowMinutes > 0 {
+		dueAt = dueAt.Add(time.Duration(rand.Intn(windowMinutes+1)) * time.Minute)
 	}
 
 	intervalHours := account.CheckinIntervalHours
 	if intervalHours <= 0 {
 		intervalHours = 24
 	}
-	windowMinutes := account.CheckinRandomWindowMinutes
-	if windowMinutes < 0 {
-		windowMinutes = 0
-	}
-
-	base := now
 	if account.LastCheckinAt != nil && !account.LastCheckinAt.IsZero() && account.LastCheckinStatus == model.SiteExecutionStatusSuccess {
 		earliest := account.LastCheckinAt.Add(time.Duration(intervalHours) * time.Hour)
-		if earliest.After(base) {
-			base = earliest
+		if earliest.After(dueAt) {
+			dueAt = earliest
 		}
 	}
 
-	if windowMinutes > 0 {
-		base = base.Add(time.Duration(rand.Intn(windowMinutes+1)) * time.Minute)
-	}
-
-	next := base
+	next := dueAt
 	return &next
 }
 
-func ensureRandomCheckinSchedule(ctx context.Context, account *model.SiteAccount, now time.Time) (*time.Time, error) {
+func armRandomCheckinPending(ctx context.Context, account *model.SiteAccount, baseline time.Time) (*time.Time, error) {
 	if account == nil || !account.RandomCheckin {
 		return nil, nil
 	}
@@ -49,7 +48,7 @@ func ensureRandomCheckinSchedule(ctx context.Context, account *model.SiteAccount
 		return account.NextAutoCheckinAt, nil
 	}
 
-	nextAt := buildNextRandomCheckinAt(account, now)
+	nextAt := buildRandomCheckinDueAt(account, baseline)
 	if err := persistNextAutoCheckinAt(ctx, account.ID, nextAt); err != nil {
 		return nil, err
 	}
@@ -69,10 +68,11 @@ func RefreshAccountRandomCheckinSchedule(ctx context.Context, accountID int) err
 	if err != nil {
 		return fmt.Errorf("site account not found")
 	}
-
-	nextAt := buildNextRandomCheckinAt(account, time.Now())
-	if err := persistNextAutoCheckinAt(ctx, account.ID, nextAt); err != nil {
-		return err
+	if account.Enabled && account.AutoCheckin && account.RandomCheckin {
+		// The global interval/cron task owns random work creation. Preserve an
+		// existing pending execution, but do not invent one while an account is
+		// merely being created or edited.
+		return nil
 	}
-	return nil
+	return persistNextAutoCheckinAt(ctx, account.ID, nil)
 }

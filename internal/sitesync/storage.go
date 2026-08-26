@@ -73,6 +73,9 @@ func persistSyncSnapshot(ctx context.Context, accountID int, snapshot *syncSnaps
 			existingGroupMap[model.NormalizeSiteGroupKey(group.GroupKey)] = group
 		}
 
+		if snapshot.preserveHistoricalGroups {
+			snapshot.groups = mergeHistoricalSiteGroups(snapshot.groups, existingGroups)
+		}
 		if err := tx.Where("site_account_id = ?", accountID).Delete(&model.SiteUserGroup{}).Error; err != nil {
 			return err
 		}
@@ -119,6 +122,7 @@ func persistSyncSnapshot(ctx context.Context, accountID int, snapshot *syncSnaps
 				itemCopy := item
 				existing = &itemCopy
 				snapshot.groups[i].ProjectionDisabled = item.ProjectionDisabled
+				snapshot.groups[i].ChannelDisabled = item.ChannelDisabled
 			}
 			if result, ok := groupResultMap[snapshot.groups[i].GroupKey]; ok {
 				applyPersistedGroupSyncState(&snapshot.groups[i], existing, result, now)
@@ -130,7 +134,7 @@ func persistSyncSnapshot(ctx context.Context, accountID int, snapshot *syncSnaps
 		if snapshot.createdToken != nil {
 			incomingTokens = mergeCreatedSiteTokenIntoSyncedTokens(incomingTokens, snapshot.createdToken)
 		}
-		mergedTokens := mergePersistedSiteTokens(accountID, existingTokens, incomingTokens, now)
+		mergedTokens := mergePersistedSiteTokensWithHistory(accountID, existingTokens, incomingTokens, now, snapshot.preserveHistoricalGroups)
 		incomingModels := preparePersistedSyncModels(accountID, snapshot.models, existingModelMap, now)
 		finalModels := mergePersistedSiteModelsByGroup(existingModels, incomingModels, snapshot.groupResults)
 
@@ -167,6 +171,31 @@ func persistSyncSnapshot(ctx context.Context, accountID int, snapshot *syncSnaps
 	return nil
 }
 
+func mergeHistoricalSiteGroups(incoming []model.SiteUserGroup, existing []model.SiteUserGroup) []model.SiteUserGroup {
+	merged := make(map[string]model.SiteUserGroup, len(incoming)+len(existing))
+	for _, group := range existing {
+		key := model.NormalizeSiteGroupKey(group.GroupKey)
+		group.GroupKey = key
+		merged[key] = group
+	}
+	for _, group := range incoming {
+		key := model.NormalizeSiteGroupKey(group.GroupKey)
+		group.GroupKey = key
+		group.Name = model.NormalizeSiteGroupName(key, group.Name)
+		merged[key] = group
+	}
+	keys := make([]string, 0, len(merged))
+	for key := range merged {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]model.SiteUserGroup, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, merged[key])
+	}
+	return result
+}
+
 func preparePersistedSyncModels(accountID int, incoming []model.SiteModel, existingModelMap map[string]model.SiteModel, now time.Time) []model.SiteModel {
 	prepared := make([]model.SiteModel, 0, len(incoming))
 	for i := range incoming {
@@ -188,6 +217,7 @@ func preparePersistedSyncModels(accountID int, incoming []model.SiteModel, exist
 
 func copyPersistedGroupSyncState(group *model.SiteUserGroup, existing model.SiteUserGroup) {
 	group.ProjectionSuspended = existing.ProjectionSuspended
+	group.ChannelDisabled = existing.ChannelDisabled
 	group.ProjectionSuspendReason = existing.ProjectionSuspendReason
 	group.ProjectionSuspendedAt = existing.ProjectionSuspendedAt
 	group.ModelSyncStatus = existing.ModelSyncStatus
@@ -292,6 +322,10 @@ func mergePersistedSiteModelsByGroup(existing []model.SiteModel, incoming []mode
 }
 
 func mergePersistedSiteTokens(accountID int, existingTokens []model.SiteToken, incomingTokens []model.SiteToken, now time.Time) []model.SiteToken {
+	return mergePersistedSiteTokensWithHistory(accountID, existingTokens, incomingTokens, now, false)
+}
+
+func mergePersistedSiteTokensWithHistory(accountID int, existingTokens []model.SiteToken, incomingTokens []model.SiteToken, now time.Time, preserveHistory bool) []model.SiteToken {
 	preparedExisting := make([]model.SiteToken, 0, len(existingTokens))
 	for _, token := range existingTokens {
 		token.SiteAccountID = accountID
@@ -346,7 +380,7 @@ func mergePersistedSiteTokens(accountID int, existingTokens []model.SiteToken, i
 				continue
 			}
 		}
-		if strings.TrimSpace(existing.Source) != "manual" {
+		if strings.TrimSpace(existing.Source) != "manual" && !preserveHistory {
 			continue
 		}
 		existing.LastSyncAt = &now
@@ -666,7 +700,7 @@ func updateAccountSyncState(ctx context.Context, accountID int, status model.Sit
 	return db.GetDB().WithContext(ctx).Model(&model.SiteAccount{}).Where("id = ?", accountID).Updates(updatePayload).Error
 }
 
-func updateAccountCheckinState(ctx context.Context, account *model.SiteAccount, status model.SiteExecutionStatus, message string, success bool, accessToken string) error {
+func updateAccountCheckinState(ctx context.Context, account *model.SiteAccount, status model.SiteExecutionStatus, message string, accessToken string) error {
 	if account == nil {
 		return fmt.Errorf("site account is nil")
 	}
@@ -678,14 +712,11 @@ func updateAccountCheckinState(ctx context.Context, account *model.SiteAccount, 
 	}
 	account.LastCheckinAt = &now
 	account.LastCheckinStatus = status
-	if success {
-		nextAt := buildNextRandomCheckinAt(account, now)
-		account.NextAutoCheckinAt = nextAt
-		updatePayload["next_auto_checkin_at"] = nextAt
-	} else if !account.Enabled || !account.AutoCheckin || !account.RandomCheckin {
-		account.NextAutoCheckinAt = nil
-		updatePayload["next_auto_checkin_at"] = nil
-	}
+	// A random check-in timestamp represents one pending execution produced by
+	// the global interval/cron trigger. Any completed attempt consumes it; the
+	// next global trigger will create a new pending execution.
+	account.NextAutoCheckinAt = nil
+	updatePayload["next_auto_checkin_at"] = nil
 	if strings.TrimSpace(accessToken) != "" {
 		updatePayload["access_token"] = strings.TrimSpace(accessToken)
 	}

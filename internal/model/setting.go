@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
+
+	"github.com/robfig/cron/v3"
 )
 
 type SettingKey string
@@ -16,6 +19,8 @@ const (
 	SettingKeySyncLLMInterval                  SettingKey = "sync_llm_interval"                    // LLM 同步间隔(小时)
 	SettingKeySiteSyncInterval                 SettingKey = "site_sync_interval"                   // 站点账号同步间隔(小时)
 	SettingKeySiteCheckinInterval              SettingKey = "site_checkin_interval"                // 站点自动签到间隔(小时)
+	SettingKeySiteCheckinScheduleMode          SettingKey = "site_checkin_schedule_mode"           // 站点签到调度模式：interval/cron
+	SettingKeySiteCheckinCron                  SettingKey = "site_checkin_cron"                    // 站点签到 Cron 表达式（5段）
 	SettingKeyRelayLogKeepPeriod               SettingKey = "relay_log_keep_period"                // 日志保存时间范围(天)
 	SettingKeyRelayLogKeepEnabled              SettingKey = "relay_log_keep_enabled"               // 是否保留历史日志
 	SettingKeyCORSAllowOrigins                 SettingKey = "cors_allow_origins"                   // 跨域白名单(逗号分隔, 如 "example.com,example2.com"). 为空不允许跨域, "*"允许所有
@@ -65,6 +70,8 @@ func DefaultSettings() []Setting {
 		{Key: SettingKeySyncLLMInterval, Value: "24"},                 // 默认24小时同步一次LLM
 		{Key: SettingKeySiteSyncInterval, Value: "12"},                // 默认12小时同步一次站点账号信息
 		{Key: SettingKeySiteCheckinInterval, Value: "24"},             // 默认24小时自动签到一次
+		{Key: SettingKeySiteCheckinScheduleMode, Value: "interval"},   // 默认使用固定间隔
+		{Key: SettingKeySiteCheckinCron, Value: "0 0 * * *"},          // 默认每天零点签到
 		{Key: SettingKeyRelayLogKeepPeriod, Value: "7"},               // 默认日志保存7天
 		{Key: SettingKeyRelayLogKeepEnabled, Value: "true"},           // 默认保留历史日志
 		{Key: SettingKeyCircuitBreakerThreshold, Value: "5"},          // 默认连续失败5次触发熔断
@@ -99,6 +106,15 @@ func DefaultSettings() []Setting {
 	}
 }
 
+func ParseSiteCheckinCron(value string) (cron.Schedule, error) {
+	spec := strings.TrimSpace(value)
+	if len(strings.Fields(spec)) != 5 {
+		return nil, fmt.Errorf("site check-in cron must contain exactly 5 fields")
+	}
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	return parser.Parse(spec)
+}
+
 func (s *Setting) Validate() error {
 	switch s.Key {
 	case SettingKeyModelInfoUpdateInterval, SettingKeySyncLLMInterval, SettingKeySiteSyncInterval,
@@ -107,6 +123,21 @@ func (s *Setting) Validate() error {
 		_, err := strconv.Atoi(s.Value)
 		if err != nil {
 			return fmt.Errorf("setting value must be an integer")
+		}
+		if s.Key == SettingKeySiteCheckinInterval {
+			return validateIntRange(s.Value, 1, 720)
+		}
+		return nil
+	case SettingKeySiteCheckinScheduleMode:
+		switch strings.ToLower(strings.TrimSpace(s.Value)) {
+		case "interval", "cron":
+			return nil
+		default:
+			return fmt.Errorf("site check-in schedule mode must be interval or cron")
+		}
+	case SettingKeySiteCheckinCron:
+		if _, err := ParseSiteCheckinCron(s.Value); err != nil {
+			return fmt.Errorf("invalid site check-in cron: %w", err)
 		}
 		return nil
 	case SettingKeyOutlierWindowCapacity:

@@ -84,7 +84,8 @@ func refreshSub2APIManagedSession(ctx context.Context, siteRecord *model.Site, a
 	}
 
 	headers := map[string]string{
-		"Content-Type": "application/json",
+		"Content-Type":             "application/json",
+		sub2APIUserUIRequestHeader: "1",
 	}
 	if currentAccessToken = stripBearerPrefix(currentAccessToken); currentAccessToken != "" {
 		headers["Authorization"] = ensureBearer(currentAccessToken)

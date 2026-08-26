@@ -80,6 +80,34 @@ func TestUpdateSiteSourceKeysRestoresSystemPausedProjection(t *testing.T) {
 	}
 }
 
+func TestUpdateSiteGroupChannelPersistsDisabledState(t *testing.T) {
+	ctx := setupSiteChannelSuspendTestDB(t)
+	site, account := createSiteChannelSuspendFixture(t, ctx)
+
+	if err := UpdateSiteGroupChannel(site.ID, account.ID, &model.SiteGroupChannelUpdateRequest{
+		GroupKey:        model.SiteDefaultGroupKey,
+		ChannelDisabled: true,
+	}, ctx); err != nil {
+		t.Fatalf("UpdateSiteGroupChannel failed: %v", err)
+	}
+
+	var group model.SiteUserGroup
+	if err := dbpkg.GetDB().WithContext(ctx).Where("site_account_id = ? AND group_key = ?", account.ID, model.SiteDefaultGroupKey).First(&group).Error; err != nil {
+		t.Fatalf("query group failed: %v", err)
+	}
+	if !group.ChannelDisabled {
+		t.Fatalf("expected channel_disabled to persist")
+	}
+
+	view, err := SiteChannelAccountGet(site.ID, account.ID, ctx)
+	if err != nil {
+		t.Fatalf("SiteChannelAccountGet failed: %v", err)
+	}
+	if len(view.Groups) != 1 || !view.Groups[0].ChannelDisabled {
+		t.Fatalf("expected channel_disabled in group view, got %+v", view.Groups)
+	}
+}
+
 func TestSiteManualModelsAddRestoresSystemPausedProjection(t *testing.T) {
 	ctx := setupSiteChannelSuspendTestDB(t)
 	site, account := createSiteChannelSuspendFixture(t, ctx)

@@ -76,51 +76,49 @@ func (b *Failover) Candidates(items []model.GroupItem) []model.GroupItem {
 	return sortByPriority(items)
 }
 
-// Weighted 加权分配：按权重概率排序
+// Weighted 加权分配：按权重无放回抽样，首选概率与权重成正比。
 type Weighted struct{}
 
 func (b *Weighted) Candidates(items []model.GroupItem) []model.GroupItem {
-	n := len(items)
-	if n == 0 {
+	return weightedCandidates(items, rand.Float64)
+}
+
+func weightedCandidates(items []model.GroupItem, random func() float64) []model.GroupItem {
+	if len(items) == 0 {
 		return nil
 	}
-
-	// 构建加权随机排序
-	type weightedItem struct {
-		item   model.GroupItem
-		score  float64
+	if random == nil {
+		random = rand.Float64
 	}
 
-	totalWeight := 0
-	for _, item := range items {
-		w := item.Weight
-		if w <= 0 {
-			w = 1
+	remaining := append([]model.GroupItem(nil), items...)
+	result := make([]model.GroupItem, 0, len(remaining))
+	for len(remaining) > 0 {
+		totalWeight := 0
+		for _, item := range remaining {
+			weight := item.Weight
+			if weight <= 0 {
+				weight = 1
+			}
+			totalWeight += weight
 		}
-		totalWeight += w
-	}
 
-	scored := make([]weightedItem, n)
-	for i, item := range items {
-		w := item.Weight
-		if w <= 0 {
-			w = 1
+		target := random() * float64(totalWeight)
+		cumulative := 0.0
+		selected := len(remaining) - 1
+		for i, item := range remaining {
+			weight := item.Weight
+			if weight <= 0 {
+				weight = 1
+			}
+			cumulative += float64(weight)
+			if target < cumulative {
+				selected = i
+				break
+			}
 		}
-		// 给每个 item 一个加权随机分数：weight/totalWeight 作为概率基础，加上随机扰动
-		scored[i] = weightedItem{
-			item:  item,
-			score: rand.Float64() * float64(w) / float64(totalWeight),
-		}
-	}
-
-	// 按分数降序排列（分数越高优先级越高）
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].score > scored[j].score
-	})
-
-	result := make([]model.GroupItem, n)
-	for i := range scored {
-		result[i] = scored[i].item
+		result = append(result, remaining[selected])
+		remaining = append(remaining[:selected], remaining[selected+1:]...)
 	}
 	return result
 }

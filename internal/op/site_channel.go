@@ -369,6 +369,7 @@ func newSiteChannelGroupView(groupKey string, groupName string, group model.Site
 		GroupKey:                groupKey,
 		GroupName:               groupName,
 		ProjectionDisabled:      group.ProjectionDisabled,
+		ChannelDisabled:         group.ChannelDisabled,
 		ProjectionSuspended:     group.ProjectionSuspended,
 		ProjectionSuspendReason: group.ProjectionSuspendReason,
 		ProjectionSuspendedAt:   projectionSuspendedAt,
@@ -608,6 +609,23 @@ func UpdateSiteGroupProjection(siteID int, accountID int, req *model.SiteGroupPr
 			Columns:   []clause.Column{{Name: "site_account_id"}, {Name: "group_key"}},
 			DoUpdates: clause.AssignmentColumns([]string{"projection_disabled"}),
 		}).Create(&row).Error
+	})
+}
+
+func UpdateSiteGroupChannel(siteID int, accountID int, req *model.SiteGroupChannelUpdateRequest, ctx context.Context) error {
+	if req == nil {
+		return fmt.Errorf("site group channel update request is nil")
+	}
+	if _, err := siteChannelAccount(siteID, accountID, ctx); err != nil {
+		return err
+	}
+	groupKey := model.NormalizeSiteGroupKey(req.GroupKey)
+	return db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var group model.SiteUserGroup
+		if err := tx.Where("site_account_id = ? AND group_key = ?", accountID, groupKey).First(&group).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.SiteUserGroup{}).Where("id = ?", group.ID).Update("channel_disabled", req.ChannelDisabled).Error
 	})
 }
 

@@ -64,6 +64,12 @@ func setSetting(c *gin.Context) {
 		resp.Error(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	if setting.Key == model.SettingKeySiteCheckinInterval || setting.Key == model.SettingKeySiteCheckinScheduleMode || setting.Key == model.SettingKeySiteCheckinCron {
+		if err := task.ValidateSiteCheckinScheduleChange(setting.Key, setting.Value); err != nil {
+			resp.Error(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	if err := op.SettingSetString(setting.Key, setting.Value); err != nil {
 		resp.Error(c, http.StatusInternalServerError, err.Error())
 		return
@@ -90,13 +96,11 @@ func setSetting(c *gin.Context) {
 			return
 		}
 		task.Configure(string(setting.Key), time.Duration(hours)*time.Hour, true, task.SiteSyncTask)
-	case model.SettingKeySiteCheckinInterval:
-		hours, err := strconv.Atoi(setting.Value)
-		if err != nil {
+	case model.SettingKeySiteCheckinInterval, model.SettingKeySiteCheckinScheduleMode, model.SettingKeySiteCheckinCron:
+		if err := task.ConfigureSiteCheckinSchedule(); err != nil {
 			resp.Error(c, http.StatusBadRequest, err.Error())
 			return
 		}
-		task.Configure(string(setting.Key), time.Duration(hours)*time.Hour, true, task.SiteCheckinTask)
 	case model.SettingKeyStatsSaveInterval:
 		minutes, err := strconv.Atoi(setting.Value)
 		if err != nil {

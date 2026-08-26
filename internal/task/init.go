@@ -2,6 +2,9 @@ package task
 
 import (
 	"context"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bestruirui/octopus/internal/model"
@@ -19,6 +22,7 @@ const (
 	TaskBaseUrlDelay      = "base_url_delay"
 	TaskSiteSync          = "site_sync"
 	TaskSiteCheckin       = "site_checkin"
+	TaskSiteCheckinRandom = "site_checkin_random_due"
 	TaskWSAffinityCleanup = "ws_affinity_cleanup"
 	TaskWebDAVBackup      = "webdav_backup"
 )
@@ -28,6 +32,88 @@ func ModelInfoUpdateTask() {
 	if err := price.UpdateLLMPrice(context.Background()); err != nil {
 		log.Warnf("failed to update price info: %v", err)
 	}
+}
+
+func buildSiteCheckinSchedule(mode string, intervalValue string, cronValue string) (Schedule, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "cron" {
+		schedule, err := model.ParseSiteCheckinCron(cronValue)
+		if err != nil {
+			return nil, fmt.Errorf("invalid site check-in cron: %w", err)
+		}
+		return schedule, nil
+	}
+	if mode != "" && mode != "interval" {
+		return nil, fmt.Errorf("invalid site check-in schedule mode %q", mode)
+	}
+
+	hours, err := strconv.Atoi(strings.TrimSpace(intervalValue))
+	if err != nil || hours <= 0 || hours > 720 {
+		return nil, fmt.Errorf("site check-in interval must be between 1 and 720 hours")
+	}
+	return NewIntervalSchedule(time.Duration(hours) * time.Hour), nil
+}
+
+func siteCheckinScheduleValues() (mode string, intervalValue string, cronValue string, err error) {
+	mode, err = op.SettingGetString(model.SettingKeySiteCheckinScheduleMode)
+	if err != nil {
+		return "", "", "", err
+	}
+	intervalValue, err = op.SettingGetString(model.SettingKeySiteCheckinInterval)
+	if err != nil {
+		return "", "", "", err
+	}
+	cronValue, err = op.SettingGetString(model.SettingKeySiteCheckinCron)
+	if err != nil {
+		return "", "", "", err
+	}
+	return mode, intervalValue, cronValue, nil
+}
+
+func siteCheckinScheduleFromSettings() (Schedule, error) {
+	mode, intervalValue, cronValue, err := siteCheckinScheduleValues()
+	if err != nil {
+		return nil, err
+	}
+	return buildSiteCheckinSchedule(mode, intervalValue, cronValue)
+}
+
+// ValidateSiteCheckinScheduleChange validates a setting change against the
+// companion settings before it is persisted.
+func ValidateSiteCheckinScheduleChange(key model.SettingKey, value string) error {
+	mode, intervalValue, cronValue, err := siteCheckinScheduleValues()
+	if err != nil {
+		return err
+	}
+	switch key {
+	case model.SettingKeySiteCheckinScheduleMode:
+		mode = value
+	case model.SettingKeySiteCheckinInterval:
+		intervalValue = value
+	case model.SettingKeySiteCheckinCron:
+		cronValue = value
+	default:
+		return nil
+	}
+	_, err = buildSiteCheckinSchedule(mode, intervalValue, cronValue)
+	return err
+}
+
+// ConfigureSiteCheckinSchedule reloads the persisted schedule and updates the
+// running task without requiring a process restart.
+func ConfigureSiteCheckinSchedule() error {
+	schedule, err := siteCheckinScheduleFromSettings()
+	if err != nil {
+		return err
+	}
+	mode, err := op.SettingGetString(model.SettingKeySiteCheckinScheduleMode)
+	if err != nil {
+		return err
+	}
+	runOnStart := strings.ToLower(strings.TrimSpace(mode)) != "cron"
+	taskName := string(model.SettingKeySiteCheckinInterval)
+	ConfigureSchedule(taskName, schedule, runOnStart, SiteCheckinTask)
+	return nil
 }
 
 func Init() {
@@ -60,13 +146,22 @@ func Init() {
 	siteSyncInterval := time.Duration(siteSyncIntervalHours) * time.Hour
 	Register(string(model.SettingKeySiteSyncInterval), siteSyncInterval, true, SiteSyncTask)
 
-	siteCheckinIntervalHours, err := op.SettingGetInt(model.SettingKeySiteCheckinInterval)
+	siteCheckinSchedule, err := siteCheckinScheduleFromSettings()
 	if err != nil {
-		log.Warnf("failed to get site checkin interval: %v", err)
-		return
+		log.Warnf("failed to get site check-in schedule: %v; falling back to 24 hours", err)
+		siteCheckinSchedule = NewIntervalSchedule(24 * time.Hour)
 	}
-	siteCheckinInterval := time.Duration(siteCheckinIntervalHours) * time.Hour
-	Register(string(model.SettingKeySiteCheckinInterval), siteCheckinInterval, true, SiteCheckinTask)
+	checkinScheduleMode, modeErr := op.SettingGetString(model.SettingKeySiteCheckinScheduleMode)
+	if modeErr != nil {
+		log.Warnf("failed to get site check-in schedule mode: %v; using interval", modeErr)
+	}
+	RegisterSchedule(
+		string(model.SettingKeySiteCheckinInterval),
+		siteCheckinSchedule,
+		strings.ToLower(strings.TrimSpace(checkinScheduleMode)) != "cron",
+		SiteCheckinTask,
+	)
+	Register(TaskSiteCheckinRandom, time.Minute, true, SiteRandomCheckinTask)
 
 	// 注册统计保存任务
 	statsSaveIntervalMinutes, err := op.SettingGetInt(model.SettingKeyStatsSaveInterval)

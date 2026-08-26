@@ -282,10 +282,11 @@ func syncSub2APIWithAccessToken(ctx context.Context, siteRecord *model.Site, acc
 	if accessToken == "" {
 		return nil, newAccessTokenRequiredError()
 	}
-	tokens, err := fetchSub2APITokens(ctx, siteRecord, account, accessToken)
+	tokenFetch, err := fetchSub2APITokens(ctx, siteRecord, account, accessToken)
 	if err != nil {
 		return nil, err
 	}
+	tokens := tokenFetch.tokens
 	tokens = mergeCreatedSiteTokenIntoSyncedTokens(tokens, createdToken)
 	if len(tokens) == 0 && strings.TrimSpace(account.APIKey) != "" {
 		tokens = append(tokens, model.SiteToken{Name: "default", Token: strings.TrimSpace(account.APIKey), GroupKey: model.SiteDefaultGroupKey, GroupName: model.SiteDefaultGroupName, Enabled: true, Source: "fallback", IsDefault: true})
@@ -294,7 +295,7 @@ func syncSub2APIWithAccessToken(ctx context.Context, siteRecord *model.Site, acc
 		return nil, apperror.New(apperror.CodeSiteSub2APIAPIKeyRequired, "sub2api sync requires an API key; create a key on the site and sync again")
 	}
 
-	groups, err := fetchSub2APIGroups(ctx, siteRecord, account, accessToken, tokens)
+	groups, discoveryState, err := fetchSub2APIGroups(ctx, siteRecord, account, accessToken, tokens)
 	if err != nil {
 		groups = nil
 	}
@@ -318,9 +319,13 @@ func syncSub2APIWithAccessToken(ctx context.Context, siteRecord *model.Site, acc
 	)
 	siteModels = expandExplicitGroupModelsToGroups(siteModels, groups, tokens)
 	groupResults := finalizeSiteGroupSyncResults(account, groups, tokens, siteModels, tokenGroupResults)
+	if !discoveryState.authoritative || !discoveryState.complete || !tokenFetch.complete {
+		groupResults = preserveHistoricalSiteGroupResults(groupResults)
+	}
+	preserveHistoricalGroups := !discoveryState.authoritative || !discoveryState.complete || !tokenFetch.complete
 	status := buildSyncSnapshotStatus(groupResults)
 	balance, balanceUsed, todayIncome := fetchSiteAccountBalance(ctx, siteRecord, account, accessToken, 0)
-	snapshot := &syncSnapshot{accessToken: accessToken, groups: groups, tokens: tokens, models: siteModels, groupResults: groupResults, status: status, balance: balance, balanceUsed: balanceUsed, todayIncome: todayIncome, message: buildSyncSnapshotMessage(groupResults)}
+	snapshot := &syncSnapshot{accessToken: accessToken, groups: groups, tokens: tokens, models: siteModels, groupResults: groupResults, groupDiscoveryState: discoveryState, preserveHistoricalGroups: preserveHistoricalGroups, status: status, balance: balance, balanceUsed: balanceUsed, todayIncome: todayIncome, message: buildSyncSnapshotMessage(groupResults)}
 	if status == model.SiteExecutionStatusFailed {
 		return snapshot, buildSyncSnapshotFailure(groupResults)
 	}

@@ -165,7 +165,7 @@ func createSub2APIToken(ctx context.Context, siteRecord *model.Site, account *mo
 	}
 
 	requestBody := buildSub2APITokenCreatePayload(account, groupKey, name)
-	headers := map[string]string{"Authorization": ensureBearer(accessToken)}
+	headers := sub2APIUserHeaders(accessToken)
 	endpoints := []string{"/api/v1/keys", "/api/v1/api-keys"}
 	var firstErr error
 
@@ -183,7 +183,7 @@ func createSub2APIToken(ctx context.Context, siteRecord *model.Site, account *mo
 			if shouldRetrySub2APIAfterRefresh(err, account) {
 				refreshedToken, refreshErr := ensureFreshSub2APIAccessToken(ctx, siteRecord, account, true)
 				if refreshErr == nil && stripBearerPrefix(refreshedToken) != stripBearerPrefix(accessToken) {
-					headers = map[string]string{"Authorization": ensureBearer(refreshedToken)}
+					headers = sub2APIUserHeaders(refreshedToken)
 					payload, err = requestJSON(
 						ctx,
 						siteRecord,
@@ -247,7 +247,10 @@ func buildSub2APITokenCreatePayload(account *model.SiteAccount, groupKey string,
 	}
 	groupKey = model.NormalizeSiteGroupKey(groupKey)
 	if groupID, err := strconv.Atoi(groupKey); err == nil && groupID > 0 {
+		// Standard Sub2API uses group_id; Fengwind's current product-channel
+		// variant uses channel_id. Both implementations ignore unknown fields.
 		payload["group_id"] = groupID
+		payload["channel_id"] = groupID
 	}
 	return payload
 }

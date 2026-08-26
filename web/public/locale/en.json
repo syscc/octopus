@@ -459,7 +459,13 @@
                 "button": "Check In",
                 "pending": "Checking in...",
                 "success": "Background site check-in triggered",
-                "failed": "Failed to trigger site check-in"
+                "failed": "Failed to trigger site check-in",
+                "modeInterval": "Interval",
+                "modeCron": "Cron",
+                "cronPlaceholder": "0 8 * * *",
+                "cronInvalid": "Cron expression must use the standard 5-field format (minute hour day month weekday)",
+                "intervalInvalid": "Interval must be between 1 and 720 hours",
+                "hint": "Cron uses the server's local timezone. Random check-in accounts run after the base trigger, delayed by each account's random window"
             }
         },
         "data": {

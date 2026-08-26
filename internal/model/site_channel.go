@@ -31,6 +31,7 @@ type SiteChannelGroup struct {
 	GroupKey                string                         `json:"group_key"`
 	GroupName               string                         `json:"group_name"`
 	ProjectionDisabled      bool                           `json:"projection_disabled"`
+	ChannelDisabled         bool                           `json:"channel_disabled"`
 	ProjectionSuspended     bool                           `json:"projection_suspended"`
 	ProjectionSuspendReason string                         `json:"projection_suspend_reason,omitempty"`
 	ProjectionSuspendedAt   *int64                         `json:"projection_suspended_at,omitempty"`
@@ -196,4 +197,9 @@ type SiteSourceKeyUpdateRequest struct {
 type SiteGroupProjectionUpdateRequest struct {
 	GroupKey           string `json:"group_key" binding:"required"`
 	ProjectionDisabled bool   `json:"projection_disabled"`
+}
+
+type SiteGroupChannelUpdateRequest struct {
+	GroupKey        string `json:"group_key" binding:"required"`
+	ChannelDisabled bool   `json:"channel_disabled"`
 }

@@ -828,6 +828,36 @@ func TestProjectAccountSkipsProjectionDisabledGroup(t *testing.T) {
 		t.Fatalf("expected no projected channels for projection disabled group, got %+v", channelsByGroup)
 	}
 }
+func TestProjectAccountKeepsChannelDisabledGroupBinding(t *testing.T) {
+	ctx := setupProjectTestDB(t)
+	_, account := createProjectionFixture(t, ctx)
+
+	if _, err := ProjectAccount(ctx, account.ID); err != nil {
+		t.Fatalf("initial ProjectAccount failed: %v", err)
+	}
+	channelsByGroup := loadProjectedChannelsByGroupKey(t, ctx, account.ID)
+	channel := channelsByGroup[model.SiteDefaultGroupKey]
+	if channel.ID == 0 {
+		t.Fatalf("expected initial projected channel")
+	}
+
+	group := model.SiteUserGroup{SiteAccountID: account.ID, GroupKey: model.SiteDefaultGroupKey, Name: model.SiteDefaultGroupName, ChannelDisabled: true}
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&group).Error; err != nil {
+		t.Fatalf("create channel disabled group failed: %v", err)
+	}
+	if _, err := ProjectAccount(ctx, account.ID); err != nil {
+		t.Fatalf("ProjectAccount after channel disable failed: %v", err)
+	}
+
+	channelsByGroup = loadProjectedChannelsByGroupKey(t, ctx, account.ID)
+	disabledChannel := channelsByGroup[model.SiteDefaultGroupKey]
+	if disabledChannel.ID != channel.ID {
+		t.Fatalf("expected projected channel binding to remain, got %+v", channelsByGroup)
+	}
+	if disabledChannel.Enabled {
+		t.Fatalf("expected projected channel to be disabled")
+	}
+}
 
 func TestProjectAccountRemovesProjectionDisabledManagedChannel(t *testing.T) {
 	ctx := setupProjectTestDB(t)

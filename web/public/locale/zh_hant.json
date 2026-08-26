@@ -459,7 +459,13 @@
                 "button": "立即簽到",
                 "pending": "簽到中...",
                 "success": "已觸發後台站點全量簽到",
-                "failed": "觸發簽到失敗"
+                "failed": "觸發簽到失敗",
+                "modeInterval": "間隔",
+                "modeCron": "Cron",
+                "cronPlaceholder": "0 8 * * *",
+                "cronInvalid": "Cron 運算式必須為 5 段標準格式（分 時 日 月 週）",
+                "intervalInvalid": "間隔必須在 1 到 720 小時之間",
+                "hint": "Cron 按伺服器本地時區執行；隨機簽到帳號會在基準觸發後按帳號隨機視窗延遲執行"
             }
         },
         "data": {

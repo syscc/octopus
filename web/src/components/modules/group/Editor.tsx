@@ -269,6 +269,10 @@ export function GroupEditor({
 }) {
     const t = useTranslations('group');
     const { data: modelChannels = [] } = useModelChannelList();
+    const selectableModelChannels = useMemo(
+        () => modelChannels.filter((channel) => channel.enabled !== false),
+        [modelChannels],
+    );
 
     const [groupName, setGroupName] = useState(initial?.name ?? '');
     const [matchRegex, setMatchRegex] = useState(initial?.match_regex ?? '');
@@ -298,14 +302,14 @@ export function GroupEditor({
         if (regexKey) {
             try {
                 const re = parseRegex(regexKey);
-                return { matchedModelChannels: modelChannels.filter((mc) => re.test(mc.name)), regexError: '' };
+                return { matchedModelChannels: selectableModelChannels.filter((mc) => re.test(mc.name)), regexError: '' };
             } catch (e) {
                 return { matchedModelChannels: [], regexError: (e as Error)?.message ?? 'Invalid regex' };
             }
         }
         if (!groupKey) return { matchedModelChannels: [], regexError: '' };
-        return { matchedModelChannels: modelChannels.filter((mc) => matchesGroupName(mc.name, groupKey)), regexError: '' };
-    }, [groupKey, regexKey, modelChannels]);
+        return { matchedModelChannels: selectableModelChannels.filter((mc) => matchesGroupName(mc.name, groupKey)), regexError: '' };
+    }, [groupKey, regexKey, selectableModelChannels]);
 
     const handleAddMember = useCallback((channel: LLMChannel) => {
         const key = memberKey(channel);
@@ -532,7 +536,7 @@ export function GroupEditor({
                     <div className="flex-1 min-h-0">
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 h-full min-h-0">
                             <ModelPickerSection
-                                modelChannels={modelChannels}
+                                modelChannels={selectableModelChannels}
                                 selectedMembers={selectedMembers}
                                 onAdd={handleAddMember}
                                 onAutoAdd={handleAutoAdd}

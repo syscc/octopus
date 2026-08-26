@@ -29,3 +29,14 @@ func SiteCheckinTask() {
 	defer cancel()
 	site.CheckinAll(ctx)
 }
+
+func SiteRandomCheckinTask() {
+	log.Debugf("site random checkin task started")
+	startTime := time.Now()
+	defer func() {
+		log.Debugf("site random checkin task finished, update time: %s", time.Since(startTime))
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
+	defer cancel()
+	site.CheckinRandomDue(ctx)
+}

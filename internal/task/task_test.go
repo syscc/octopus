@@ -203,6 +203,73 @@ func updateMaximum(maximum *atomic.Int32, current int32) {
 	}
 }
 
+type delaySchedule struct {
+	delay time.Duration
+}
+
+func (s delaySchedule) Next(after time.Time) time.Time {
+	return after.Add(s.delay)
+}
+
+func TestConfigureScheduleWakesExistingLoop(t *testing.T) {
+	resetTaskStateForTest(t)
+	defer resetTaskStateForTest(t)
+
+	startRunner()
+	var runs atomic.Int32
+	fired := make(chan struct{}, 1)
+	fn := func() {
+		runs.Add(1)
+		select {
+		case fired <- struct{}{}:
+		default:
+		}
+	}
+
+	ConfigureSchedule("schedule-update", delaySchedule{delay: time.Hour}, false, fn)
+	ConfigureSchedule("schedule-update", delaySchedule{delay: 10 * time.Millisecond}, false, fn)
+	waitForTaskSignal(t, fired)
+	Update("schedule-update", 0)
+	if got := runs.Load(); got < 1 {
+		t.Fatalf("expected schedule update to execute, got %d runs", got)
+	}
+}
+
+func TestBuildSiteCheckinScheduleSupportsIntervalAndCron(t *testing.T) {
+	baseline := time.Date(2026, 8, 24, 8, 30, 0, 0, time.Local)
+
+	interval, err := buildSiteCheckinSchedule("interval", "24", "")
+	if err != nil {
+		t.Fatalf("build interval schedule failed: %v", err)
+	}
+	if got, want := interval.Next(baseline), baseline.Add(24*time.Hour); !got.Equal(want) {
+		t.Fatalf("expected interval next %s, got %s", want, got)
+	}
+
+	cronSchedule, err := buildSiteCheckinSchedule("cron", "24", "0 9 * * *")
+	if err != nil {
+		t.Fatalf("build cron schedule failed: %v", err)
+	}
+	wantCron := time.Date(2026, 8, 24, 9, 0, 0, 0, time.Local)
+	if got := cronSchedule.Next(baseline); !got.Equal(wantCron) {
+		t.Fatalf("expected cron next %s, got %s", wantCron, got)
+	}
+
+	for _, test := range []struct {
+		mode     string
+		interval string
+		cron     string
+	}{
+		{mode: "invalid", interval: "24", cron: "0 9 * * *"},
+		{mode: "interval", interval: "0"},
+		{mode: "cron", interval: "24", cron: "not a cron"},
+	} {
+		if _, err := buildSiteCheckinSchedule(test.mode, test.interval, test.cron); err == nil {
+			t.Fatalf("expected invalid schedule to fail: %+v", test)
+		}
+	}
+}
+
 func TestTaskExecutionGateSpansDisableAndReenable(t *testing.T) {
 	resetTaskStateForTest(t)
 	defer resetTaskStateForTest(t)

@@ -115,6 +115,7 @@ func TestEarlyHeartbeat_DelayedFirstHeartbeat(t *testing.T) {
 	defer hb.Stop()
 
 	time.Sleep(1200 * time.Millisecond)
+	hb.Hand()
 	if !hb.HeaderWritten() {
 		t.Fatal("expected SSE header after delay")
 	}
@@ -187,6 +188,7 @@ func TestEarlyHeartbeat_FlushOrError_SSEPath(t *testing.T) {
 	time.Sleep(1200 * time.Millisecond)
 
 	hb.FlushOrError(c, http.StatusBadGateway, "channel failed")
+	hb.Hand()
 
 	body := w.Body.String()
 	if !strings.Contains(body, "event: error") {

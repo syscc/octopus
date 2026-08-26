@@ -2,11 +2,14 @@ package sitesync
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bestruirui/octopus/internal/apperror"
 	"github.com/bestruirui/octopus/internal/helper"
@@ -16,7 +19,30 @@ import (
 const (
 	siteModelSourceSync         = "sync"
 	siteModelSourceSyncFallback = "sync_fallback"
+
+	sub2APIUserUIRequestHeader = "X-User-UI-Request"
+	sub2APIPageSize            = 100
+	sub2APIMaxPages            = 10
+	sub2APIReadMaxAttempts     = 3
+	sub2APIReadRetryDelay      = 150 * time.Millisecond
 )
+
+type sub2APITokenFetchResult struct {
+	tokens   []model.SiteToken
+	complete bool
+}
+
+type sub2APIGroupDiscoveryState struct {
+	authoritative bool
+	complete      bool
+}
+
+func sub2APIUserHeaders(accessToken string) map[string]string {
+	return map[string]string{
+		"Authorization":            ensureBearer(accessToken),
+		sub2APIUserUIRequestHeader: "1",
+	}
+}
 
 type siteModelFetchResult struct {
 	names         []string
@@ -178,74 +204,396 @@ func fetchManagementGroups(ctx context.Context, siteRecord *model.Site, account 
 	return groups, nil
 }
 
-func fetchSub2APITokens(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string) ([]model.SiteToken, error) {
-	endpoints := []string{"/api/v1/keys?page=1&page_size=100", "/api/v1/api-keys?page=1&page_size=100", "/api/v1/keys", "/api/v1/api-keys"}
+func fetchSub2APITokens(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string) (sub2APITokenFetchResult, error) {
+	endpoints := []string{"/api/v1/keys", "/api/v1/api-keys"}
 	var firstErr error
+	var partialResult sub2APITokenFetchResult
+	var successfulEndpoint bool
+	var incompleteEndpoint bool
 	for _, endpoint := range endpoints {
-		payload, err := requestJSON(ctx, siteRecord, "GET", buildSiteURL(siteRecord.BaseURL, endpoint), nil, map[string]string{"Authorization": ensureBearer(accessToken)}, account)
+		items, complete, err := fetchSub2APIPagedItems(ctx, siteRecord, account, accessToken, endpoint, parseTokenItemsFromAny)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		data, err := unwrapSub2APIData(payload, endpoint)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		items := parseTokenItemsFromAny(data)
 		tokens := buildSub2APITokensFromItems(items)
+		successfulEndpoint = true
+		if !complete {
+			incompleteEndpoint = true
+		}
 		if len(tokens) > 0 {
-			return tokens, nil
+			if complete {
+				return sub2APITokenFetchResult{tokens: tokens, complete: true}, nil
+			}
+			if len(partialResult.tokens) == 0 {
+				partialResult = sub2APITokenFetchResult{tokens: tokens, complete: false}
+			}
+			continue
+		}
+		if !complete && firstErr == nil {
+			firstErr = fmt.Errorf("sub2api %s pagination did not complete", endpoint)
 		}
 	}
-	if firstErr != nil {
-		return nil, firstErr
+	if len(partialResult.tokens) > 0 {
+		return partialResult, nil
 	}
-	return nil, nil
+	if firstErr != nil && (!successfulEndpoint || incompleteEndpoint) {
+		return sub2APITokenFetchResult{}, firstErr
+	}
+	return sub2APITokenFetchResult{complete: true}, nil
 }
 
-func fetchSub2APIGroups(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, tokens []model.SiteToken) ([]model.SiteUserGroup, error) {
-	inferredGroups := inferSub2APIGroupsFromTokens(tokens)
+func fetchSub2APIGroups(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, tokens []model.SiteToken) ([]model.SiteUserGroup, sub2APIGroupDiscoveryState, error) {
+	seen := make(map[string]model.SiteUserGroup)
+	for _, group := range inferSub2APIGroupsFromTokens(tokens) {
+		mergeSub2APIGroup(seen, group)
+	}
 
+	// Standard Sub2API exposes /groups/available. Fengwind's current deployment
+	// uses /channels/products instead and binds keys through channel_id.
 	endpoints := []string{
 		"/api/v1/groups/available",
-		"/api/v1/groups?page=1&page_size=100",
-		"/api/v1/groups",
-		"/api/v1/group?page=1&page_size=100",
-		"/api/v1/group",
+		"/api/v1/channels/products",
 	}
 	var firstErr error
 	for _, endpoint := range endpoints {
-		payload, err := requestJSON(ctx, siteRecord, "GET", buildSiteURL(siteRecord.BaseURL, endpoint), nil, map[string]string{"Authorization": ensureBearer(accessToken)}, account)
+		groups, err := fetchSub2APISingleGroupEndpoint(ctx, siteRecord, account, accessToken, endpoint)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		data, err := unwrapSub2APIData(payload, endpoint)
-		if err != nil {
+		for _, group := range groups {
+			mergeSub2APIGroup(seen, group)
+		}
+		return sortedSub2APIGroups(seen), sub2APIGroupDiscoveryState{authoritative: true, complete: true}, nil
+	}
+
+	fallbackSucceeded := false
+	fallbackComplete := true
+	for _, endpoint := range []string{"/api/v1/groups", "/api/v1/group"} {
+		groups, complete, fallbackErr := fetchSub2APIPagedGroups(ctx, siteRecord, account, accessToken, endpoint)
+		if fallbackErr != nil {
 			if firstErr == nil {
-				firstErr = err
+				firstErr = fallbackErr
 			}
 			continue
 		}
-		items := parseGroupItemsFromAny(data)
-		if len(items) > 0 {
-			return items, nil
+		fallbackSucceeded = true
+		fallbackComplete = fallbackComplete && complete
+		for _, group := range groups {
+			mergeSub2APIGroup(seen, group)
 		}
 	}
-	if len(inferredGroups) > 0 {
-		return inferredGroups, nil
+	if len(seen) > 0 {
+		return sortedSub2APIGroups(seen), sub2APIGroupDiscoveryState{complete: fallbackSucceeded && fallbackComplete}, nil
 	}
 	if firstErr != nil {
-		return nil, firstErr
+		return nil, sub2APIGroupDiscoveryState{}, firstErr
 	}
-	return []model.SiteUserGroup{{GroupKey: model.SiteDefaultGroupKey, Name: model.SiteDefaultGroupName}}, nil
+	return []model.SiteUserGroup{{GroupKey: model.SiteDefaultGroupKey, Name: model.SiteDefaultGroupName}}, sub2APIGroupDiscoveryState{complete: fallbackSucceeded && fallbackComplete}, nil
+}
+
+func requestSub2APIUserJSON(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, endpoint string) (map[string]any, error) {
+	requestURL := endpoint
+	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+		requestURL = buildSiteURL(siteRecord.BaseURL, endpoint)
+	}
+	var lastErr error
+	for attempt := 1; attempt <= sub2APIReadMaxAttempts; attempt++ {
+		payload, err := requestJSON(ctx, siteRecord, http.MethodGet, requestURL, nil, sub2APIUserHeaders(accessToken), account)
+		if err == nil {
+			return payload, nil
+		}
+		lastErr = err
+		if attempt >= sub2APIReadMaxAttempts || !isRetryableSub2APIReadError(err) {
+			break
+		}
+		timer := time.NewTimer(sub2APIReadRetryDelay * time.Duration(attempt))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, lastErr
+}
+
+func isRetryableSub2APIReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "eof") ||
+		strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "connection refused") ||
+		strings.Contains(message, "http 502") ||
+		strings.Contains(message, "http 503") ||
+		strings.Contains(message, "http 504")
+}
+
+func fetchSub2APISingleGroupEndpoint(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, endpoint string) ([]model.SiteUserGroup, error) {
+	payload, err := requestSub2APIUserJSON(ctx, siteRecord, account, accessToken, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	data, err := unwrapSub2APIData(payload, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if isExplicitEmptyCollection(data) {
+		return []model.SiteUserGroup{}, nil
+	}
+	if endpoint == "/api/v1/channels/products" {
+		groups := parseSub2APIProductGroups(data)
+		if len(groups) == 0 {
+			return nil, fmt.Errorf("sub2api %s returned an unrecognized group response", endpoint)
+		}
+		return groups, nil
+	}
+	groups := parseGroupItemsFromAny(data)
+	if len(groups) == 0 {
+		return nil, fmt.Errorf("sub2api %s returned an unrecognized group response", endpoint)
+	}
+	return groups, nil
+}
+
+func fetchSub2APIPagedGroups(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, endpoint string) ([]model.SiteUserGroup, bool, error) {
+	seen := make(map[string]model.SiteUserGroup)
+	previousSignature := ""
+	for page := 1; page <= sub2APIMaxPages; page++ {
+		payload, data, err := fetchSub2APIPage(ctx, siteRecord, account, accessToken, endpoint, page)
+		if err != nil {
+			if page == 1 {
+				return nil, false, err
+			}
+			return sortedSub2APIGroups(seen), false, nil
+		}
+		if !isExplicitEmptyCollection(data) && len(parseGroupItemsFromAny(data)) == 0 {
+			return sortedSub2APIGroups(seen), false, fmt.Errorf("sub2api %s returned an unrecognized group response", endpoint)
+		}
+		groups := parseGroupItemsFromAny(data)
+		signature := sub2APIValueSignature(groups)
+		if page > 1 && signature != "" && signature == previousSignature {
+			return sortedSub2APIGroups(seen), false, nil
+		}
+		previousSignature = signature
+		for _, group := range groups {
+			mergeSub2APIGroup(seen, group)
+		}
+		if !sub2APIHasNextPage(payload, page, len(groups)) {
+			return sortedSub2APIGroups(seen), true, nil
+		}
+	}
+	return sortedSub2APIGroups(seen), false, nil
+}
+
+func fetchSub2APIPagedItems(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, endpoint string, parse func(any) []map[string]any) ([]map[string]any, bool, error) {
+	items := make([]map[string]any, 0)
+	seen := make(map[string]struct{})
+	previousSignature := ""
+	for page := 1; page <= sub2APIMaxPages; page++ {
+		payload, data, err := fetchSub2APIPage(ctx, siteRecord, account, accessToken, endpoint, page)
+		if err != nil {
+			if page == 1 {
+				return nil, false, err
+			}
+			return items, false, nil
+		}
+		if !isRecognizedSub2APIItemCollection(data) {
+			return items, false, fmt.Errorf("sub2api %s returned an unrecognized item response", endpoint)
+		}
+		pageItems := parse(data)
+		signature := sub2APIValueSignature(pageItems)
+		if page > 1 && signature != "" && signature == previousSignature {
+			return items, false, nil
+		}
+		previousSignature = signature
+		for _, item := range pageItems {
+			itemSignature := sub2APIValueSignature(item)
+			if _, ok := seen[itemSignature]; ok {
+				continue
+			}
+			seen[itemSignature] = struct{}{}
+			items = append(items, item)
+		}
+		if !sub2APIHasNextPage(payload, page, len(pageItems)) {
+			return items, true, nil
+		}
+	}
+	return items, false, nil
+}
+
+func fetchSub2APIPage(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, endpoint string, page int) (map[string]any, any, error) {
+	requestURL, err := url.Parse(buildSiteURL(siteRecord.BaseURL, endpoint))
+	if err != nil {
+		return nil, nil, err
+	}
+	query := requestURL.Query()
+	query.Set("page", strconv.Itoa(page))
+	query.Set("page_size", strconv.Itoa(sub2APIPageSize))
+	requestURL.RawQuery = query.Encode()
+	payload, err := requestSub2APIUserJSON(ctx, siteRecord, account, accessToken, requestURL.String())
+	if err != nil {
+		return nil, nil, err
+	}
+	data, err := unwrapSub2APIData(payload, endpoint)
+	if err != nil {
+		return nil, nil, err
+	}
+	return payload, data, nil
+}
+
+func sub2APIHasNextPage(payload map[string]any, page int, itemCount int) bool {
+	metadata := sub2APIPaginationMetadata(payload)
+	if pages := firstPositiveInt(metadata, "pages", "total_pages", "totalPages", "last_page", "lastPage"); pages > 0 {
+		return page < pages
+	}
+	for _, key := range []string{"has_more", "hasMore"} {
+		if raw, ok := metadata[key]; ok {
+			return parseEnabledFlag(raw)
+		}
+	}
+	if total := firstPositiveInt(metadata, "total", "total_count", "totalCount"); total > 0 {
+		return page*sub2APIPageSize < total
+	}
+	return itemCount >= sub2APIPageSize
+}
+
+func sub2APIPaginationMetadata(payload map[string]any) map[string]any {
+	merged := make(map[string]any)
+	copyFields := func(value any) {
+		fields, ok := value.(map[string]any)
+		if !ok {
+			return
+		}
+		for key, raw := range fields {
+			merged[key] = raw
+		}
+	}
+	copyFields(payload)
+	copyFields(payload["data"])
+	copyFields(payload["pagination"])
+	copyFields(payload["meta"])
+	if data, ok := payload["data"].(map[string]any); ok {
+		copyFields(data["pagination"])
+		copyFields(data["meta"])
+	}
+	return merged
+}
+
+func firstPositiveInt(values map[string]any, keys ...string) int {
+	for _, key := range keys {
+		if value := int(anyToInt64(values[key])); value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func sub2APIValueSignature(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprintf("%#v", value)
+	}
+	return string(encoded)
+}
+
+func mergeSub2APIGroup(groups map[string]model.SiteUserGroup, group model.SiteUserGroup) {
+	key := model.NormalizeSiteGroupKey(group.GroupKey)
+	group.GroupKey = key
+	group.Name = model.NormalizeSiteGroupName(key, group.Name)
+	if existing, ok := groups[key]; ok && strings.TrimSpace(existing.Name) != "" && strings.TrimSpace(existing.Name) != existing.GroupKey && (strings.TrimSpace(group.Name) == "" || group.Name == group.GroupKey) {
+		return
+	}
+	groups[key] = group
+}
+
+func sortedSub2APIGroups(groups map[string]model.SiteUserGroup) []model.SiteUserGroup {
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]model.SiteUserGroup, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, groups[key])
+	}
+	return result
+}
+
+func parseSub2APIProductGroups(value any) []model.SiteUserGroup {
+	items := make([]map[string]any, 0)
+	for _, candidate := range itemSliceCandidates(value) {
+		items = append(items, normalizeItemSlice(candidate)...)
+	}
+	seen := make(map[string]model.SiteUserGroup)
+	for _, item := range items {
+		key := firstNonEmptyString(
+			jsonString(item["channel_id"]),
+			jsonString(item["channelId"]),
+			jsonString(item["id"]),
+			jsonString(item["group_id"]),
+			jsonString(item["groupId"]),
+			jsonString(item["key"]),
+		)
+		if key == "" {
+			continue
+		}
+		name := firstNonEmptyString(
+			jsonString(item["name"]),
+			jsonString(item["channel_name"]),
+			jsonString(item["channelName"]),
+			jsonString(item["group_name"]),
+			jsonString(item["groupName"]),
+			key,
+		)
+		mergeSub2APIGroup(seen, model.SiteUserGroup{GroupKey: key, Name: name, RawPayload: marshalRawPayload(item)})
+	}
+	return sortedSub2APIGroups(seen)
+}
+
+func isExplicitEmptyCollection(value any) bool {
+	switch typed := value.(type) {
+	case []any:
+		return len(typed) == 0
+	case []map[string]any:
+		return len(typed) == 0
+	case []string:
+		return len(typed) == 0
+	case map[string]any:
+		found := false
+		for _, key := range []string{"groups", "products", "channels", "items", "list", "records", "rows", "data"} {
+			child, ok := typed[key]
+			if !ok {
+				continue
+			}
+			found = true
+			if !isExplicitEmptyCollection(child) {
+				return false
+			}
+		}
+		return found
+	}
+	return false
+}
+
+func isRecognizedSub2APIItemCollection(value any) bool {
+	switch typed := value.(type) {
+	case []any, []map[string]any, []string:
+		return true
+	case map[string]any:
+		for _, key := range []string{"items", "models", "data", "list", "records", "rows"} {
+			if child, ok := typed[key]; ok {
+				return isRecognizedSub2APIItemCollection(child)
+			}
+		}
+	}
+	return false
 }
 
 func unwrapSub2APIData(payload map[string]any, endpoint string) (any, error) {
@@ -284,17 +632,23 @@ func buildSub2APITokensFromItems(items []map[string]any) []model.SiteToken {
 			jsonString(item["group_id"]),
 			jsonString(item["groupId"]),
 			jsonString(nestedValue(item, "group", "id")),
+			jsonString(item["channel_id"]),
+			jsonString(item["channelId"]),
 			jsonString(item["token_group"]),
 			jsonString(item["tokenGroup"]),
 			jsonString(item["group_name"]),
 			jsonString(item["groupName"]),
 			jsonString(nestedValue(item, "group", "name")),
+			jsonString(item["channel_name"]),
+			jsonString(item["channelName"]),
 			jsonString(item["group"]),
 		))
 		groupName := model.NormalizeSiteGroupName(groupKey, firstNonEmptyString(
 			jsonString(item["group_name"]),
 			jsonString(item["groupName"]),
 			jsonString(nestedValue(item, "group", "name")),
+			jsonString(item["channel_name"]),
+			jsonString(item["channelName"]),
 			jsonString(item["group"]),
 			jsonString(item["token_group"]),
 			jsonString(item["tokenGroup"]),
@@ -920,11 +1274,7 @@ func mergeSiteGroups(groups []model.SiteUserGroup, tokens []model.SiteToken) []m
 	if len(merged) == 0 {
 		merged[model.SiteDefaultGroupKey] = model.SiteUserGroup{GroupKey: model.SiteDefaultGroupKey, Name: model.SiteDefaultGroupName}
 	}
-	result := make([]model.SiteUserGroup, 0, len(merged))
-	for _, group := range merged {
-		result = append(result, group)
-	}
-	return result
+	return sortedSub2APIGroups(merged)
 }
 
 func jsonFloat(value any) float64 {

@@ -299,6 +299,7 @@ type SiteUserGroup struct {
 	Name                    string                   `json:"name"`
 	RawPayload              string                   `json:"raw_payload"`
 	ProjectionDisabled      bool                     `json:"projection_disabled" gorm:"default:false"`
+	ChannelDisabled         bool                     `json:"channel_disabled" gorm:"default:false"`
 	ProjectionSuspended     bool                     `json:"projection_suspended" gorm:"default:false;index"`
 	ProjectionSuspendReason string                   `json:"projection_suspend_reason"`
 	ProjectionSuspendedAt   *time.Time               `json:"projection_suspended_at"`

@@ -19,6 +19,8 @@ export const SettingKey = {
     SyncLLMInterval: 'sync_llm_interval',
     SiteSyncInterval: 'site_sync_interval',
     SiteCheckinInterval: 'site_checkin_interval',
+    SiteCheckinScheduleMode: 'site_checkin_schedule_mode',
+    SiteCheckinCron: 'site_checkin_cron',
     RelayLogKeepEnabled: 'relay_log_keep_enabled',
     RelayLogKeepPeriod: 'relay_log_keep_period',
     CORSAllowOrigins: 'cors_allow_origins',

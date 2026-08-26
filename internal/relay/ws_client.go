@@ -434,7 +434,7 @@ func newWSRelayRequest(
 	if iter.Len() == 0 {
 		return nil, nil, fmt.Errorf("no available channel")
 	}
-	applyProtocolPreference(inbound.InboundTypeOpenAIResponse, iter, ctx)
+	applyProtocolPreferenceForMode(group.Mode, inbound.InboundTypeOpenAIResponse, iter, ctx)
 
 	if executionRequest != nil && executionRequest.IsOpenAIExactReplayRequest() {
 		rawBody = nil

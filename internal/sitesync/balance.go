@@ -304,7 +304,7 @@ func fetchSub2APIBalance(ctx context.Context, siteRecord *model.Site, account *m
 	if token == "" {
 		return 0, 0
 	}
-	payload, err := requestJSON(ctx, siteRecord, "GET", buildSiteURL(siteRecord.BaseURL, "/api/v1/auth/me"), nil, map[string]string{"Authorization": ensureBearer(token)}, account)
+	payload, err := requestJSON(ctx, siteRecord, "GET", buildSiteURL(siteRecord.BaseURL, "/api/v1/auth/me"), nil, sub2APIUserHeaders(token), account)
 	if err != nil {
 		return 0, 0
 	}

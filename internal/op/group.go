@@ -60,7 +60,26 @@ func GroupGetEnabledMap(name string, ctx context.Context) (model.Group, error) {
 	return group, nil
 }
 
+func validateGroupChannelEnabled(channelID int) error {
+	channel, ok := channelCache.Get(channelID)
+	if !ok {
+		return fmt.Errorf("channel not found: %d", channelID)
+	}
+	if !channel.Enabled {
+		return fmt.Errorf("channel disabled: %d", channelID)
+	}
+	return nil
+}
+
 func GroupCreate(group *model.Group, ctx context.Context) error {
+	if group == nil {
+		return fmt.Errorf("group is nil")
+	}
+	for _, item := range group.Items {
+		if err := validateGroupChannelEnabled(item.ChannelID); err != nil {
+			return err
+		}
+	}
 	if err := db.GetDB().WithContext(ctx).Create(group).Error; err != nil {
 		return err
 	}
@@ -70,6 +89,14 @@ func GroupCreate(group *model.Group, ctx context.Context) error {
 }
 
 func GroupUpdate(req *model.GroupUpdateRequest, ctx context.Context) (*model.Group, error) {
+	if req == nil {
+		return nil, fmt.Errorf("group update request is nil")
+	}
+	for _, item := range req.ItemsToAdd {
+		if err := validateGroupChannelEnabled(item.ChannelID); err != nil {
+			return nil, err
+		}
+	}
 	oldGroup, ok := groupCache.Get(req.ID)
 	if !ok {
 		return nil, fmt.Errorf("group not found")
@@ -201,32 +228,20 @@ func GroupUpdate(req *model.GroupUpdateRequest, ctx context.Context) (*model.Gro
 }
 
 func groupUpdateAffectedChannelIDs(oldGroup model.Group, req *model.GroupUpdateRequest) []int {
-	itemChannels := make(map[int]int, len(oldGroup.Items))
-	for _, item := range oldGroup.Items {
-		itemChannels[item.ID] = item.ChannelID
-	}
-
-	ids := make([]int, 0, len(oldGroup.Items)+len(req.ItemsToAdd))
-	if req.Mode != nil || req.SessionKeepTime != nil {
+	// 成员、权重、模式、重试或会话配置变化都会影响下一次路由决策。
+	// 重置分组内全部现有渠道，避免旧的会话粘性掩盖刚保存的权重分布。
+	if req.Mode != nil || req.SessionKeepTime != nil || req.RetryEnabled != nil || req.MaxRetries != nil ||
+		len(req.ItemsToAdd) > 0 || len(req.ItemsToUpdate) > 0 || len(req.ItemsToDelete) > 0 {
+		ids := make([]int, 0, len(oldGroup.Items)+len(req.ItemsToAdd))
 		for _, item := range oldGroup.Items {
 			ids = append(ids, item.ChannelID)
 		}
-	}
-	if req.RetryEnabled != nil || req.MaxRetries != nil {
-		for _, item := range oldGroup.Items {
+		for _, item := range req.ItemsToAdd {
 			ids = append(ids, item.ChannelID)
 		}
+		return ids
 	}
-	for _, itemID := range req.ItemsToDelete {
-		ids = append(ids, itemChannels[itemID])
-	}
-	for _, item := range req.ItemsToUpdate {
-		ids = append(ids, itemChannels[item.ID])
-	}
-	for _, item := range req.ItemsToAdd {
-		ids = append(ids, item.ChannelID)
-	}
-	return ids
+	return nil
 }
 
 func GroupDel(id int, ctx context.Context) error {
@@ -270,8 +285,14 @@ func GroupDel(id int, ctx context.Context) error {
 }
 
 func GroupItemAdd(item *model.GroupItem, ctx context.Context) error {
+	if item == nil {
+		return fmt.Errorf("group item is nil")
+	}
 	if _, ok := groupCache.Get(item.GroupID); !ok {
 		return fmt.Errorf("group not found")
+	}
+	if err := validateGroupChannelEnabled(item.ChannelID); err != nil {
+		return err
 	}
 
 	if err := db.GetDB().WithContext(ctx).Create(item).Error; err != nil {
@@ -293,6 +314,14 @@ func GroupItemBatchAdd(groupID int, items []model.GroupIDAndLLMName, ctx context
 	group, ok := groupCache.Get(groupID)
 	if !ok {
 		return fmt.Errorf("group not found")
+	}
+	for _, item := range items {
+		if item.ChannelID == 0 || item.ModelName == "" {
+			continue
+		}
+		if err := validateGroupChannelEnabled(item.ChannelID); err != nil {
+			return err
+		}
 	}
 
 	seen := make(map[string]struct{}, len(items))

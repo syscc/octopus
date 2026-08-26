@@ -17,3 +17,29 @@ func TestStatsSaveIntervalValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestSiteCheckinScheduleSettingsValidation(t *testing.T) {
+	valid := []Setting{
+		{Key: SettingKeySiteCheckinInterval, Value: "24"},
+		{Key: SettingKeySiteCheckinScheduleMode, Value: "interval"},
+		{Key: SettingKeySiteCheckinScheduleMode, Value: "cron"},
+		{Key: SettingKeySiteCheckinCron, Value: "*/15 * * * *"},
+	}
+	for _, setting := range valid {
+		if err := setting.Validate(); err != nil {
+			t.Fatalf("expected setting %s=%q to be valid: %v", setting.Key, setting.Value, err)
+		}
+	}
+
+	invalid := []Setting{
+		{Key: SettingKeySiteCheckinInterval, Value: "0"},
+		{Key: SettingKeySiteCheckinInterval, Value: "721"},
+		{Key: SettingKeySiteCheckinScheduleMode, Value: "timer"},
+		{Key: SettingKeySiteCheckinCron, Value: "not a cron"},
+	}
+	for _, setting := range invalid {
+		if err := setting.Validate(); err == nil {
+			t.Fatalf("expected setting %s=%q to be rejected", setting.Key, setting.Value)
+		}
+	}
+}

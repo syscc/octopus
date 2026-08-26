@@ -36,7 +36,7 @@ func EffectiveProjectedChannelAutoGroup(channel model.Channel) model.AutoGroupTy
 }
 
 func ChannelAutoGroupWithMode(channel *model.Channel, autoGroup model.AutoGroupType, ctx context.Context) {
-	if channel == nil || autoGroup == model.AutoGroupTypeNone {
+	if channel == nil || !channel.Enabled || autoGroup == model.AutoGroupTypeNone {
 		return
 	}
 	groups, err := GroupList(ctx)

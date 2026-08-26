@@ -9,13 +9,29 @@ import (
 	"github.com/bestruirui/octopus/internal/utils/safe"
 )
 
+// Schedule returns the next execution time after the supplied instant.
+type Schedule interface {
+	Next(time.Time) time.Time
+}
+
+type intervalSchedule struct {
+	interval time.Duration
+}
+
+func (s intervalSchedule) Next(after time.Time) time.Time {
+	return after.Add(s.interval)
+}
+
+func NewIntervalSchedule(interval time.Duration) Schedule {
+	return intervalSchedule{interval: interval}
+}
+
 type taskGate struct {
 	running atomic.Bool
 }
 
 type taskEntry struct {
 	name        string
-	interval    atomic.Int64
 	fn          func()
 	runOnStart  bool
 	stopCh      chan struct{}
@@ -26,6 +42,9 @@ type taskEntry struct {
 	loopStarted atomic.Bool
 	inactive    atomic.Bool
 	gate        *taskGate
+
+	scheduleMu sync.RWMutex
+	schedule   Schedule
 }
 
 var (
@@ -36,8 +55,8 @@ var (
 	runnerStarted bool
 )
 
-func newTaskEntry(name string, interval time.Duration, runOnStart bool, fn func()) *taskEntry {
-	entry := &taskEntry{
+func newTaskEntry(name string, schedule Schedule, runOnStart bool, fn func()) *taskEntry {
+	return &taskEntry{
 		name:       name,
 		fn:         fn,
 		runOnStart: runOnStart,
@@ -45,9 +64,8 @@ func newTaskEntry(name string, interval time.Duration, runOnStart bool, fn func(
 		wakeCh:     make(chan struct{}, 1),
 		doneCh:     make(chan struct{}),
 		gate:       taskGates[name],
+		schedule:   schedule,
 	}
-	entry.interval.Store(int64(interval))
-	return entry
 }
 
 func taskGateLocked(name string) *taskGate {
@@ -59,11 +77,19 @@ func taskGateLocked(name string) *taskGate {
 	return gate
 }
 
-// Register 注册一个定时任务
-// runOnStart: 是否在启动时立即执行一次
+// Register registers a duration-based scheduled task.
+// runOnStart controls whether the task executes once when the runner starts.
 func Register(name string, interval time.Duration, runOnStart bool, fn func()) {
 	if interval <= 0 {
 		log.Debugf("task %s not registered: interval is 0", name)
+		return
+	}
+	RegisterSchedule(name, NewIntervalSchedule(interval), runOnStart, fn)
+}
+
+func RegisterSchedule(name string, schedule Schedule, runOnStart bool, fn func()) {
+	if schedule == nil {
+		log.Debugf("task %s not registered: schedule is nil", name)
 		return
 	}
 
@@ -81,20 +107,30 @@ func Register(name string, interval time.Duration, runOnStart bool, fn func()) {
 		}
 
 		taskGateLocked(name)
-		entry := newTaskEntry(name, interval, runOnStart, fn)
+		entry := newTaskEntry(name, schedule, runOnStart, fn)
 		tasks[name] = entry
 		if runnerStarted {
 			startEntry(entry)
 		}
 		tasksMu.Unlock()
-		log.Debugf("task %s registered with interval %v, runOnStart: %v", name, interval, runOnStart)
+		log.Debugf("task %s registered with runOnStart: %v", name, runOnStart)
 		return
 	}
 }
 
-// Configure 创建或更新一个定时任务；interval 为 0 时停止并删除任务。
+// Configure creates or updates a duration-based scheduled task; interval 0
+// stops and removes the task.
 func Configure(name string, interval time.Duration, runOnStart bool, fn func()) {
 	if interval <= 0 {
+		Update(name, 0)
+		return
+	}
+	ConfigureSchedule(name, NewIntervalSchedule(interval), runOnStart, fn)
+}
+
+// ConfigureSchedule creates or updates a task with an arbitrary schedule.
+func ConfigureSchedule(name string, schedule Schedule, runOnStart bool, fn func()) {
+	if schedule == nil {
 		Update(name, 0)
 		return
 	}
@@ -107,27 +143,32 @@ func Configure(name string, interval time.Duration, runOnStart bool, fn func()) 
 			continue
 		}
 		if entry, exists := tasks[name]; exists {
-			entry.interval.Store(int64(interval))
-			signalIntervalUpdate(entry)
+			entry.scheduleMu.Lock()
+			entry.schedule = schedule
+			entry.scheduleMu.Unlock()
+			if !entry.loopStarted.Load() {
+				entry.runOnStart = runOnStart
+			}
+			signalScheduleUpdate(entry)
 			tasksMu.Unlock()
-			log.Infof("task %s interval updated to %v", name, interval)
+			log.Infof("task %s schedule updated", name)
 			return
 		}
 
 		taskGateLocked(name)
-		entry := newTaskEntry(name, interval, runOnStart, fn)
+		entry := newTaskEntry(name, schedule, runOnStart, fn)
 		tasks[name] = entry
 		if runnerStarted {
 			startEntry(entry)
 		}
 		tasksMu.Unlock()
-		log.Debugf("task %s configured with interval %v, runOnStart: %v", name, interval, runOnStart)
+		log.Debugf("task %s configured with runOnStart: %v", name, runOnStart)
 		return
 	}
 }
 
-// Update 更新任务的执行间隔
-// 当 interval 为 0 时，删除任务
+// Update updates a duration-based task. When interval is 0, the task is
+// stopped and removed.
 func Update(name string, interval time.Duration) {
 	tasksMu.Lock()
 	entry, exists := tasks[name]
@@ -156,8 +197,10 @@ func Update(name string, interval time.Duration) {
 		return
 	}
 
-	entry.interval.Store(int64(interval))
-	signalIntervalUpdate(entry)
+	entry.scheduleMu.Lock()
+	entry.schedule = NewIntervalSchedule(interval)
+	entry.scheduleMu.Unlock()
+	signalScheduleUpdate(entry)
 	tasksMu.Unlock()
 	log.Infof("task %s interval updated to %v", name, interval)
 }
@@ -173,18 +216,17 @@ func startEntry(entry *taskEntry) {
 	})
 }
 
-func signalIntervalUpdate(entry *taskEntry) {
+func signalScheduleUpdate(entry *taskEntry) {
 	select {
 	case entry.wakeCh <- struct{}{}:
 	default:
 	}
 }
 
-// RUN 启动所有注册的任务
+// RUN starts all registered tasks and then keeps the runner alive.
 func RUN() {
 	startRunner()
 
-	// 阻塞主协程
 	select {}
 }
 
@@ -199,30 +241,56 @@ func startRunner() {
 	tasksMu.Unlock()
 }
 
+func currentSchedule(entry *taskEntry) Schedule {
+	entry.scheduleMu.RLock()
+	defer entry.scheduleMu.RUnlock()
+	return entry.schedule
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer == nil {
+		return
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
 func runTask(entry *taskEntry) {
 	defer entry.doneOnce.Do(func() { close(entry.doneCh) })
 	if entry.inactive.Load() {
 		return
 	}
 
-	// 根据配置决定是否在启动时立即执行
 	if entry.runOnStart {
 		triggerTask(entry, "startup")
 	}
 
-	ticker := time.NewTicker(time.Duration(entry.interval.Load()))
-	defer func() {
-		ticker.Stop()
-	}()
-
 	for {
+		schedule := currentSchedule(entry)
+		if schedule == nil {
+			return
+		}
+		next := schedule.Next(time.Now())
+		if next.IsZero() {
+			return
+		}
+		delay := time.Until(next)
+		if delay < 0 {
+			delay = 0
+		}
+		timer := time.NewTimer(delay)
+
 		select {
-		case <-ticker.C:
-			triggerTask(entry, "ticker")
+		case <-timer.C:
+			triggerTask(entry, "schedule")
 		case <-entry.wakeCh:
-			ticker.Stop()
-			ticker = time.NewTicker(time.Duration(entry.interval.Load()))
+			stopTimer(timer)
 		case <-entry.stopCh:
+			stopTimer(timer)
 			return
 		}
 	}

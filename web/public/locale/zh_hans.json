@@ -459,7 +459,13 @@
                 "button": "立即签到",
                 "pending": "签到中...",
                 "success": "已触发后台站点全量签到",
-                "failed": "触发签到失败"
+                "failed": "触发签到失败",
+                "modeInterval": "间隔",
+                "modeCron": "Cron",
+                "cronPlaceholder": "0 8 * * *",
+                "cronInvalid": "Cron 表达式必须为 5 段标准格式（分 时 日 月 周）",
+                "intervalInvalid": "间隔必须在 1 到 720 小时之间",
+                "hint": "Cron 按服务端本地时区执行；随机签到账号会在基准触发后按账号随机窗口延迟执行"
             }
         },
         "data": {

@@ -390,6 +390,34 @@ func TestPersistSyncSnapshotPreservesGroupProjectionDisabled(t *testing.T) {
 	}
 }
 
+func TestPersistSyncSnapshotPreservesChannelDisabled(t *testing.T) {
+	ctx := setupProjectTestDB(t)
+	_, account := createProjectionFixture(t, ctx)
+
+	group := model.SiteUserGroup{SiteAccountID: account.ID, GroupKey: "vip", Name: "VIP", ChannelDisabled: true}
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&group).Error; err != nil {
+		t.Fatalf("create vip group failed: %v", err)
+	}
+	snapshot := &syncSnapshot{
+		accessToken: account.AccessToken,
+		groups:      []model.SiteUserGroup{{GroupKey: "vip", Name: "VIP Renamed"}},
+		tokens:      []model.SiteToken{{Name: "vip", Token: "key-vip", GroupKey: "vip", GroupName: "VIP", Enabled: true, Source: "sync"}},
+		status:      model.SiteExecutionStatusSuccess,
+		message:     "ok",
+	}
+	if err := persistSyncSnapshot(ctx, account.ID, snapshot); err != nil {
+		t.Fatalf("persistSyncSnapshot returned error: %v", err)
+	}
+
+	var reloaded model.SiteUserGroup
+	if err := dbpkg.GetDB().WithContext(ctx).Where("site_account_id = ? AND group_key = ?", account.ID, "vip").First(&reloaded).Error; err != nil {
+		t.Fatalf("query reloaded group failed: %v", err)
+	}
+	if !reloaded.ChannelDisabled {
+		t.Fatalf("expected channel_disabled to be preserved")
+	}
+}
+
 func TestPersistSyncSnapshotReplacesOnlyAuthoritativeGroups(t *testing.T) {
 	ctx := setupProjectTestDB(t)
 	_, account := createProjectionFixture(t, ctx)
@@ -473,6 +501,103 @@ func TestPersistSyncSnapshotReplacesOnlyAuthoritativeGroups(t *testing.T) {
 	}
 	if vipReloaded.ModelSyncFailureCount != 1 {
 		t.Fatalf("expected vip failure count 1, got %d", vipReloaded.ModelSyncFailureCount)
+	}
+}
+
+func TestPreserveHistoricalSiteGroupResultsDegradesDestructiveStatuses(t *testing.T) {
+	results := preserveHistoricalSiteGroupResults([]siteGroupSyncResult{
+		{GroupKey: "removed", Status: siteGroupSyncStatusRemoved, Authoritative: true},
+		{GroupKey: "missing", Status: siteGroupSyncStatusMissingKey},
+		{GroupKey: "empty", Status: siteGroupSyncStatusEmpty, Authoritative: true},
+		{GroupKey: "synced", Status: siteGroupSyncStatusSynced, Authoritative: true},
+	})
+	for _, result := range results {
+		switch result.GroupKey {
+		case "removed", "missing", "empty":
+			if result.Status != siteGroupSyncStatusUnresolved || result.Authoritative {
+				t.Fatalf("expected destructive status to degrade for %s, got %+v", result.GroupKey, result)
+			}
+		case "synced":
+			if result.Status != siteGroupSyncStatusSynced || !result.Authoritative {
+				t.Fatalf("expected synced status to remain authoritative, got %+v", result)
+			}
+		}
+	}
+}
+
+func TestPersistSyncSnapshotPreservesIncompleteDiscoveryHistory(t *testing.T) {
+	ctx := setupProjectTestDB(t)
+	_, account := createProjectionFixture(t, ctx)
+
+	vipGroup := model.SiteUserGroup{SiteAccountID: account.ID, GroupKey: "vip", Name: "VIP"}
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&vipGroup).Error; err != nil {
+		t.Fatalf("create vip group failed: %v", err)
+	}
+	vipToken := model.SiteToken{SiteAccountID: account.ID, Name: "vip", Token: "key-vip", GroupKey: "vip", GroupName: "VIP", Enabled: true, Source: "sync"}
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&vipToken).Error; err != nil {
+		t.Fatalf("create vip token failed: %v", err)
+	}
+	vipModel := model.SiteModel{SiteAccountID: account.ID, GroupKey: "vip", ModelName: "gpt-4o-vip", Source: "sync", RouteType: model.SiteModelRouteTypeOpenAIChat, RouteSource: model.SiteModelRouteSourceSyncInferred}
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&vipModel).Error; err != nil {
+		t.Fatalf("create vip model failed: %v", err)
+	}
+
+	if _, err := ProjectAccount(ctx, account.ID); err != nil {
+		t.Fatalf("initial ProjectAccount failed: %v", err)
+	}
+
+	snapshot := &syncSnapshot{
+		accessToken: account.AccessToken,
+		groups: []model.SiteUserGroup{
+			{GroupKey: model.SiteDefaultGroupKey, Name: model.SiteDefaultGroupName},
+		},
+		tokens: []model.SiteToken{
+			{Name: "primary", Token: "key-primary-new", GroupKey: model.SiteDefaultGroupKey, GroupName: model.SiteDefaultGroupName, Enabled: true, Source: "sync"},
+		},
+		models: []model.SiteModel{
+			{GroupKey: model.SiteDefaultGroupKey, ModelName: "gpt-4.1", Source: "sync", RouteType: model.SiteModelRouteTypeOpenAIChat, RouteSource: model.SiteModelRouteSourceSyncInferred},
+		},
+		groupResults: []siteGroupSyncResult{
+			{GroupKey: model.SiteDefaultGroupKey, GroupName: model.SiteDefaultGroupName, HasKey: true, Status: siteGroupSyncStatusSynced, Authoritative: true, ModelCount: 1, Message: "同步到 1 个模型"},
+		},
+		preserveHistoricalGroups: true,
+		status:                   model.SiteExecutionStatusPartial,
+		message:                  "部分分组同步完成：保留历史投影",
+	}
+	if err := persistSyncSnapshot(ctx, account.ID, snapshot); err != nil {
+		t.Fatalf("persistSyncSnapshot returned error: %v", err)
+	}
+	if _, err := ProjectAccount(ctx, account.ID); err != nil {
+		t.Fatalf("ProjectAccount after incomplete sync failed: %v", err)
+	}
+
+	var vipGroupCount int64
+	if err := dbpkg.GetDB().WithContext(ctx).Model(&model.SiteUserGroup{}).Where("site_account_id = ? AND group_key = ?", account.ID, "vip").Count(&vipGroupCount).Error; err != nil {
+		t.Fatalf("count vip groups failed: %v", err)
+	}
+	if vipGroupCount != 1 {
+		t.Fatalf("expected historical vip group to remain, got %d", vipGroupCount)
+	}
+	var vipTokenCount int64
+	if err := dbpkg.GetDB().WithContext(ctx).Model(&model.SiteToken{}).Where("site_account_id = ? AND group_key = ?", account.ID, "vip").Count(&vipTokenCount).Error; err != nil {
+		t.Fatalf("count vip tokens failed: %v", err)
+	}
+	if vipTokenCount != 1 {
+		t.Fatalf("expected historical vip token to remain, got %d", vipTokenCount)
+	}
+	var vipModelCount int64
+	if err := dbpkg.GetDB().WithContext(ctx).Model(&model.SiteModel{}).Where("site_account_id = ? AND group_key = ?", account.ID, "vip").Count(&vipModelCount).Error; err != nil {
+		t.Fatalf("count vip models failed: %v", err)
+	}
+	if vipModelCount != 1 {
+		t.Fatalf("expected historical vip model to remain, got %d", vipModelCount)
+	}
+	var vipBindingCount int64
+	if err := dbpkg.GetDB().WithContext(ctx).Model(&model.SiteChannelBinding{}).Where("site_account_id = ? AND group_key LIKE ?", account.ID, "vip%").Count(&vipBindingCount).Error; err != nil {
+		t.Fatalf("count vip bindings failed: %v", err)
+	}
+	if vipBindingCount != 1 {
+		t.Fatalf("expected historical vip channel binding to remain, got %d", vipBindingCount)
 	}
 }
 

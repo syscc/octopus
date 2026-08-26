@@ -13,6 +13,7 @@ import { toast } from '@/components/common/Toast';
 import { useSettingStore } from '@/stores/setting';
 import { translateSiteMessage } from '@/components/modules/site/site-message';
 import { SettingCard, useSettingField, useSettingToggle } from './shared';
+import { cn } from '@/lib/utils';
 
 function getErrorMessage(error: unknown, fallback: string) {
     if (error instanceof Error && error.message.trim()) {
@@ -76,6 +77,129 @@ function TaskRow({ icon: Icon, label, settingKey, last, running, runLabel, pendi
                     className="w-28 rounded-xl"
                 />
                 <Button variant="outline" size="sm" onClick={onRun} disabled={running} className="rounded-xl">
+                    {running ? pendingLabel : runLabel}
+                </Button>
+            </div>
+        </div>
+    );
+}
+
+// 间隔 / Cron 二选一的紧凑分段按钮（视觉沿用 APIKeyExport 的 ToggleGroup，缩小以适配任务行）
+function ModeToggleGroup({ value, options, onChange, title }: {
+    value: 'interval' | 'cron';
+    options: { value: 'interval' | 'cron'; label: string }[];
+    onChange: (value: 'interval' | 'cron') => void;
+    title?: string;
+}) {
+    return (
+        <div title={title} className="inline-flex shrink-0 items-center gap-0.5 rounded-lg border border-border bg-muted/20 p-0.5">
+            {options.map((opt) => (
+                <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => onChange(opt.value)}
+                    aria-pressed={value === opt.value}
+                    className={cn(
+                        'h-7 whitespace-nowrap rounded-md px-2 text-xs transition-colors',
+                        value === opt.value
+                            ? 'bg-primary text-primary-foreground'
+                            : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground'
+                    )}
+                >
+                    {opt.label}
+                </button>
+            ))}
+        </div>
+    );
+}
+
+// 站点全量签到：基准调度（间隔小时 / Cron）+ 手动触发。
+// 随机签到账号不直接跟随基准触发，而是在基准触发后按账号随机窗口延迟执行。
+function SiteCheckinTaskRow({ last, running, runLabel, pendingLabel, onRun }: {
+    last: string;
+    running: boolean;
+    runLabel: string;
+    pendingLabel: string;
+    onRun: () => void;
+}) {
+    const t = useTranslations('setting');
+    const modeField = useSettingField(SettingKey.SiteCheckinScheduleMode);
+    const intervalField = useSettingField(SettingKey.SiteCheckinInterval);
+    const cronField = useSettingField(SettingKey.SiteCheckinCron);
+    const mode: 'interval' | 'cron' = modeField.value === 'cron' ? 'cron' : 'interval';
+
+    const handleModeChange = (next: 'interval' | 'cron') => {
+        if (next === mode) return;
+        // 切换立即保存 site_checkin_schedule_mode；失败时 hook 内部回滚并提示
+        modeField.commit(next);
+    };
+
+    const handleIntervalBlur = () => {
+        const raw = intervalField.value.trim();
+        if (raw === '') return;
+        const hours = Number(raw);
+        if (!Number.isInteger(hours) || hours < 1 || hours > 720) {
+            toast.error(t('syncTasks.siteCheckin.intervalInvalid'));
+            return;
+        }
+        intervalField.save();
+    };
+
+    const handleCronBlur = () => {
+        const raw = cronField.value.trim();
+        if (raw === '') return;
+        if (raw.split(/\s+/).length !== 5) {
+            toast.error(t('syncTasks.siteCheckin.cronInvalid'));
+            return;
+        }
+        cronField.save();
+    };
+
+    return (
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+            <div className="flex min-w-0 flex-col gap-1">
+                <div className="flex items-center gap-3">
+                    <CalendarCheck2 className="h-5 w-5 shrink-0 text-muted-foreground" />
+                    <span className="text-sm font-medium">{t('syncTasks.siteCheckin.label')}</span>
+                </div>
+                <span className="ml-8 text-xs text-muted-foreground">
+                    {t('syncTasks.last')}: {last}
+                </span>
+            </div>
+            <div className="flex min-w-0 shrink-0 flex-nowrap items-center gap-2">
+                <ModeToggleGroup
+                    value={mode}
+                    options={[
+                        { value: 'interval', label: t('syncTasks.siteCheckin.modeInterval') },
+                        { value: 'cron', label: t('syncTasks.siteCheckin.modeCron') },
+                    ]}
+                    onChange={handleModeChange}
+                    title={t('syncTasks.siteCheckin.hint')}
+                />
+                {mode === 'interval' ? (
+                    <Input
+                        type="number"
+                        min={1}
+                        max={720}
+                        value={intervalField.value}
+                        onChange={(e) => intervalField.setValue(e.target.value)}
+                        onBlur={handleIntervalBlur}
+                        placeholder={t('syncTasks.intervalPlaceholder')}
+                        className="w-24 rounded-xl sm:w-28"
+                        aria-label={t('syncTasks.siteCheckin.modeInterval')}
+                    />
+                ) : (
+                    <Input
+                        type="text"
+                        value={cronField.value}
+                        onChange={(e) => cronField.setValue(e.target.value)}
+                        onBlur={handleCronBlur}
+                        placeholder={t('syncTasks.siteCheckin.cronPlaceholder')}
+                        className="w-28 rounded-xl font-mono text-xs"
+                        aria-label={t('syncTasks.siteCheckin.modeCron')}
+                    />
+                )}
+                <Button variant="outline" size="sm" onClick={onRun} disabled={running} className="shrink-0 whitespace-nowrap rounded-xl">
                     {running ? pendingLabel : runLabel}
                 </Button>
             </div>
@@ -159,10 +283,7 @@ export function SettingSyncTasks() {
             />
 
             {/* 站点全量签到 */}
-            <TaskRow
-                icon={CalendarCheck2}
-                label={t('syncTasks.siteCheckin.label')}
-                settingKey={SettingKey.SiteCheckinInterval}
+            <SiteCheckinTaskRow
                 last={formatTime(lastSiteCheckinTime)}
                 running={checkinAllSites.isPending}
                 runLabel={t('syncTasks.siteCheckin.button')}

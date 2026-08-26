@@ -283,6 +283,9 @@ func syncActivePresetTx(tx *gorm.DB, groupID int) error {
 // GroupPresetUpdate 直接编辑预设内容
 // 若该预设是某 Group 的 active，同事务内把改动镜像到该 Group 的实时配置 + items
 func GroupPresetUpdate(presetID int, req *model.GroupPresetUpdateRequest, ctx context.Context) (*model.GroupPreset, error) {
+	if req == nil {
+		return nil, fmt.Errorf("preset update request is nil")
+	}
 	var preset model.GroupPreset
 	var mirrorGroupID int
 	var affectedChannels []int
@@ -290,6 +293,20 @@ func GroupPresetUpdate(presetID int, req *model.GroupPresetUpdateRequest, ctx co
 	err := db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.First(&preset, presetID).Error; err != nil {
 			return fmt.Errorf("preset not found")
+		}
+		if req.Items != nil {
+			existingChannels := make(map[int]struct{}, len(preset.Items))
+			for _, item := range preset.Items {
+				existingChannels[item.ChannelID] = struct{}{}
+			}
+			for _, item := range *req.Items {
+				if _, existed := existingChannels[item.ChannelID]; existed {
+					continue
+				}
+				if err := validateGroupChannelEnabled(item.ChannelID); err != nil {
+					return err
+				}
+			}
 		}
 		if req.Name != nil {
 			preset.Name = *req.Name

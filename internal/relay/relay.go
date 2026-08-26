@@ -125,9 +125,9 @@ func Handler(inboundType inbound.InboundType, c *gin.Context) {
 		return
 	}
 
-	// 同协议优先：对普通候选做稳定排序；明确的 sticky/replay 渠道保持首位，
-	// 其他 OpenAI 协议渠道作为回落候选，不删除任何候选。
-	applyProtocolPreference(inboundType, iter, c.Request.Context())
+	// Weighted mode must preserve its sampled order; a second protocol sort would
+	// override the user-configured provider weights. Other modes retain protocol preference.
+	applyProtocolPreferenceForMode(group.Mode, inboundType, iter, c.Request.Context())
 
 	// === 早期心跳 ===
 	// 在所有 forward / 重试 / 退避之前启动早期心跳协程，覆盖前置阶段（连接慢、failover、退避叠加）
@@ -1041,6 +1041,13 @@ func applyProtocolPreference(inboundType inbound.InboundType, iter *balancer.Ite
 			}
 		})
 	}
+}
+
+func applyProtocolPreferenceForMode(mode dbmodel.GroupMode, inboundType inbound.InboundType, iter *balancer.Iterator, ctx context.Context) {
+	if mode == dbmodel.GroupModeWeighted {
+		return
+	}
+	applyProtocolPreference(inboundType, iter, ctx)
 }
 
 // channelTypeForPreference 从缓存读取通道类型，用于协议偏好排序。读不到时返回一个

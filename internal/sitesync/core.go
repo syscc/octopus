@@ -13,17 +13,19 @@ import (
 )
 
 type syncSnapshot struct {
-	accessToken  string
-	groups       []model.SiteUserGroup
-	tokens       []model.SiteToken
-	models       []model.SiteModel
-	groupResults []siteGroupSyncResult
-	createdToken *model.SiteToken
-	status       model.SiteExecutionStatus
-	balance      float64
-	balanceUsed  float64
-	todayIncome  float64
-	message      string
+	accessToken              string
+	groups                   []model.SiteUserGroup
+	tokens                   []model.SiteToken
+	models                   []model.SiteModel
+	groupResults             []siteGroupSyncResult
+	createdToken             *model.SiteToken
+	status                   model.SiteExecutionStatus
+	balance                  float64
+	balanceUsed              float64
+	todayIncome              float64
+	message                  string
+	groupDiscoveryState      sub2APIGroupDiscoveryState
+	preserveHistoricalGroups bool
 }
 
 type siteBatchAccount struct {
@@ -93,6 +95,12 @@ func syncAccountWithCreatedToken(ctx context.Context, accountID int, createdToke
 }
 
 func CheckinAccount(ctx context.Context, accountID int) (*model.SiteCheckinResult, error) {
+	checkinBatchMu.Lock()
+	defer checkinBatchMu.Unlock()
+	return checkinAccount(ctx, accountID)
+}
+
+func checkinAccount(ctx context.Context, accountID int) (*model.SiteCheckinResult, error) {
 	siteRecord, account, err := loadSiteAccount(ctx, accountID)
 	if err != nil {
 		return nil, sanitizeSiteError(err)
@@ -106,7 +114,7 @@ func CheckinAccount(ctx context.Context, accountID int) (*model.SiteCheckinResul
 			status = model.SiteExecutionStatusSkipped
 		}
 		message := sanitizeSiteStatusMessage(err)
-		updateErr := updateAccountCheckinState(ctx, account, status, message, false, resolvedAccessToken)
+		updateErr := updateAccountCheckinState(ctx, account, status, message, resolvedAccessToken)
 		if updateErr != nil {
 			return nil, sanitizeSiteError(updateErr)
 		}
@@ -116,7 +124,7 @@ func CheckinAccount(ctx context.Context, accountID int) (*model.SiteCheckinResul
 	result.AccountID = account.ID
 	result.SiteID = siteRecord.ID
 	result.Message = sanitizeSiteStatusText(result.Message)
-	if err := updateAccountCheckinState(ctx, account, result.Status, result.Message, result.Status == model.SiteExecutionStatusSuccess, resolvedAccessToken); err != nil {
+	if err := updateAccountCheckinState(ctx, account, result.Status, result.Message, resolvedAccessToken); err != nil {
 		return nil, sanitizeSiteError(err)
 	}
 	return result, nil
@@ -214,7 +222,12 @@ func CheckinAll(ctx context.Context) {
 	CheckinAllWithOptions(ctx, SiteBatchOptions{Trigger: SiteBatchTriggerScheduled})
 }
 
+var checkinBatchMu sync.Mutex
+
 func CheckinAllWithOptions(ctx context.Context, opts SiteBatchOptions) SiteBatchSummary {
+	checkinBatchMu.Lock()
+	defer checkinBatchMu.Unlock()
+
 	trigger := normalizedSiteBatchTrigger(opts.Trigger)
 	sites, err := op.SiteList(ctx)
 	if err != nil {
@@ -222,43 +235,88 @@ func CheckinAllWithOptions(ctx context.Context, opts SiteBatchOptions) SiteBatch
 		return SiteBatchSummary{Phase: SiteBatchPhaseCheckin, Trigger: trigger}
 	}
 	defer markLastCheckinAllTime()
+
 	items := eligibleCheckinAccounts(sites)
 	summary := newSiteBatchSummary(SiteBatchPhaseCheckin, opts, len(items))
 	defer summary.emitLog()
-	now := time.Now()
+	baseline := time.Now()
 	for i := 0; i < len(items); i++ {
 		item := items[i]
-		if item.account.RandomCheckin {
-			nextAt, scheduleErr := ensureRandomCheckinSchedule(ctx, item.account, now)
-			if scheduleErr != nil {
+		if item.account.RandomCheckin && trigger != SiteBatchTriggerManual {
+			if _, scheduleErr := armRandomCheckinPending(ctx, item.account, baseline); scheduleErr != nil {
 				summary.recordFailure(item.site.ID, item.site.Platform, item.account.ID, sanitizeSiteError(scheduleErr))
-				continue
-			}
-			if nextAt != nil && now.Before(*nextAt) {
+			} else {
 				summary.recordSkip(item.site.ID, item.site.Platform, SiteBatchReasonScheduledLater, 1)
-				continue
 			}
+			continue
 		}
-		if !waitSiteBatchInterval(ctx, 500*time.Millisecond) {
-			summary.markCanceled(ctx.Err())
-			recordBatchCanceledSkips(summary, items[i:])
+		i = checkinBatchAccount(ctx, summary, items, i)
+		if summary.Canceled {
 			return *summary
 		}
-		result, err := CheckinAccount(ctx, item.account.ID)
-		if err != nil {
-			summary.recordFailure(item.site.ID, item.site.Platform, item.account.ID, err)
-			if IsCloudflareProtectionError(err) || siteBatchReason(err) == SiteBatchReasonCloudflareProtection {
-				i = recordCloudflareSkipsAndWait(ctx, summary, items, i, CloudflareRetryAfter(err))
-			}
-			continue
-		}
-		if result.Status == model.SiteExecutionStatusSkipped {
-			summary.recordSkip(item.site.ID, item.site.Platform, SiteBatchReasonUnsupportedCheckin, 1)
-			continue
-		}
-		summary.recordResult(item.site.ID, item.site.Platform, item.account.ID, result.Status, result.Message)
 	}
 	return *summary
+}
+
+// CheckinRandomDue only consumes persisted random-checkin work whose due time
+// has arrived. The full interval/cron task is the sole producer of that work.
+func CheckinRandomDue(ctx context.Context) SiteBatchSummary {
+	checkinBatchMu.Lock()
+	defer checkinBatchMu.Unlock()
+
+	trigger := SiteBatchTriggerScheduled
+	sites, err := op.SiteList(ctx)
+	if err != nil {
+		log.Warnw("sitesync.random_checkin.list_failed", "trigger", string(trigger), "reason", string(siteBatchReason(err)), "message", sanitizeSiteStatusMessage(err))
+		return SiteBatchSummary{Phase: SiteBatchPhaseCheckin, Trigger: trigger}
+	}
+
+	now := time.Now()
+	items := dueRandomCheckinAccounts(eligibleCheckinAccounts(sites), now)
+	summary := newSiteBatchSummary(SiteBatchPhaseCheckin, SiteBatchOptions{Trigger: trigger}, len(items))
+	defer summary.emitLog()
+	for i := 0; i < len(items); i++ {
+		i = checkinBatchAccount(ctx, summary, items, i)
+		if summary.Canceled {
+			return *summary
+		}
+	}
+	return *summary
+}
+
+func checkinBatchAccount(ctx context.Context, summary *SiteBatchSummary, items []siteBatchAccount, index int) int {
+	item := items[index]
+	if !waitSiteBatchInterval(ctx, 500*time.Millisecond) {
+		summary.markCanceled(ctx.Err())
+		recordBatchCanceledSkips(summary, items[index:])
+		return len(items)
+	}
+	result, err := checkinAccount(ctx, item.account.ID)
+	if err != nil {
+		summary.recordFailure(item.site.ID, item.site.Platform, item.account.ID, err)
+		if IsCloudflareProtectionError(err) || siteBatchReason(err) == SiteBatchReasonCloudflareProtection {
+			return recordCloudflareSkipsAndWait(ctx, summary, items, index, CloudflareRetryAfter(err))
+		}
+		return index
+	}
+	if result.Status == model.SiteExecutionStatusSkipped {
+		summary.recordSkip(item.site.ID, item.site.Platform, SiteBatchReasonUnsupportedCheckin, 1)
+		return index
+	}
+	summary.recordResult(item.site.ID, item.site.Platform, item.account.ID, result.Status, result.Message)
+	return index
+}
+
+func dueRandomCheckinAccounts(items []siteBatchAccount, now time.Time) []siteBatchAccount {
+	filtered := make([]siteBatchAccount, 0, len(items))
+	for _, item := range items {
+		nextAt := item.account.NextAutoCheckinAt
+		if !item.account.RandomCheckin || nextAt == nil || nextAt.IsZero() || now.Before(*nextAt) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func eligibleSyncAccounts(sites []model.Site) []siteBatchAccount {

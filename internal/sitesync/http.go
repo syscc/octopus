@@ -239,10 +239,14 @@ func itemSliceCandidates(value any) []any {
 		nestedValue(payload, "data", "records"),
 		nestedValue(payload, "data", "rows"),
 		nestedValue(payload, "data", "data"),
+		nestedValue(payload, "data", "products"),
+		nestedValue(payload, "data", "channels"),
 		payload["items"],
 		payload["list"],
 		payload["records"],
 		payload["rows"],
+		payload["products"],
+		payload["channels"],
 		payload["data"],
 	}
 }
@@ -335,10 +339,13 @@ func parseGroupCandidate(candidate any) []model.SiteUserGroup {
 				continue
 			}
 			name := key
-			if value, ok := raw.(string); ok {
-				name = firstNonEmptyString(value, key)
-			} else if item, ok := raw.(map[string]any); ok {
+			switch item := raw.(type) {
+			case string:
+				name = firstNonEmptyString(item, key)
+			case map[string]any:
 				name = firstNonEmptyString(jsonString(item["name"]), jsonString(item["group_name"]), jsonString(item["groupName"]), jsonString(item["title"]), jsonString(item["label"]), key)
+			default:
+				continue
 			}
 			items = append(items, model.SiteUserGroup{GroupKey: key, Name: name})
 		}
@@ -375,7 +382,7 @@ func parseGroupObject(item map[string]any) (model.SiteUserGroup, bool) {
 
 func isIgnorableGroupMapKey(key string) bool {
 	switch strings.ToLower(strings.TrimSpace(key)) {
-	case "", "success", "message", "msg", "data", "code", "error", "errors", "groups", "items", "list", "records", "rows", "total", "page", "page_size", "pageSize":
+	case "", "success", "message", "msg", "data", "code", "error", "errors", "groups", "items", "list", "records", "rows", "total", "total_count", "totalcount", "page", "current_page", "currentpage", "page_size", "pagesize", "pages", "total_pages", "totalpages", "last_page", "lastpage", "has_more", "hasmore", "pagination", "meta", "timestamp":
 		return true
 	default:
 		return false

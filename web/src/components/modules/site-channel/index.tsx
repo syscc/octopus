@@ -90,6 +90,7 @@ import {
     useSiteChannelList,
     useUpdateSiteProjectedChannelSettings,
     useUpdateSiteGroupProjection,
+    useUpdateSiteGroupChannel,
     useUpdateAnySiteSourceKeys,
     useUpdateSiteSourceKeys,
     useUpdateSiteChannelModelDisabled,
@@ -101,6 +102,7 @@ import {
     getRouteSourceTone,
     getRouteTypeTone,
     isSupportedRouteType,
+    MANUAL_MODEL_ROUTE_TYPES,
 } from './constants';
 import { translateSiteMessage } from '../site/site-message';
 import {
@@ -1253,6 +1255,8 @@ const SiteChannelTableView = forwardRef<
                                                     ? 'text-destructive hover:bg-destructive/10'
                                                     : 'text-muted-foreground hover:bg-muted hover:text-foreground',
                                             )}
+                                            title={model.disabled ? '启用模型' : '停用模型'}
+                                            aria-label={model.disabled ? `启用模型 ${model.model_name}` : `停用模型 ${model.model_name}`}
                                         >
                                             <CircleOff className="size-4" />
                                         </button>
@@ -1326,6 +1330,7 @@ function SiteAccountPanel({
     const sourceKeyMutation = useUpdateSiteSourceKeys(siteId, account.account_id);
     const advancedMutation = useUpdateSiteProjectedChannelSettings(siteId, account.account_id);
     const groupProjectionMutation = useUpdateSiteGroupProjection(siteId, account.account_id);
+    const groupChannelMutation = useUpdateSiteGroupChannel(siteId, account.account_id);
     const addManualModelsMutation = useAddSiteManualModels(siteId, account.account_id);
     const deleteManualModelMutation = useDeleteSiteManualModel(siteId, account.account_id);
     const routeMutation = useUpdateSiteChannelModelRoutes(siteId, account.account_id);
@@ -1871,6 +1876,7 @@ function SiteAccountPanel({
 
     const handleGroupFilterChange = useCallback((value: string) => {
         setActiveFilter(value === SITE_GROUP_FILTER_ALL_VALUE ? SITE_GROUP_FILTER_ALL : createGroupFilter(value));
+        setSelectedModelKeys(new Set());
     }, []);
 
     const handleClearQuickFilters = useCallback(() => {
@@ -2053,6 +2059,27 @@ function SiteAccountPanel({
                         >
                             {activeGroupProjectionSuspended ? <CirclePause className="size-4" /> : <Waypoints className={cn('size-4', groupProjectionMutation.isPending && 'animate-spin')} />}
                             {activeGroupProjectionSuspended ? '已暂停' : activeGroup?.projection_disabled ? '不投影' : '投影'}
+                        </Button>
+
+                        <Button
+                            type="button"
+                            variant="outline"
+                            className={cn(
+                                'h-8 rounded-2xl px-3',
+                                activeGroup?.channel_disabled && 'border-destructive/30 bg-destructive/10 text-destructive hover:bg-destructive/15',
+                            )}
+                            onClick={() => activeGroup && groupChannelMutation.mutate({
+                                group_key: activeGroup.group_key,
+                                channel_disabled: !activeGroup.channel_disabled,
+                            }, {
+                                onSuccess: () => toast.success(activeGroup.channel_disabled ? '已启用当前分组渠道' : '已停用当前分组渠道'),
+                                onError: (error) => toast.error(translateSiteError(error, '更新渠道状态失败')),
+                            })}
+                            disabled={!activeGroup || activeGroupProjectionSuspended || !activeGroup.has_projected_channel || groupChannelMutation.isPending}
+                            title={!activeGroup ? '请先选择具体分组' : !activeGroup.has_projected_channel ? '当前分组暂无投影渠道' : activeGroup.channel_disabled ? '启用当前分组的投影渠道' : '停用当前分组的投影渠道'}
+                        >
+                            <Power className={cn('size-4', groupChannelMutation.isPending && 'animate-spin')} />
+                            {groupChannelMutation.isPending ? '保存中...' : activeGroup?.channel_disabled ? '启用渠道' : '停用渠道'}
                         </Button>
 
                         <Popover>
@@ -2429,8 +2456,8 @@ function SiteAccountPanel({
                             <Select value={manualModelRouteType} onValueChange={(value) => setManualModelRouteType(value as SiteModelRouteType)}>
                                 <SelectTrigger className="h-10 rounded-xl bg-background"><SelectValue /></SelectTrigger>
                                 <SelectContent className="rounded-xl">
-                                    {SITE_ROUTE_COLUMN_ORDER.map((routeType) => (
-                                        <SelectItem key={routeType} value={routeType}>{routeTypeTargetLabel(routeType)}</SelectItem>
+                                    {MANUAL_MODEL_ROUTE_TYPES.map((routeType) => (
+                                        <SelectItem key={routeType} value={routeType}>{routeTypeLabel(routeType)}</SelectItem>
                                     ))}
                                 </SelectContent>
                             </Select>

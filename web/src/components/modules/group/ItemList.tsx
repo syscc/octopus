@@ -40,6 +40,7 @@ function MemberItem({
     member,
     onRemove,
     onWeightChange,
+    onWeightCommit,
     isRemoving,
     index,
     showWeight = false,
@@ -50,6 +51,7 @@ function MemberItem({
     member: SelectedMember;
     onRemove: (id: string) => void;
     onWeightChange?: (id: string, weight: number) => void;
+    onWeightCommit?: (id: string, weight: number) => void;
     isRemoving?: boolean;
     index: number;
     showWeight?: boolean;
@@ -130,6 +132,10 @@ function MemberItem({
                         min={1}
                         value={member.weight ?? 1}
                         onChange={(e) => onWeightChange?.(member.id, Math.max(1, parseInt(e.target.value) || 1))}
+                        onBlur={(e) => onWeightCommit?.(member.id, Math.max(1, parseInt(e.currentTarget.value) || 1))}
+                        onKeyDown={(e) => {
+                            if (e.key === 'Enter') e.currentTarget.blur();
+                        }}
                         className={cn(
                             'w-12 h-6 text-xs text-center rounded border border-border bg-muted/50 focus:outline-none focus:ring-1 focus:ring-primary',
                             isDisabled && 'text-muted-foreground'
@@ -186,6 +192,7 @@ export interface MemberListProps {
     onReorder: (members: SelectedMember[]) => void;
     onRemove: (id: string) => void;
     onWeightChange?: (id: string, weight: number) => void;
+    onWeightCommit?: (id: string, weight: number) => void;
     /**
      * When true, auto-scroll the list to bottom when a *new visible* member appears
      * (i.e. a new member id is added). Useful in "editor" flows. Defaults to true.
@@ -218,6 +225,7 @@ export function MemberList({
     onReorder,
     onRemove,
     onWeightChange,
+    onWeightCommit,
     autoScrollOnAdd = true,
     onDragStart,
     onDrop,
@@ -324,6 +332,7 @@ export function MemberList({
                                                 member={member}
                                                 onRemove={onRemove}
                                                 onWeightChange={onWeightChange}
+                                                onWeightCommit={onWeightCommit}
                                                 isRemoving={removingIds.has(member.id)}
                                                 index={index}
                                                 showWeight={showWeight}

@@ -14,16 +14,23 @@ import { SettingWebDAVBackup } from './WebDAVBackup';
 export function Setting() {
     return (
         <div className="h-full min-h-0 overflow-y-auto overscroll-contain rounded-t-3xl">
-            <PageWrapper className="columns-1 gap-4 pb-24 md:columns-2 md:pb-4 *:mb-4 *:min-w-0 *:break-inside-avoid">
-                <SettingAPIKey key="setting-apikey" />
-                <SettingInfo key="setting-info" />
-                <SettingAppearance key="setting-appearance" />
-                <SettingNetwork key="setting-network" />
-                <SettingAccount key="setting-account" />
-                <SettingReliability key="setting-reliability" />
-                <SettingSyncTasks key="setting-sync-tasks" />
-                <SettingData key="setting-data" />
-                <SettingWebDAVBackup key="setting-webdav-backup" />
+            <PageWrapper
+                animateChildren={false}
+                className="grid grid-cols-1 items-start gap-4 pb-24 md:grid-cols-2 md:pb-4"
+            >
+                <PageWrapper className="grid content-start gap-4" childLayout={false}>
+                    <SettingAPIKey key="setting-apikey" />
+                    <SettingInfo key="setting-info" />
+                    <SettingAppearance key="setting-appearance" />
+                    <SettingNetwork key="setting-network" />
+                    <SettingAccount key="setting-account" />
+                </PageWrapper>
+                <PageWrapper className="grid content-start gap-4" childLayout={false}>
+                    <SettingReliability key="setting-reliability" />
+                    <SettingSyncTasks key="setting-sync-tasks" />
+                    <SettingData key="setting-data" />
+                    <SettingWebDAVBackup key="setting-webdav-backup" />
+                </PageWrapper>
             </PageWrapper>
         </div>
     );
