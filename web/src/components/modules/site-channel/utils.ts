@@ -100,20 +100,6 @@ export function routeTypeLabel(routeType: SiteModelRouteType) {
             return 'OpenAI';
     }
 }
-
-// Active route selectors keep the protocol distinction so moving a model or
-// adding a manual route cannot accidentally choose the wrong endpoint.
-export function routeTypeTargetLabel(routeType: SiteModelRouteType) {
-    switch (routeType) {
-        case 'openai_chat':
-            return 'OpenAI Chat';
-        case 'openai_response':
-            return 'OpenAI Responses';
-        default:
-            return routeTypeLabel(routeType);
-    }
-}
-
 export function routeSourceLabel(routeSource: SiteModelRouteSource) {
     switch (routeSource) {
         case 'manual_override':

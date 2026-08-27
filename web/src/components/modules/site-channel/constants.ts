@@ -10,15 +10,26 @@ export const SITE_ROUTE_COLUMN_ORDER: SiteModelRouteType[] = [
     'openai_embedding',
 ];
 
-// Manual model creation uses the stable Chat Completions route by default;
-// Responses remains available for synced models and explicit route changes.
-export const MANUAL_MODEL_ROUTE_TYPES: SiteModelRouteType[] = [
+// Protocol pickers expose a single merged OpenAI entry, whose canonical stored
+// value is the stable Chat Completions route. 'openai_response' stays a valid
+// value produced by sync inference / runtime learning, so historical rows keep
+// rendering and keep routing through the Responses transformer untouched.
+export const SITE_ROUTE_TARGET_ORDER: SiteModelRouteType[] = [
     'openai_chat',
     'anthropic',
     'gemini',
     'volcengine',
     'openai_embedding',
 ];
+
+// Manual model creation offers exactly the same merged target list.
+export const MANUAL_MODEL_ROUTE_TYPES: SiteModelRouteType[] = SITE_ROUTE_TARGET_ORDER;
+
+// Collapses the legacy Responses value onto the merged OpenAI entry for display,
+// counting and target comparison. The stored route_type itself is never rewritten.
+export function canonicalRouteTarget(routeType: SiteModelRouteType): SiteModelRouteType {
+    return routeType === 'openai_response' ? 'openai_chat' : routeType;
+}
 
 export const SITE_ROUTE_DISPLAY_ORDER: SiteModelRouteType[] = [
     ...SITE_ROUTE_COLUMN_ORDER,

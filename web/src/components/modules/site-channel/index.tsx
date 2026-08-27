@@ -98,7 +98,8 @@ import {
 } from '@/api/endpoints/site-channel';
 import {
     SITE_ROUTE_DISPLAY_ORDER,
-    SITE_ROUTE_COLUMN_ORDER,
+    SITE_ROUTE_TARGET_ORDER,
+    canonicalRouteTarget,
     getRouteSourceTone,
     getRouteTypeTone,
     isSupportedRouteType,
@@ -127,7 +128,6 @@ import {
     platformLabel,
     routeSourceLabel,
     routeTypeLabel,
-    routeTypeTargetLabel,
     summarizeHistory,
 } from './utils';
 import { useJumpStore, type JumpTarget, type PendingJump, type SiteChannelJumpTarget, isSiteChannelJumpTarget } from '@/stores/jump';
@@ -545,7 +545,7 @@ function collectSiteSummary(card: SiteChannelCard) {
         }
 
         for (const route of account.route_summaries) {
-            const routeType = route.route_type === 'openai_response' ? 'openai_chat' : route.route_type;
+            const routeType = canonicalRouteTarget(route.route_type);
             routeCounts.set(routeType, (routeCounts.get(routeType) ?? 0) + route.count);
         }
     }
@@ -903,6 +903,9 @@ function MoveRoutePopover({
     onMove: (routeType: SiteModelRouteType) => void;
 }) {
     const [open, setOpen] = useState(false);
+    // Legacy 'openai_response' rows map onto the single merged OpenAI entry so the
+    // menu never shows two OpenAI options and marks the right one as current.
+    const currentTarget = canonicalRouteTarget(currentRouteType);
 
     return (
         <Popover open={open} onOpenChange={setOpen}>
@@ -922,24 +925,24 @@ function MoveRoutePopover({
                 <div className="space-y-2">
                     <div className="px-2 pt-1 text-xs font-medium text-muted-foreground">移动至...</div>
                     <div className="grid gap-1">
-                        {SITE_ROUTE_COLUMN_ORDER.map((routeType) => (
+                        {SITE_ROUTE_TARGET_ORDER.map((routeType) => (
                             <button
                                 key={routeType}
                                 type="button"
-                                disabled={disabled || routeType === currentRouteType}
+                                disabled={disabled || routeType === currentTarget}
                                 onClick={() => {
                                     onMove(routeType);
                                     setOpen(false);
                                 }}
                                 className={cn(
                                     'flex items-center justify-between rounded-xl px-2 py-2 text-left text-sm transition',
-                                    routeType === currentRouteType
+                                    routeType === currentTarget
                                         ? 'bg-muted/60 text-muted-foreground'
                                         : 'hover:bg-muted',
                                 )}
                             >
-                                <span>{routeTypeTargetLabel(routeType)}</span>
-                                {routeType === currentRouteType ? <Check className="size-4" /> : null}
+                                <span>{routeTypeLabel(routeType)}</span>
+                                {routeType === currentTarget ? <Check className="size-4" /> : null}
                             </button>
                         ))}
                     </div>
@@ -1486,7 +1489,9 @@ function SiteAccountPanel({
     const applyRouteChange = useCallback((models: SiteModelView[], nextRouteType: SiteModelRouteType) => {
         const eligibleModels = models.filter((model) => {
             const modelKey = makeModelKey(model.group_key, model.model_name);
-            return !pendingModelKeys.has(modelKey) && !model.disabled && model.route_type !== nextRouteType;
+            // Compare on the merged target so "move to OpenAI" never rewrites a legacy
+            // 'openai_response' row into 'openai_chat' and silently change its endpoint.
+            return !pendingModelKeys.has(modelKey) && !model.disabled && canonicalRouteTarget(model.route_type) !== nextRouteType;
         });
 
         if (eligibleModels.length === 0) return;
@@ -2279,9 +2284,9 @@ function SiteAccountPanel({
                                         <SelectValue placeholder="目标端点" />
                                     </SelectTrigger>
                                     <SelectContent className="rounded-xl">
-                                        {SITE_ROUTE_COLUMN_ORDER.map((routeType) => (
+                                        {SITE_ROUTE_TARGET_ORDER.map((routeType) => (
                                             <SelectItem key={routeType} value={routeType}>
-                                                {routeTypeTargetLabel(routeType)}
+                                                {routeTypeLabel(routeType)}
                                             </SelectItem>
                                         ))}
                                     </SelectContent>
