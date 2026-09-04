@@ -341,7 +341,14 @@ func syncWithDirectToken(ctx context.Context, siteRecord *model.Site, account *m
 	if token == "" {
 		return nil, newDirectTokenRequiredError()
 	}
-	models, err := fetchModelsForSiteToken(ctx, siteRecord, account, model.SiteToken{Token: token, GroupKey: model.SiteDefaultGroupKey, GroupName: model.SiteDefaultGroupName, Enabled: true})
+	modelToken := model.SiteToken{Token: token, GroupKey: model.SiteDefaultGroupKey, GroupName: model.SiteDefaultGroupName, Enabled: true}
+	// API 直连站点协议未定时先探一次。探测顺手拿到的模型列表直接复用，命中就不用再
+	// 请求一遍；探不出来 models 为空，照原路径按兜底协议拉。
+	detectedRouteType, models, detectedSupported := probeSiteDefaultRouteType(ctx, siteRecord, account, token)
+	var err error
+	if len(models) == 0 {
+		models, err = fetchModelsForSiteToken(ctx, siteRecord, account, modelToken)
+	}
 	groupToken := model.SiteToken{Name: "default", Token: token, GroupKey: model.SiteDefaultGroupKey, GroupName: model.SiteDefaultGroupName, Enabled: true, Source: source, IsDefault: true}
 	siteModels := buildSiteModels(models, model.SiteDefaultGroupKey, source)
 	siteModels = applyDetectedRoutesToSiteModels(
@@ -381,13 +388,16 @@ func syncWithDirectToken(ctx context.Context, siteRecord *model.Site, account *m
 	}})
 	status := buildSyncSnapshotStatus(groupResults)
 	snapshot := &syncSnapshot{
-		accessToken:  strings.TrimSpace(account.AccessToken),
-		groups:       []model.SiteUserGroup{{GroupKey: model.SiteDefaultGroupKey, Name: model.SiteDefaultGroupName}},
-		tokens:       []model.SiteToken{groupToken},
-		models:       siteModels,
-		groupResults: groupResults,
-		status:       status,
-		message:      buildSyncSnapshotMessage(groupResults),
+		accessToken:              strings.TrimSpace(account.AccessToken),
+		groups:                   []model.SiteUserGroup{{GroupKey: model.SiteDefaultGroupKey, Name: model.SiteDefaultGroupName}},
+		tokens:                   []model.SiteToken{groupToken},
+		models:                   siteModels,
+		groupResults:             groupResults,
+		status:                   status,
+		message:                  buildSyncSnapshotMessage(groupResults),
+		detectedDefaultRouteType: detectedRouteType,
+
+		detectedSupportedRouteTypes: detectedSupported,
 	}
 	if err != nil || status == model.SiteExecutionStatusFailed {
 		return snapshot, buildSyncSnapshotFailure(groupResults)

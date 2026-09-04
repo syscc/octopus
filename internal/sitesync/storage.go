@@ -76,14 +76,35 @@ func persistSyncSnapshot(ctx context.Context, accountID int, snapshot *syncSnaps
 			return err
 		}
 		var accountSite struct {
-			Platform model.SitePlatform
+			Platform         model.SitePlatform
+			DefaultRouteType model.SiteModelRouteType
 		}
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Model(&model.Site{}).
-			Select("platform").
+			Select("platform", "default_route_type").
 			Where("id = ?", accountRef.SiteID).
 			Take(&accountSite).Error; err != nil {
 			return err
+		}
+		// 兜底协议只在 DB 里仍为空时写，别盖掉用户在同步期间手动指定的值。WHERE 里
+		// 重复带上空值条件，让批量同步中同一站点的多个账号退化成先到先写。和下面
+		// applyPersistedRouteState 保护 ManualOverride 是同一个道理。
+		if snapshot.detectedDefaultRouteType != "" && accountSite.DefaultRouteType == "" {
+			if err := tx.Model(&model.Site{}).
+				Where("id = ? AND (default_route_type = ? OR default_route_type IS NULL)", accountRef.SiteID, "").
+				Update("default_route_type", snapshot.detectedDefaultRouteType).Error; err != nil {
+				return err
+			}
+		}
+		// 支持集合是纯客观的探测结果，不表达用户意图，所以探到了就无条件刷新 ——
+		// 上游今天多开了 /v1/messages，下次同步就该反映出来。
+		if len(snapshot.detectedSupportedRouteTypes) > 0 {
+			if err := tx.Model(&model.Site{}).
+				Where("id = ?", accountRef.SiteID).
+				Select("SupportedRouteTypes").
+				Updates(&model.Site{SupportedRouteTypes: snapshot.detectedSupportedRouteTypes}).Error; err != nil {
+				return err
+			}
 		}
 		var existingGroups []model.SiteUserGroup
 		if err := tx.Where("site_account_id = ?", accountID).Find(&existingGroups).Error; err != nil {

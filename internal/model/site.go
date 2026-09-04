@@ -179,10 +179,15 @@ type Site struct {
 	CustomHeader       []CustomHeader     `json:"custom_header" gorm:"serializer:json"`
 	RouteBaseURLs      []SiteRouteBaseURL `json:"route_base_urls" gorm:"serializer:json"`
 	DefaultRouteType   SiteModelRouteType `json:"default_route_type" gorm:"type:varchar(32);not null;default:''"`
-	Tags               []string           `json:"tags" gorm:"serializer:json"`
-	Archived           bool               `json:"archived" gorm:"default:false;index"`
-	ArchivedAt         *time.Time         `json:"archived_at"`
-	Accounts           []SiteAccount      `json:"accounts,omitempty" gorm:"foreignKey:SiteID"`
+	// SupportedRouteTypes 记录探测确认上游真正接受的协议。单值的 DefaultRouteType
+	// 只能说"认不出模型时兜底走哪个"，说不了"这个 key 还能走 /v1/messages" ——
+	// 同时支持 OpenAI 和 Anthropic 的中转站很常见，靠这个集合才能把 claude 模型
+	// 投影成原生 Anthropic 渠道，而不是让网关白转一遍。只对 API 直连有意义。
+	SupportedRouteTypes []SiteModelRouteType `json:"supported_route_types" gorm:"serializer:json"`
+	Tags                []string             `json:"tags" gorm:"serializer:json"`
+	Archived            bool                 `json:"archived" gorm:"default:false;index"`
+	ArchivedAt          *time.Time           `json:"archived_at"`
+	Accounts            []SiteAccount        `json:"accounts,omitempty" gorm:"foreignKey:SiteID"`
 }
 
 func (s *Site) UnmarshalJSON(data []byte) error {
@@ -909,6 +914,7 @@ func (s *Site) Normalize() {
 		}
 		s.RouteBaseURLs = nil
 		s.DefaultRouteType = SiteModelRouteTypeOpenAIChat
+		s.SupportedRouteTypes = nil
 		s.ExternalCheckinURL = nil
 	}
 	if s.SiteProxy != nil {
@@ -941,6 +947,7 @@ func (s *Site) Normalize() {
 	}
 	s.Tags = NormalizeSiteTags(s.Tags)
 	s.RouteBaseURLs = NormalizeSiteRouteBaseURLs(s.RouteBaseURLs)
+	s.SupportedRouteTypes = NormalizeSiteSupportedRouteTypes(s.SupportedRouteTypes)
 	s.normalizeLegacyAPIPlatform()
 }
 
@@ -969,6 +976,83 @@ func (s *Site) ResolveDefaultRouteType() SiteModelRouteType {
 		return s.DefaultRouteType
 	}
 	return SiteModelRouteTypeOpenAIChat
+}
+
+// NormalizeSiteSupportedRouteTypes drops empty and non-projectable entries and
+// dedupes, so a probe result is safe to persist and compare against.
+func NormalizeSiteSupportedRouteTypes(values []SiteModelRouteType) []SiteModelRouteType {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[SiteModelRouteType]struct{}, len(values))
+	result := make([]SiteModelRouteType, 0, len(values))
+	for _, value := range values {
+		normalized := NormalizeSiteModelRouteType(value)
+		if !IsProjectedSiteModelRouteType(normalized) {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// SiteModelRouteTypeNeedsProbeConfirmation 区分"另一套协议"和"同一套协议的另一个
+// 端点"。OpenAI 的 chat / responses / embeddings 共用一个 base URL 和一套鉴权，站点
+// 支持 OpenAI 就都能走；anthropic / gemini / volcengine 是真正独立的协议，必须探测
+// 确认上游接受，否则会投影出一个打不通的渠道。
+func SiteModelRouteTypeNeedsProbeConfirmation(routeType SiteModelRouteType) bool {
+	switch NormalizeSiteModelRouteType(routeType) {
+	case SiteModelRouteTypeAnthropic, SiteModelRouteTypeGemini, SiteModelRouteTypeVolcengine:
+		return true
+	default:
+		return false
+	}
+}
+
+// SupportsRouteType reports whether routeType may be projected as its own channel
+// for this site.
+//
+// Only API-direct sites are gated. A management platform reports each model's
+// endpoint types through its own /api/pricing metadata, which is more
+// authoritative than anything we can probe from outside - overriding that with a
+// probe result would collapse correctly split channels.
+//
+// For API-direct sites, endpoints of the site's own protocol family always pass; a
+// genuinely different protocol needs the probe to have seen the upstream answer
+// it. The site's own default always counts - it is what unclassified models fall
+// back to, so a channel of that type exists regardless.
+func (s *Site) SupportsRouteType(routeType SiteModelRouteType) bool {
+	if s == nil {
+		return false
+	}
+	if s.Platform != SitePlatformAPI {
+		return true
+	}
+	normalized := NormalizeSiteModelRouteType(routeType)
+	if !SiteModelRouteTypeNeedsProbeConfirmation(normalized) {
+		return true
+	}
+	if normalized == s.ResolveDefaultRouteType() {
+		return true
+	}
+	// 站点为这个协议配了路径覆盖，等于用户明确声明"它走这个地址"，比我们从外面
+	// 探测出的结论更权威。
+	if _, ok := s.ResolveRouteBaseURL(normalized); ok {
+		return true
+	}
+	for _, value := range s.SupportedRouteTypes {
+		if NormalizeSiteModelRouteType(value) == normalized {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Site) Validate() error {

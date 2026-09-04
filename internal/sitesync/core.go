@@ -26,6 +26,11 @@ type syncSnapshot struct {
 	message                  string
 	groupDiscoveryState      sub2APIGroupDiscoveryState
 	preserveHistoricalGroups bool
+	// detectedDefaultRouteType / detectedSupportedRouteTypes 是本次同步探测出的站点级
+	// 协议信息，只在 API 直连站点还没探过时才有值。落库由 persistSyncSnapshot 负责 ——
+	// 它已经持有 site 行锁，顺手写掉最省事。
+	detectedDefaultRouteType    model.SiteModelRouteType
+	detectedSupportedRouteTypes []model.SiteModelRouteType
 }
 
 type siteBatchAccount struct {
