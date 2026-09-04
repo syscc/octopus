@@ -65,6 +65,10 @@ const AUTO_DETECT_VALUE = '__auto__';
 
 const OPENAI_DEFAULT_ROUTE_TYPE_VALUE = 'openai';
 
+// 站点协议留空 = 交给首次同步用真实 key 探测。Radix Select 不接受空串做 value
+// （会被当成"未选中"，渲染出一个空白触发器），所以下拉里用哨兵，提交时映射回空串。
+const AUTO_DETECT_ROUTE_TYPE_VALUE = '__auto_detect__';
+
 function isOpenAIDefaultRouteType(routeType: string) {
     return routeType === 'openai_chat' || routeType === 'openai_response';
 }
@@ -79,10 +83,25 @@ const ROUTE_BASE_URL_OPTIONS: ReadonlyArray<{ value: string; label: string }> = 
 ];
 
 const DEFAULT_ROUTE_TYPE_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
+    { value: AUTO_DETECT_ROUTE_TYPE_VALUE, label: '自动探测' },
     { value: OPENAI_DEFAULT_ROUTE_TYPE_VALUE, label: 'OpenAI' },
     { value: 'anthropic', label: 'Anthropic' },
     { value: 'gemini', label: 'Gemini' },
 ];
+
+const ROUTE_TYPE_LABELS: Record<string, string> = Object.fromEntries(
+    ROUTE_BASE_URL_OPTIONS.map((option) => [option.value, option.label]),
+);
+
+function formatSupportedRouteTypes(values: string[]) {
+    return values.map((value) => ROUTE_TYPE_LABELS[value] ?? value).join('、');
+}
+
+// 签到要登录站点后台。API 直连和 Cloudflare 只有一把 API Key，后端
+// checkinAccountState 对这两个平台直接返回 skipped，签到 URL 摆在那儿只会误导。
+function supportsCheckin(platform: SitePlatform | '') {
+    return platform !== SitePlatform.Cloudflare && platform !== SitePlatform.API;
+}
 
 const PLATFORM_LABELS: Record<SitePlatform, string> = {
     [SitePlatform.API]: 'API 直连',
@@ -110,7 +129,8 @@ function createEmptySiteForm(): SiteFormState {
         custom_header: [{ header_key: '', header_value: '' }],
         route_base_urls: [],
         tags: [],
-        default_route_type: 'openai_chat',
+        // 空串 = 自动探测。API 直连站点的协议由首次同步探测决定，用户不用选。
+        default_route_type: '',
     };
 }
 
@@ -123,7 +143,9 @@ function createSiteForm(site: SiteRecord): SiteFormState {
         enabled: site.enabled,
         proxy_mode: site.proxy_mode ?? 'direct',
         proxy_config_id: site.proxy_config_id ?? null,
-        external_checkin_url: isCloudflare ? '' : (site.external_checkin_url ?? ''),
+        external_checkin_url: supportsCheckin(site.platform)
+            ? (site.external_checkin_url ?? '')
+            : '',
         is_pinned: site.is_pinned,
         sort_order: site.sort_order,
         global_weight: site.global_weight,
@@ -134,9 +156,11 @@ function createSiteForm(site: SiteRecord): SiteFormState {
             ? []
             : (site.route_base_urls ?? []).map((item) => ({ ...item })),
         tags: [...(site.tags ?? [])],
+        // 空串必须原样保留 —— 它表示"等待探测"。以前这里 || 'openai_chat' 会把它
+        // 吃掉，于是随便改个站点名保存就把协议钉死成 OpenAI，自动探测被悄悄杀死。
         default_route_type: isCloudflare
             ? 'openai_chat'
-            : (site.default_route_type || 'openai_chat'),
+            : (site.default_route_type ?? ''),
     };
 }
 
@@ -145,6 +169,10 @@ function applySitePlatform(
     platform: SitePlatform | '',
 ): SiteFormState {
     const next = { ...form, platform };
+    if (!supportsCheckin(platform)) {
+        // 切到签不了的平台就把签到 URL 一起清掉，否则字段被隐藏了值还留着。
+        next.external_checkin_url = '';
+    }
     if (platform !== SitePlatform.Cloudflare) {
         return next;
     }
@@ -333,8 +361,9 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                 proxy_mode: siteForm.proxy_mode,
                 proxy_config_id:
                     siteForm.proxy_mode === 'pool' ? siteForm.proxy_config_id : null,
-                external_checkin_url:
-                    isCloudflare ? null : (siteForm.external_checkin_url.trim() || null),
+                external_checkin_url: supportsCheckin(platform)
+                    ? (siteForm.external_checkin_url.trim() || null)
+                    : null,
                 is_pinned: siteForm.is_pinned,
                 sort_order: siteForm.sort_order,
                 global_weight: siteForm.global_weight,
@@ -476,7 +505,7 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                             )}
                         </label>
 
-                        {siteForm.platform === SitePlatform.API && (
+                        {siteForm.platform === SitePlatform.API && site && (
                             <div className="grid gap-2 text-sm">
                                 <div className="flex items-center gap-1.5">
                                     <span className="font-medium">默认协议</span>
@@ -493,20 +522,24 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                                             </button>
                                         </TooltipTrigger>
                                         <TooltipContent className="max-w-xs">
-                                            决定获取模型列表的请求格式，以及未手动指定路由类型的模型的默认端点格式
+                                            决定获取模型列表的请求格式，以及未手动指定路由类型的模型的默认端点格式。选「自动探测」会在下次同步时用 API Key 试探上游实际支持的协议并自动填上。
                                         </TooltipContent>
                                     </Tooltip>
                                 </div>
                                 <Select
-                                    value={isOpenAIDefaultRouteType(siteForm.default_route_type)
-                                        ? OPENAI_DEFAULT_ROUTE_TYPE_VALUE
-                                        : siteForm.default_route_type}
+                                    value={siteForm.default_route_type === ''
+                                        ? AUTO_DETECT_ROUTE_TYPE_VALUE
+                                        : isOpenAIDefaultRouteType(siteForm.default_route_type)
+                                            ? OPENAI_DEFAULT_ROUTE_TYPE_VALUE
+                                            : siteForm.default_route_type}
                                     onValueChange={(value) =>
                                         setSiteForm((current) => ({
                                             ...current,
-                                            default_route_type: value === OPENAI_DEFAULT_ROUTE_TYPE_VALUE
-                                                ? lastOpenAIDefaultRouteTypeRef.current
-                                                : value,
+                                            default_route_type: value === AUTO_DETECT_ROUTE_TYPE_VALUE
+                                                ? ''
+                                                : value === OPENAI_DEFAULT_ROUTE_TYPE_VALUE
+                                                    ? lastOpenAIDefaultRouteTypeRef.current
+                                                    : value,
                                         }))
                                     }
                                 >
@@ -521,10 +554,18 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                                         ))}
                                     </SelectContent>
                                 </Select>
+                                {(site.supported_route_types?.length ?? 0) > 0 && (
+                                    <span className="text-xs text-muted-foreground">
+                                        已探测支持：{formatSupportedRouteTypes(site.supported_route_types ?? [])}
+                                        {(site.supported_route_types?.length ?? 0) > 1
+                                            ? ' — 上面选的只是兜底，模型会各自按原生协议投影成独立渠道'
+                                            : ''}
+                                    </span>
+                                )}
                             </div>
                         )}
 
-                        {siteForm.platform !== SitePlatform.Cloudflare ? (
+                        {supportsCheckin(siteForm.platform) ? (
                             <label className="grid gap-2 text-sm">
                                 <span className="font-medium">手动签到 URL</span>
                                 <Input

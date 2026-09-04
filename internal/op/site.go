@@ -183,7 +183,10 @@ func mergeSiteUpdateRequest(site model.Site, req *model.SiteUpdateRequest) (mode
 		selectFields = append(selectFields, "base_url")
 	}
 	if req.DefaultRouteType != nil {
-		if !model.IsProjectedSiteModelRouteType(*req.DefaultRouteType) {
+		// 空串是合法输入，含义是"清空，交给下次同步重新探测"。只有 API 直连会用到
+		// 这个状态；其它平台的空串由 ResolveDefaultRouteType 兜回 openai_chat，
+		// Cloudflare 还会被 Normalize 强制写回。非空值仍必须是可投影的路由类型。
+		if *req.DefaultRouteType != "" && !model.IsProjectedSiteModelRouteType(*req.DefaultRouteType) {
 			return model.Site{}, nil, fmt.Errorf("invalid default route type")
 		}
 		merged.DefaultRouteType = *req.DefaultRouteType

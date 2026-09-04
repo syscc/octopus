@@ -179,6 +179,27 @@ func updateSite(c *gin.Context) {
 		return
 	}
 	siteID := site.ID
+	// API 直连站点的协议为空（用户选了"自动探测"，或还没探过）时不能走裸投影：
+	// platformOutboundType 只会拿到兜底的 openai_chat，当场把线上 Anthropic/Gemini
+	// 渠道改成 OpenAI，一直错到下次同步探测回来。这里改跑一次同步 —— 它会先探测出
+	// 真实协议写库，再自己投影。代价是多打上游一次，但用户刚改过站点配置
+	// （base_url / header / 代理都可能变），重新同步本来也更正确。
+	if req.DefaultRouteType != nil && *req.DefaultRouteType == "" &&
+		site.Platform == model.SitePlatformAPI && len(site.Accounts) > 0 {
+		accountIDs := make([]int, 0, len(site.Accounts))
+		for _, account := range site.Accounts {
+			accountIDs = append(accountIDs, account.ID)
+		}
+		safe.Go("site-update-reprobe", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			// 同步完成后会自动调 ProjectAccount，把探测结果投影出去
+			sitesvc.SyncAccountsWithOptions(ctx, accountIDs, sitesync.SiteBatchOptions{Trigger: sitesync.SiteBatchTriggerManual})
+		})
+		resp.Success(c, site)
+		return
+	}
+	// 同步完成或跳过时才走投影，确保渠道与 DB 一致
 	safe.Go("site-update-project", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()

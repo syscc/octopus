@@ -131,6 +131,9 @@ export type Site = {
   route_base_urls: SiteRouteBaseURL[];
   tags: string[];
   default_route_type?: string;
+  // 探测确认上游支持的全部协议。default_route_type 只是兜底，多协议站点靠这个集合
+  // 把 claude / gemini 模型投影成原生渠道。
+  supported_route_types?: string[];
   archived: boolean;
   archived_at?: string | null;
   accounts: SiteAccount[];
@@ -155,6 +158,7 @@ type SiteServer = Omit<
   route_base_urls: SiteRouteBaseURL[] | null;
   tags: string[] | null;
   default_route_type?: string | null;
+  supported_route_types?: string[] | null;
 };
 
 export type SiteSyncResult = {
@@ -237,6 +241,7 @@ function normalizeSiteServerList(data: SiteServer[]): Site[] {
     route_base_urls: site.route_base_urls ?? [],
     tags: site.tags ?? [],
     default_route_type: site.default_route_type ?? undefined,
+    supported_route_types: site.supported_route_types ?? undefined,
     proxy_mode: site.proxy_mode ?? "direct",
     proxy_config_id: site.proxy_config_id ?? null,
     external_checkin_url: site.external_checkin_url ?? null,

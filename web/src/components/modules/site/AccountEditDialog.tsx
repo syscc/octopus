@@ -109,17 +109,22 @@ function AnimatedFormSection({ children }: { children: ReactNode }) {
     );
 }
 
-function defaultCredentialType(): SiteCredentialType {
+function defaultCredentialType(platform: SitePlatform): SiteCredentialType {
+    // API 直连只需要一把 key，别让用户在 Access Token 上白折腾。其它平台仍然以
+    // Access Token 为默认（管理平台靠它调用户接口）。
+    if (platform === SitePlatform.API) {
+        return SiteCredentialType.APIKey;
+    }
     return SiteCredentialType.AccessToken;
 }
 
 function credentialOptions(platform: SitePlatform) {
     switch (platform) {
+        case SitePlatform.API:
+            return [SiteCredentialType.APIKey];
         case SitePlatform.Cloudflare:
             return [SiteCredentialType.AccessToken, SiteCredentialType.APIKey];
         case SitePlatform.Sub2API:
-            return [SiteCredentialType.AccessToken, SiteCredentialType.APIKey];
-        case SitePlatform.API:
             return [SiteCredentialType.AccessToken, SiteCredentialType.APIKey];
         default:
             return [
@@ -130,11 +135,36 @@ function credentialOptions(platform: SitePlatform) {
     }
 }
 
+// 收窄选项不能把存量账号锁死：老账号如果用的是现在已不推荐的凭据类型，仍要能
+// 打开编辑框改别的字段。所以下拉是「平台允许集 ∪ 账号当前类型」。
+function credentialOptionsForAccount(
+    platform: SitePlatform,
+    current?: SiteCredentialType,
+) {
+    const allowed = credentialOptions(platform);
+    if (current && !allowed.includes(current)) {
+        return [...allowed, current];
+    }
+    return allowed;
+}
+
+// 签到要么平台不支持，要么需要一份能调用户接口的凭据。API Key 只能打 relay 端点，
+// 后端 resolveManagedAccessToken 拿不到 access token，签到必然失败；API 直连和
+// Cloudflare 平台的 checkinAccountState 本来就直接返回 skipped。既然签不了，开关就
+// 别摆在那儿误导人。
+function supportsCheckin(platform: SitePlatform, credentialType: SiteCredentialType) {
+    if (platform === SitePlatform.Cloudflare || platform === SitePlatform.API) {
+        return false;
+    }
+    return credentialType !== SiteCredentialType.APIKey;
+}
+
 function createEmptyAccountForm(site: SiteRecord): SiteAccountFormState {
+    const credentialType = defaultCredentialType(site.platform);
     return {
         site_id: site.id,
         name: '',
-        credential_type: defaultCredentialType(),
+        credential_type: credentialType,
         username: '',
         password: '',
         access_token: '',
@@ -146,7 +176,7 @@ function createEmptyAccountForm(site: SiteRecord): SiteAccountFormState {
         proxy_config_id: null,
         enabled: true,
         auto_sync: true,
-        auto_checkin: site.platform !== SitePlatform.Cloudflare,
+        auto_checkin: supportsCheckin(site.platform, credentialType),
         random_checkin: false,
         checkin_interval_hours: 24,
         checkin_random_window_minutes: 120,
@@ -157,14 +187,14 @@ function createAccountForm(
     account: SiteAccount,
     platform: SitePlatform,
 ): SiteAccountFormState {
-    const supportedTypes = credentialOptions(platform);
+    const supportedTypes = credentialOptionsForAccount(platform, account.credential_type);
     const credentialType = supportedTypes.includes(account.credential_type)
         ? account.credential_type
-        : defaultCredentialType();
+        : defaultCredentialType(platform);
     const isUsernamePassword = credentialType === SiteCredentialType.UsernamePassword;
     const isAccessToken = credentialType === SiteCredentialType.AccessToken;
     const isAPIKey = credentialType === SiteCredentialType.APIKey;
-    const supportsCheckin = platform !== SitePlatform.Cloudflare;
+    const canCheckin = supportsCheckin(platform, credentialType);
 
     return {
         site_id: account.site_id,
@@ -187,8 +217,8 @@ function createAccountForm(
         proxy_config_id: account.proxy_config_id ?? null,
         enabled: account.enabled,
         auto_sync: account.auto_sync,
-        auto_checkin: supportsCheckin && account.auto_checkin,
-        random_checkin: supportsCheckin && account.random_checkin,
+        auto_checkin: canCheckin && account.auto_checkin,
+        random_checkin: canCheckin && account.random_checkin,
         checkin_interval_hours: account.checkin_interval_hours,
         checkin_random_window_minutes: account.checkin_random_window_minutes,
     };
@@ -253,8 +283,8 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
 
     const currentPlatform = site?.platform ?? SitePlatform.NewAPI;
     const currentCredentialOptions = useMemo(
-        () => credentialOptions(currentPlatform),
-        [currentPlatform],
+        () => credentialOptionsForAccount(currentPlatform, account?.credential_type),
+        [currentPlatform, account?.credential_type],
     );
 
     const handleSubmit = useCallback(
@@ -293,7 +323,8 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
                 toast.error('请输入 API Key');
                 return;
             }
-            if (accountForm.auto_checkin && accountForm.random_checkin) {
+            const canCheckin = supportsCheckin(currentPlatform, accountForm.credential_type);
+            if (canCheckin && accountForm.auto_checkin && accountForm.random_checkin) {
                 if (
                     !Number.isFinite(accountForm.checkin_interval_hours) ||
                     accountForm.checkin_interval_hours < 1 ||
@@ -377,10 +408,8 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
                     accountForm.proxy_mode === 'pool' ? accountForm.proxy_config_id : null,
                 enabled: accountForm.enabled,
                 auto_sync: accountForm.auto_sync,
-                auto_checkin:
-                    currentPlatform === SitePlatform.Cloudflare ? false : accountForm.auto_checkin,
-                random_checkin:
-                    currentPlatform === SitePlatform.Cloudflare ? false : accountForm.random_checkin,
+                auto_checkin: canCheckin && accountForm.auto_checkin,
+                random_checkin: canCheckin && accountForm.random_checkin,
                 checkin_interval_hours: Math.max(
                     1,
                     Math.trunc(accountForm.checkin_interval_hours || 24),
@@ -431,6 +460,8 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
         );
     }
 
+    const canCheckinNow = supportsCheckin(currentPlatform, accountForm.credential_type);
+
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
             <DialogContent
@@ -480,9 +511,14 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
                                         setAccountForm((current) => {
                                             if (!current) return current;
                                             const nextType = value as SiteCredentialType;
+                                            // 切到签不了的凭据时把签到状态一起清掉，否则开关被隐藏
+                                            // 了值还留着 true，提交时会带上去。
+                                            const nextCanCheckin = supportsCheckin(currentPlatform, nextType);
                                             return {
                                                 ...current,
                                                 credential_type: nextType,
+                                                auto_checkin: nextCanCheckin && current.auto_checkin,
+                                                random_checkin: nextCanCheckin && current.random_checkin,
                                                 access_token:
                                                     nextType === SiteCredentialType.AccessToken
                                                         ? current.access_token
@@ -724,7 +760,7 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
                                         }
                                     />
                                 </label>
-                                {currentPlatform !== SitePlatform.Cloudflare ? (
+                                {canCheckinNow ? (
                                     <>
                                         <label className="flex cursor-pointer items-center justify-between gap-3">
                                             <span className="flex items-center gap-2 text-sm text-card-foreground">
@@ -763,7 +799,7 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
                             </div>
 
                             <AnimatePresence initial={false}>
-                                {currentPlatform !== SitePlatform.Cloudflare &&
+                                {canCheckinNow &&
                                 accountForm.auto_checkin && accountForm.random_checkin ? (
                                     <motion.div
                                         key="random-checkin-options"
