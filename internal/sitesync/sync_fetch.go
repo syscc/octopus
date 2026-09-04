@@ -942,17 +942,10 @@ func buildModelFetchBaseURLs(siteRecord *model.Site) []string {
 	if siteRecord == nil {
 		return nil
 	}
-
-	baseURL := strings.TrimRight(strings.TrimSpace(siteRecord.BaseURL), "/")
-	if baseURL == "" {
-		return nil
-	}
-
-	candidates := []string{baseURL}
-	if sitePlatformUsesV1ModelEndpoint(siteRecord) && !strings.HasSuffix(strings.ToLower(baseURL), "/v1") {
-		candidates = append(candidates, baseURL+"/v1")
-	}
-	return candidates
+	// 和 helper.ProbeModelProtocol 共用同一套候选生成。这两处一旦不一致，就会出现
+	// 只在第二次同步才暴露的 bug：探测在某个变体上认出协议并写库，下次同步因为协议
+	// 已定不再探测，却去打另一个变体 —— 404，模型全丢。
+	return helper.BuildVersionedBaseURLs(siteRecord.BaseURL, siteModelFetchVersionSuffix(siteRecord))
 }
 
 func filterSessionFallbackModelsByGroup(
@@ -1026,12 +1019,20 @@ func stringSliceContainsFold(values []string, target string) bool {
 	return false
 }
 
-func sitePlatformUsesV1ModelEndpoint(site *model.Site) bool {
-	if site.Platform == model.SitePlatformAPI {
-		rt := site.ResolveDefaultRouteType()
-		return rt == model.SiteModelRouteTypeOpenAIChat || rt == model.SiteModelRouteTypeOpenAIResponse || rt == ""
+// siteModelFetchVersionSuffix 返回该站点还应该尝试的 base URL 版本段（"" = 只试
+// base 本身）。
+//
+// 这里必须和 helper.ProbeModelProtocol 的候选保持一致。否则会出现一个只在第二次
+// 同步才暴露的 bug：探测在 {base}/v1 上认出 anthropic 并写入协议，下次同步因为协议
+// 已定不再探测，却只试 {base}/models —— 404，模型全丢。
+func siteModelFetchVersionSuffix(site *model.Site) string {
+	if site == nil || site.Platform != model.SitePlatformAPI {
+		return "/v1"
 	}
-	return true
+	if site.ResolveDefaultRouteType() == model.SiteModelRouteTypeGemini {
+		return "/v1beta"
+	}
+	return "/v1"
 }
 
 func buildSiteModels(names []string, groupKey string, source string) []model.SiteModel {

@@ -610,10 +610,18 @@ func partitionSiteModelsByRouteType(items []model.SiteModel, split bool, site *m
 		return map[model.SiteModelRouteType][]model.SiteModel{routeType: items}
 	}
 	buckets := make(map[model.SiteModelRouteType][]model.SiteModel)
+	fallbackRouteType := model.SiteModelRouteTypeFromOutboundType(platformOutboundType(site))
 	for _, item := range items {
 		routeType := model.NormalizeSiteModelRouteType(item.RouteType)
 		if !model.IsProjectedSiteModelRouteType(routeType) {
 			continue
+		}
+		// 探测没确认上游讲这套协议时，把模型收回兜底桶。独立成渠道只会得到一个打不通
+		// 的端点 —— hub.linux.do 的 95 个 gemini 模型就是这么挂上去的：站点只探到
+		// openai_chat + anthropic，Gemini 渠道却拿着 /v1 的 base 去打 :generateContent。
+		// 走兜底协议让网关转换反而能用。手动指定的尊重用户判断，不动。
+		if !item.ManualOverride && !site.SupportsRouteType(routeType) {
+			routeType = fallbackRouteType
 		}
 		buckets[routeType] = append(buckets[routeType], item)
 	}
@@ -839,22 +847,26 @@ func shouldSplitForAccount(account *model.SiteAccount, site *model.Site) bool {
 		return true
 	}
 
-	// 优先级 3: 检测手动覆盖是否与平台默认类型不同
-	// 只要有任何手动覆盖与默认不同，或有多种手动覆盖类型，就启用拆分
+	// 优先级 3: 模型的端点格式和站点兜底协议不一致时拆分。
+	//
+	// 手动打勾的一律算数（用户明确表达了意图）。自动推断出来的要多一道门槛：只有
+	// 探测确认上游真的支持那个协议才算 —— 否则一个模型名叫 claude-* 但上游只讲
+	// OpenAI 的站点，会被拆出一个打不通的 Anthropic 渠道。反过来，多协议中转站的
+	// claude 模型就该走原生 /v1/messages，不该让网关白转一遍。
 	siteDefaultRoute := model.SiteModelRouteTypeFromOutboundType(platformOutboundType(site))
 	routeTypes := make(map[model.SiteModelRouteType]struct{})
 	for _, m := range account.Models {
 		if m.Disabled {
 			continue // 跳过禁用的模型
 		}
-		if !m.ManualOverride {
-			continue // 跳过自动推断的模型
-		}
 		rt := model.NormalizeSiteModelRouteType(m.RouteType)
 		if !model.IsProjectedSiteModelRouteType(rt) {
 			continue // 跳过非投影类型
 		}
-		// 如果手动覆盖与平台默认不同，需要拆分
+		if !m.ManualOverride && !site.SupportsRouteType(rt) {
+			continue // 自动推断的协议未被探测确认，不据此拆分
+		}
+		// 与站点兜底协议不同，需要拆分
 		if rt != siteDefaultRoute {
 			return true
 		}
@@ -864,6 +876,5 @@ func shouldSplitForAccount(account *model.SiteAccount, site *model.Site) bool {
 		}
 	}
 
-	// 所有手动覆盖都与平台默认相同，不需要拆分
 	return false
 }
