@@ -197,6 +197,45 @@ func TestNormalizeModelNamesPreservesCaseDistinctVariants(t *testing.T) {
 	}
 }
 
+func TestNormalizeModelNamesDropsOverlongNames(t *testing.T) {
+	// 模拟 hub.linux.do 返回的畸形"模型名"：3200 字符，内容是几十个真模型名用空格拼接
+	overlong := make([]byte, 0, 2100)
+	for len(overlong) < 2000 {
+		overlong = append(overlong, "abcdefghij "...)
+	}
+
+	models := normalizeModelNames([]string{
+		"gpt-5.6-sol",
+		"claude 4.5", // 合法的带空格模型名，必须保留
+		string(overlong),
+		"deepseek-v4-pro",
+	})
+
+	// 3 个合法 + 1 个超长 → 结果应该是 3 个
+	if len(models) != 3 {
+		t.Fatalf("expected 3 models (1 overlong dropped), got %d: %v", len(models), models)
+	}
+
+	// 所有保留的模型名都不能超过列宽
+	for _, m := range models {
+		if len(m) > maxSiteModelNameLength {
+			t.Fatalf("overlong name survived: %d chars", len(m))
+		}
+	}
+
+	// "claude 4.5" 必须在结果里（验证不是按空格判断）
+	found := false
+	for _, m := range models {
+		if m == "claude 4.5" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("legitimate name with space must survive")
+	}
+}
+
 func TestParseGroupItemsPreservesScalarMapLabels(t *testing.T) {
 	groups := parseGroupItems(map[string]any{
 		"data": map[string]any{

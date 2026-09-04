@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/bestruirui/octopus/internal/client"
 	"github.com/bestruirui/octopus/internal/model"
@@ -485,12 +486,25 @@ func normalizeItemSlice(value any) []map[string]any {
 	}
 }
 
+// maxSiteModelNameLength 对齐 SiteModel.ModelName 的列宽（varchar(191)）。
+//
+// 上游偶尔会把一整串模型名塞进一个字段：实测 hub.linux.do 返回过一个 3200 字符的
+// "模型名"，内容是几十个真模型名用空格拼起来的。SQLite 不限列宽，这种值在本地能
+// 存下去；PostgreSQL 会直接抛 22001 (value too long for varchar(191))，让整次同步
+// 失败并返回 500 —— 于是同一份配置本地跑得通、容器里报"服务内部错误"。
+//
+// 只按长度判，不按空格判：有站点真的用带空格的模型名（hub 上就有 "claude 4.5"）。
+const maxSiteModelNameLength = 191
+
 func normalizeModelNames(names []string) []string {
 	seen := make(map[string]struct{}, len(names))
 	result := make([]string, 0, len(names))
 	for _, name := range names {
 		trimmed := strings.TrimSpace(name)
 		if trimmed == "" {
+			continue
+		}
+		if utf8.RuneCountInString(trimmed) > maxSiteModelNameLength {
 			continue
 		}
 		if _, ok := seen[trimmed]; ok {

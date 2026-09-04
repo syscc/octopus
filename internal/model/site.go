@@ -338,7 +338,7 @@ type SiteModel struct {
 	RouteType       SiteModelRouteType   `json:"route_type" gorm:"type:varchar(32);not null;default:'openai_chat';index"`
 	RouteSource     SiteModelRouteSource `json:"route_source" gorm:"type:varchar(32);not null;default:'sync_inferred'"`
 	ManualOverride  bool                 `json:"manual_override" gorm:"default:false"`
-	RouteRawPayload string               `json:"route_raw_payload"`
+	RouteRawPayload string               `json:"route_raw_payload" gorm:"type:text"`
 	RouteUpdatedAt  *time.Time           `json:"route_updated_at"`
 	Disabled        bool                 `json:"disabled" gorm:"default:false;index"`
 	// DisableProtocolFallback 关闭 OpenAI 两个文本协议之间的自动降级。
