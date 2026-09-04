@@ -2,8 +2,13 @@ package relay
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
+
+	model "github.com/bestruirui/octopus/internal/transformer/model"
 )
 
 func TestObserveWSPassthroughEventParsesErrorEnvelope(t *testing.T) {
@@ -45,5 +50,62 @@ func TestNormalizeWSUpstreamErrorCode(t *testing.T) {
 	}
 	if got := normalizeWSUpstreamErrorCode(payload.Code); got != "429" {
 		t.Fatalf("expected numeric code to normalize to 429, got %q", got)
+	}
+}
+
+func TestNormalizeWSUpstreamErrorCodeRejectsStructuredValues(t *testing.T) {
+	if got := normalizeWSUpstreamErrorCode(map[string]any{"secret": "value"}); got != "" {
+		t.Fatalf("object code must be rejected, got %q", got)
+	}
+	if got := normalizeWSUpstreamErrorCode([]any{"secret"}); got != "" {
+		t.Fatalf("array code must be rejected, got %q", got)
+	}
+}
+
+func TestWrappedWSUpstreamErrorPreservesClientStatus(t *testing.T) {
+	upstreamErr := &wsUpstreamEventError{
+		Status:  http.StatusForbidden,
+		Code:    "model_not_allowed",
+		Type:    "permission_error",
+		Message: "model access forbidden",
+	}
+	wrapped := fmt.Errorf("channel failed: %w", upstreamErr)
+
+	var recovered *wsUpstreamEventError
+	if !errors.As(wrapped, &recovered) || recovered != upstreamErr {
+		t.Fatalf("wrapped error lost its structured cause: %v", wrapped)
+	}
+	if got := wsUpstreamErrorStatus(wrapped); got != http.StatusForbidden {
+		t.Fatalf("structured 403 was rewritten to %d", got)
+	}
+	publicErr, ok := classifyWSPublicError(wrapped, http.StatusBadGateway)
+	if !ok || publicErr.Status != http.StatusForbidden {
+		t.Fatalf("expected public 403 classification, got %#v ok=%t", publicErr, ok)
+	}
+}
+
+func TestBuildWSPassthroughFailureTerminalSanitizesProviderFields(t *testing.T) {
+	ra := &relayAttempt{relayRequest: &relayRequest{requestModel: "model-test", internalRequest: &model.InternalLLMRequest{Model: "model-test"}}}
+	stats := &wsPassthroughStats{
+		ResponseID: "response-test",
+		Model:      "model-test",
+		Error: &wsUpstreamEventError{
+			Code:    "provider-secret-code",
+			Type:    "provider-secret-type",
+			Message: "provider-secret-message",
+		},
+	}
+	body, err := ra.buildWSPassthroughFailureTerminal(stats)
+	if err != nil {
+		t.Fatalf("build synthetic terminal: %v", err)
+	}
+	text := string(body)
+	for _, forbidden := range []string{"provider-secret-code", "provider-secret-type", "provider-secret-message"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("synthetic terminal leaked provider field %q: %s", forbidden, text)
+		}
+	}
+	if !strings.Contains(text, `"code":"upstream_error"`) || !strings.Contains(text, "The upstream request failed.") {
+		t.Fatalf("synthetic terminal did not use fixed public wording: %s", text)
 	}
 }

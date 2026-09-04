@@ -66,3 +66,42 @@ func TestTransformStreamEventsToolCallStreamProducesChunk(t *testing.T) {
 		t.Fatalf("expected chunk with choice 0 carrying the tool call, got %q", chunk)
 	}
 }
+
+func TestChatInboundErrorWinsOverDoneInOneResponse(t *testing.T) {
+	inbound := &ChatInbound{}
+	output, err := inbound.TransformStream(context.Background(), &model.InternalLLMResponse{
+		Object: "[DONE]",
+		Error:  &model.ResponseError{Detail: model.ErrorDetail{Code: "upstream_failed", Message: "failed"}},
+	})
+	if err != nil {
+		t.Fatalf("TransformStream returned error: %v", err)
+	}
+	if strings.Contains(string(output), "[DONE]") {
+		t.Fatalf("error response must not be replaced by [DONE]: %q", output)
+	}
+	outcome, cause := inbound.StreamTerminalOutcome()
+	if outcome != model.PassthroughTerminalOutcomeFailed || cause == nil {
+		t.Fatalf("expected failed terminal outcome, got outcome=%q cause=%v", outcome, cause)
+	}
+}
+
+func TestChatInboundDropsEventsAfterDoneWhenErrorAlsoPresent(t *testing.T) {
+	inbound := &ChatInbound{}
+	output, err := inbound.TransformStreamEvents(context.Background(), []model.StreamEvent{
+		{Kind: model.StreamEventKindTextDelta, Delta: &model.StreamDelta{Text: "prefix"}},
+		{Kind: model.StreamEventKindDone},
+		{Kind: model.StreamEventKindTextDelta, Delta: &model.StreamDelta{Text: "must-drop"}},
+		{Kind: model.StreamEventKindError, Error: &model.ResponseError{Detail: model.ErrorDetail{Code: "failed", Message: "boom"}}},
+	})
+	if err == nil {
+		t.Fatal("expected semantic error from mixed batch")
+	}
+	text := string(output)
+	if !strings.Contains(text, "prefix") || strings.Contains(text, "must-drop") || strings.Contains(text, "data: [DONE]") {
+		t.Fatalf("unexpected mixed-batch output: %q", text)
+	}
+	outcome, _ := inbound.StreamTerminalOutcome()
+	if outcome != model.PassthroughTerminalOutcomeFailed {
+		t.Fatalf("expected failed outcome, got %q", outcome)
+	}
+}

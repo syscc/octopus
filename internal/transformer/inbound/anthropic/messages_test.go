@@ -458,6 +458,35 @@ func TestTransformStreamEventsDirectErrorAndDone(t *testing.T) {
 	}
 }
 
+func TestTransformStreamEventsErrorWinsOverEarlierDone(t *testing.T) {
+	inbound := &MessagesInbound{}
+	out, err := inbound.TransformStreamEvents(context.Background(), []model.StreamEvent{
+		{Kind: model.StreamEventKindMessageStart, ID: "msg-mixed", Model: "claude-test"},
+		{Kind: model.StreamEventKindTextDelta, Delta: &model.StreamDelta{Text: "prefix"}},
+		{Kind: model.StreamEventKindMessageStop, StopReason: model.FinishReasonStop},
+		{Kind: model.StreamEventKindDone},
+		{Kind: model.StreamEventKindTextDelta, Delta: &model.StreamDelta{Text: "must-drop"}},
+		{Kind: model.StreamEventKindError, Error: &model.ResponseError{Detail: model.ErrorDetail{Message: "boom"}}},
+	})
+	if err != nil {
+		t.Fatalf("TransformStreamEvents() error = %v", err)
+	}
+	text := string(out)
+	if !strings.Contains(text, "event:error") || !strings.Contains(text, "boom") {
+		t.Fatalf("expected error SSE, got %s", text)
+	}
+	if strings.Contains(text, "must-drop") {
+		t.Fatalf("post-terminal delta leaked into output: %s", text)
+	}
+	if strings.Contains(text, "event:message_stop") {
+		t.Fatalf("error-plus-Done must not append a success terminal: %s", text)
+	}
+	outcome, _ := inbound.StreamTerminalOutcome()
+	if outcome != model.PassthroughTerminalOutcomeFailed {
+		t.Fatalf("expected failed terminal outcome, got %q", outcome)
+	}
+}
+
 func stringPtr(v string) *string {
 	return &v
 }
@@ -507,6 +536,63 @@ func TestTransformStreamErrorDefaultsTypeWhenEmpty(t *testing.T) {
 	}
 	if !strings.Contains(string(out), `"type":"api_error"`) {
 		t.Fatalf("expected fallback type=api_error, got %q", string(out))
+	}
+}
+
+func TestFinalizeIncompleteAnthropicStreamEmitsSingleTerminal(t *testing.T) {
+	inbound := &MessagesInbound{
+		hasStarted:            true,
+		messageID:             "msg_partial",
+		modelName:             "claude-test",
+		hasTextContentStarted: true,
+		contentIndex:          2,
+	}
+
+	output, err := inbound.FinalizeIncompleteStream(context.Background(), []byte("partial raw stream"))
+	if err != model.ErrIncompleteUpstreamStream {
+		t.Fatalf("expected ErrIncompleteUpstreamStream, got %v", err)
+	}
+	text := string(output)
+	if strings.Count(text, "event:content_block_stop") != 1 || strings.Count(text, "event:message_stop") != 1 {
+		t.Fatalf("expected one content close and one message terminal, got %q", text)
+	}
+	if strings.Contains(text, `"stop_reason"`) || strings.Contains(text, "event:error") {
+		t.Fatalf("incomplete terminal must not fabricate a stop reason or generic error, got %q", text)
+	}
+
+	again, err := inbound.FinalizeIncompleteStream(context.Background(), []byte("ignored"))
+	if err != nil || len(again) != 0 {
+		t.Fatalf("incomplete finalization must be idempotent, got %q err=%v", again, err)
+	}
+}
+
+func TestFinalizeInterruptedAnthropicStreamEmitsIncompleteTerminal(t *testing.T) {
+	inbound := &MessagesInbound{hasStarted: true, messageID: "msg_interrupted", modelName: "claude-test"}
+	output, err := inbound.FinalizeInterruptedStream(context.Background())
+	if err != model.ErrIncompleteUpstreamStream {
+		t.Fatalf("expected ErrIncompleteUpstreamStream, got %v", err)
+	}
+	if !strings.Contains(string(output), "event:message_stop") {
+		t.Fatalf("expected message_stop for interrupted transform stream, got %q", output)
+	}
+}
+
+func TestFinalizeStreamAnthropicEmitsIncompleteAtCleanEOF(t *testing.T) {
+	inbound := &MessagesInbound{hasStarted: true, messageID: "msg_clean_eof", modelName: "claude-test", hasTextContentStarted: true}
+	output, err := inbound.FinalizeStream(context.Background())
+	if err != model.ErrIncompleteUpstreamStream {
+		t.Fatalf("expected ErrIncompleteUpstreamStream, got %v", err)
+	}
+	text := string(output)
+	if strings.Count(text, "event:message_stop") != 1 || strings.Count(text, "event:content_block_stop") != 1 {
+		t.Fatalf("expected one incomplete terminal, got %q", text)
+	}
+	if strings.Contains(text, `"stop_reason"`) || strings.Contains(text, `"usage"`) {
+		t.Fatalf("clean EOF must not fabricate stop reason or usage, got %q", text)
+	}
+	again, err := inbound.FinalizeStream(context.Background())
+	if err != nil || len(again) != 0 {
+		t.Fatalf("clean EOF finalization must be idempotent, got %q err=%v", again, err)
 	}
 }
 

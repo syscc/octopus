@@ -84,6 +84,6 @@ func DetectPlatform(ctx context.Context, rawURL string) (model.SitePlatform, mod
 	return sitesync.DetectPlatform(ctx, rawURL)
 }
 
-func CreateAccountToken(ctx context.Context, accountID int, req model.SiteChannelKeyCreateRequest) (*model.SiteSyncResult, error) {
-	return sitesync.CreateAccountToken(ctx, accountID, req)
+func CreateAccountToken(ctx context.Context, siteID int, accountID int, req model.SiteChannelKeyCreateRequest) (*model.SiteSyncResult, error) {
+	return sitesync.CreateAccountToken(ctx, siteID, accountID, req)
 }

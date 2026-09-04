@@ -176,6 +176,13 @@ func TestShouldSplitForAccount(t *testing.T) {
 			reason:   "nil site 安全返回 false",
 		},
 		{
+			name:     "cloudflare never splits into unsupported protocols",
+			site:     &model.Site{Platform: model.SitePlatformCloudflare, RouteBaseURLs: []model.SiteRouteBaseURL{{RouteType: model.SiteModelRouteTypeAnthropic, BaseURL: "https://example.com/messages"}}},
+			account:  &model.SiteAccount{Models: []model.SiteModel{{ModelName: "@cf/meta/llama", RouteType: model.SiteModelRouteTypeAnthropic, ManualOverride: true}}},
+			expected: false,
+			reason:   "Cloudflare Workers AI only exposes OpenAI-compatible routes",
+		},
+		{
 			name:     "nil account returns false",
 			site:     &model.Site{Platform: model.SitePlatformAPI},
 			account:  nil,

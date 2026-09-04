@@ -103,6 +103,48 @@ func TestBestEffortWarmupUpstreamWSPrimesPoolAndSticky(t *testing.T) {
 	wsUpstreamPool.Remove(pc.poolKey)
 }
 
+func TestBestEffortWarmupUpstreamWSSkipsKnownResponsesUnsupported(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+	resetWSUpstreamPool()
+	t.Cleanup(resetWSUpstreamPool)
+
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	channel := &model.Channel{
+		Name:               "relay-warmup-chat-only",
+		Type:               outbound.OutboundTypeOpenAIChat,
+		Enabled:            true,
+		BaseUrls:           []model.BaseUrl{{URL: server.URL + "/v1"}},
+		Model:              "warmup-model",
+		OpenAIProtocolMode: model.OpenAIProtocolModeChatOnly,
+		Keys:               []model.ChannelKey{{Enabled: true, ChannelKey: "warmup-key"}},
+	}
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("ChannelCreate failed: %v", err)
+	}
+	group := &model.Group{Name: "relay-warmup-chat-only-group", Mode: model.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("GroupCreate failed: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "warmup-model"}, ctx); err != nil {
+		t.Fatalf("GroupItemAdd failed: %v", err)
+	}
+
+	reqBody := map[string]json.RawMessage{"model": json.RawMessage(`"relay-warmup-chat-only-group"`)}
+	if err := bestEffortWarmupUpstreamWS(context.Background(), 322, "", reqBody); err == nil {
+		t.Fatal("expected no Responses-capable channel for warmup")
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("known Responses-unsupported channel must not be warmed, hits=%d", hits.Load())
+	}
+}
+
 func waitForWarmupAccepted(t *testing.T, accepted <-chan struct{}) {
 	t.Helper()
 	select {

@@ -15,6 +15,7 @@ import (
 	"github.com/bestruirui/octopus/internal/transformer/compat"
 	anthropicModel "github.com/bestruirui/octopus/internal/transformer/inbound/anthropic"
 	"github.com/bestruirui/octopus/internal/transformer/model"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/bestruirui/octopus/internal/utils/xurl"
 )
@@ -265,26 +266,25 @@ func (o *MessageOutbound) TransformResponse(ctx context.Context, response *http.
 		return nil, fmt.Errorf("response is nil")
 	}
 
-	body, err := io.ReadAll(response.Body)
+	body, err := httpbody.ReadResponse(response)
 	if err != nil {
+		if httpbody.IsErrorStatus(response.StatusCode) {
+			return nil, &model.ResponseError{StatusCode: response.StatusCode}
+		}
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	if len(body) == 0 {
-		return nil, fmt.Errorf("response body is empty")
-	}
-
 	// Check for error response
-	if response.StatusCode >= 400 {
+	if httpbody.IsErrorStatus(response.StatusCode) {
 		var errResp anthropicModel.AnthropicError
 		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error.Message != "" {
+			// Keep provider-controlled error text out of logs; the typed detail below is only for controlled protocol classification.
 			if strings.Contains(strings.ToLower(errResp.Error.Message), "signature") {
 				log.Warnw("transformer.reasoning.signature.passthrough",
 					"provider", "anthropic",
 					"direction", "error",
 					"status_code", response.StatusCode,
 					"error_type", errResp.Error.Type,
-					"error_message", truncateForAudit(errResp.Error.Message, 256),
 				)
 			}
 			return nil, &model.ResponseError{
@@ -295,7 +295,10 @@ func (o *MessageOutbound) TransformResponse(ctx context.Context, response *http.
 				},
 			}
 		}
-		return nil, fmt.Errorf("HTTP error %d: %s", response.StatusCode, string(body))
+		return nil, &model.ResponseError{StatusCode: response.StatusCode}
+	}
+	if len(body) == 0 {
+		return nil, fmt.Errorf("response body is empty")
 	}
 
 	var anthropicResp anthropicModel.Message
@@ -1265,16 +1268,6 @@ func logAnthropicSignatureAudit(direction string, blocks []model.ReasoningBlock)
 	)
 }
 
-// truncateForAudit keeps audit log fields bounded to avoid logging entire
-// multi-KB provider error payloads. Byte-level truncation is fine for
-// audit purposes.
-func truncateForAudit(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
-
 func emitThinkingBlocksLegacy(msg model.Message) []anthropicModel.MessageContentBlock {
 	var out []anthropicModel.MessageContentBlock
 	if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
@@ -2043,6 +2036,9 @@ func (o *MessageOutbound) PassthroughConfig() model.PassthroughConfig {
 		TerminalEvents: map[string]struct{}{
 			"message_stop": {},
 			"error":        {},
+		},
+		FailureEvents: map[string]struct{}{
+			"error": {},
 		},
 		CollectMetrics: true, // Anthropic requires full response aggregation for metrics
 	}

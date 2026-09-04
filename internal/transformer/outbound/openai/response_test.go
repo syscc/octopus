@@ -3,7 +3,10 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/bestruirui/octopus/internal/transformer/model"
@@ -548,11 +551,12 @@ func TestConvertToResponsesRequestPreservesImageGenerationTools(t *testing.T) {
 	}
 }
 
-func TestTransformRequestRawRewritesModel(t *testing.T) {
+func TestTransformRequestRawRewritesModelPreservingJSONBytes(t *testing.T) {
 	outbound := &ResponseOutbound{}
+	rawBody := []byte("{\n  \"model\" : \"old-model\", \"input\": 900719925474099312345, \"nested\": {\"model\": \"nested-model\"}, \"future\": true\n}")
 	req, err := outbound.TransformRequestRaw(
 		context.Background(),
-		[]byte(`{"model":"old-model","tools":[{"type":"apply_patch"}],"input":"hello"}`),
+		rawBody,
 		"new-model",
 		"https://example.com/v1",
 		"test-key",
@@ -566,21 +570,84 @@ func TestTransformRequestRawRewritesModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read request body failed: %v", err)
 	}
+	want := []byte("{\n  \"model\" : \"new-model\", \"input\": 900719925474099312345, \"nested\": {\"model\": \"nested-model\"}, \"future\": true\n}")
+	if string(body) != string(want) {
+		t.Fatalf("expected only top-level model bytes to change, got %q want %q", body, want)
+	}
+}
 
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		t.Fatalf("unmarshal request body failed: %v", err)
+func TestRewriteRawResponsesRequestModelEdgeCases(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr string
+	}{
+		{name: "insert missing model", raw: `{"input":900719925474099312345}`, want: `{"input":900719925474099312345,"model":"new-model"}`},
+		{name: "insert into empty object", raw: `{ }`, want: `{ "model":"new-model"}`},
+		{name: "replace duplicate models", raw: `{"model":"first","model":"second","input":"ok"}`, want: `{"model":"new-model","model":"new-model","input":"ok"}`},
+		{name: "reject non-string model", raw: `{"model":null}`, wantErr: "model must be a string"},
+		{name: "reject trailing comma", raw: `{"input":"ok",}`, wantErr: "trailing comma"},
+		{name: "reject trailing data", raw: `{"input":"ok"} true`, wantErr: "trailing JSON data"},
 	}
-	if payload["model"] != "new-model" {
-		t.Fatalf("expected model to be rewritten, got %#v", payload["model"])
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := rewriteRawResponsesRequestModel([]byte(tc.raw), "new-model")
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("rewrite failed: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("rewrite = %q, want %q", got, tc.want)
+			}
+		})
 	}
-	tools, ok := payload["tools"].([]any)
-	if !ok || len(tools) != 1 {
-		t.Fatalf("expected raw tools to stay intact, got %#v", payload["tools"])
+}
+
+func TestResponsesErrorCodeAcceptsStringAndNumber(t *testing.T) {
+	for _, raw := range []string{`"context_length_exceeded"`, `5035`} {
+		var code ResponsesErrorCode
+		if err := json.Unmarshal([]byte(raw), &code); err != nil {
+			t.Fatalf("unmarshal code %s failed: %v", raw, err)
+		}
+		want := strings.Trim(raw, `"`)
+		if string(code) != want {
+			t.Fatalf("unmarshal code %s = %q, want %q", raw, code, want)
+		}
 	}
-	tool, ok := tools[0].(map[string]any)
-	if !ok || tool["type"] != "apply_patch" {
-		t.Fatalf("expected raw apply_patch tool to be preserved, got %#v", tools[0])
+
+	var response ResponsesResponse
+	if err := json.Unmarshal([]byte(`{"status":"failed","error":{"code":"context_length_exceeded","message":"too long"}}`), &response); err != nil {
+		t.Fatalf("unmarshal string Responses error failed: %v", err)
+	}
+	if response.Error == nil || string(response.Error.Code) != "context_length_exceeded" {
+		t.Fatalf("expected string error code to survive, got %+v", response.Error)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal Responses error failed: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"code":"context_length_exceeded"`) {
+		t.Fatalf("expected string error code in output, got %s", encoded)
+	}
+}
+
+func TestTransformStreamFailedEventPreservesStringErrorCode(t *testing.T) {
+	outbound := &ResponseOutbound{}
+	resp, err := outbound.TransformStream(context.Background(), []byte(`{"type":"response.failed","response":{"status":"failed","error":{"code":"context_length_exceeded","message":"too long"}}}`))
+	if err != nil {
+		t.Fatalf("TransformStream failed: %v", err)
+	}
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("expected internal response error, got %+v", resp)
+	}
+	if resp.Error.Detail.Code != "context_length_exceeded" {
+		t.Fatalf("expected string error code, got %q", resp.Error.Detail.Code)
 	}
 }
 
@@ -603,7 +670,7 @@ func TestNormalizeResponsesFinishReason(t *testing.T) {
 	}{
 		{name: "completed", status: "completed", wantReason: "stop"},
 		{name: "incomplete", status: "incomplete", wantReason: "length"},
-		{name: "failed carries error cause", status: "failed", err: &ResponsesError{Code: 400, Message: "boom"}, wantReason: "stop", wantErrMsg: "boom"},
+		{name: "failed carries error cause", status: "failed", err: &ResponsesError{Code: "400", Message: "boom"}, wantReason: "stop", wantErrMsg: "boom"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -885,5 +952,26 @@ func TestTransformStreamPreservesReasoningDeltaBeforeOutputItemAdded(t *testing.
 	part := summary[0].(map[string]any)
 	if part["type"] != "summary_text" || part["text"] != "step" {
 		t.Fatalf("expected merged reasoning summary, got %#v", part)
+	}
+}
+
+func TestTransformResponseUnstructuredHTTPErrorDoesNotExposeBody(t *testing.T) {
+	const secret = "private-provider-body-should-not-leak"
+	outbound := &ResponseOutbound{}
+	response := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Body:       io.NopCloser(strings.NewReader(secret)),
+	}
+
+	_, err := outbound.TransformResponse(context.Background(), response)
+	if err == nil {
+		t.Fatal("expected upstream response error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("transformer error exposed upstream body: %q", err)
+	}
+	var responseErr *model.ResponseError
+	if !errors.As(err, &responseErr) || responseErr.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected safe ResponseError with status, got %T %v", err, err)
 	}
 }

@@ -2,6 +2,7 @@ package op
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/bestruirui/octopus/internal/db"
 	"github.com/bestruirui/octopus/internal/model"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func SiteList(ctx context.Context) ([]model.Site, error) {
@@ -103,6 +105,10 @@ func SiteCreate(site *model.Site, ctx context.Context) error {
 	if err := site.Validate(); err != nil {
 		return err
 	}
+	// Accounts nested in client payloads must never be cascade-inserted: they
+	// would bypass SiteAccountCreate's ownership, platform, credential and
+	// proxy validation. Accounts are only created through SiteAccountCreate.
+	site.Accounts = nil
 	if site.ProxyMode == model.ProxyUsageModePool && site.ProxyConfigID != nil {
 		if _, err := ProxyURLForConfig(*site.ProxyConfigID, ctx); err != nil {
 			return err
@@ -110,7 +116,7 @@ func SiteCreate(site *model.Site, ctx context.Context) error {
 	}
 	if site.EnabledSet && !site.Enabled {
 		err := db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Create(site).Error; err != nil {
+			if err := tx.Omit(clause.Associations).Create(site).Error; err != nil {
 				return err
 			}
 			return tx.Model(&model.Site{}).Where("id = ?", site.ID).Update("enabled", false).Error
@@ -118,22 +124,52 @@ func SiteCreate(site *model.Site, ctx context.Context) error {
 		site.Enabled = false
 		return err
 	}
-	return db.GetDB().WithContext(ctx).Create(site).Error
+	return db.GetDB().WithContext(ctx).Omit(clause.Associations).Create(site).Error
 }
 
-func SiteUpdate(req *model.SiteUpdateRequest, ctx context.Context) (*model.Site, error) {
-	if req == nil {
-		return nil, fmt.Errorf("site update request is nil")
+func appendUniqueString(items []string, value string) []string {
+	for _, item := range items {
+		if item == value {
+			return items
+		}
+	}
+	return append(items, value)
+}
+func lockSiteByID(tx *gorm.DB, siteID int) (*model.Site, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("database transaction is nil")
 	}
 	var site model.Site
-	if err := db.GetDB().WithContext(ctx).First(&site, req.ID).Error; err != nil {
-		return nil, fmt.Errorf("site not found")
+	result := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&site, siteID)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("site not found")
+		}
+		return nil, result.Error
 	}
+	return &site, nil
+}
 
+func validateProxyConfigurationTx(tx *gorm.DB, proxyMode model.ProxyUsageMode, proxyConfigID *int) error {
+	if proxyMode != model.ProxyUsageModePool || proxyConfigID == nil {
+		return nil
+	}
+	var config model.ProxyConfiguration
+	if err := tx.Select("id", "enabled").First(&config, *proxyConfigID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("proxy configuration not found")
+		}
+		return err
+	}
+	if !config.Enabled {
+		return fmt.Errorf("proxy configuration is disabled")
+	}
+	return nil
+}
+
+func mergeSiteUpdateRequest(site model.Site, req *model.SiteUpdateRequest) (model.Site, []string, error) {
 	merged := site
-	var selectFields []string
-	updates := model.Site{ID: req.ID}
-
+	selectFields := make([]string, 0, 16)
 	if req.Name != nil {
 		merged.Name = *req.Name
 		selectFields = append(selectFields, "name")
@@ -148,7 +184,7 @@ func SiteUpdate(req *model.SiteUpdateRequest, ctx context.Context) (*model.Site,
 	}
 	if req.DefaultRouteType != nil {
 		if !model.IsProjectedSiteModelRouteType(*req.DefaultRouteType) {
-			return nil, fmt.Errorf("invalid default route type")
+			return model.Site{}, nil, fmt.Errorf("invalid default route type")
 		}
 		merged.DefaultRouteType = *req.DefaultRouteType
 		selectFields = append(selectFields, "default_route_type")
@@ -197,66 +233,94 @@ func SiteUpdate(req *model.SiteUpdateRequest, ctx context.Context) (*model.Site,
 		merged.Tags = *req.Tags
 		selectFields = append(selectFields, "tags")
 	}
-	if len(selectFields) > 0 {
-		if err := merged.Validate(); err != nil {
-			return nil, err
+	if len(selectFields) == 0 {
+		return merged, nil, nil
+	}
+	if err := merged.Validate(); err != nil {
+		return model.Site{}, nil, err
+	}
+	if merged.Platform == model.SitePlatformCloudflare {
+		// Validate canonicalizes Cloudflare host/fixed path/default port in
+		// memory. Persist that value even when the request only switched the
+		// platform, otherwise the stored URL can remain a valid-but-broken
+		// mixed-case endpoint and bypass canonical deduplication.
+		selectFields = appendUniqueString(selectFields, "base_url")
+		selectFields = appendUniqueString(selectFields, "default_route_type")
+		selectFields = appendUniqueString(selectFields, "external_checkin_url")
+		selectFields = appendUniqueString(selectFields, "route_base_urls")
+	}
+	return merged, selectFields, nil
+}
+
+func SiteUpdate(req *model.SiteUpdateRequest, ctx context.Context) (*model.Site, error) {
+	if req == nil {
+		return nil, fmt.Errorf("site update request is nil")
+	}
+
+	err := db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		current, err := lockSiteByID(tx, req.ID)
+		if err != nil {
+			return err
 		}
-		if merged.ProxyMode == model.ProxyUsageModePool && merged.ProxyConfigID != nil {
-			if _, err := ProxyURLForConfig(*merged.ProxyConfigID, ctx); err != nil {
-				return nil, err
+		merged, selectFields, err := mergeSiteUpdateRequest(*current, req)
+		if err != nil {
+			return err
+		}
+		if len(selectFields) == 0 {
+			return nil
+		}
+		if err := validateProxyConfigurationTx(tx, merged.ProxyMode, merged.ProxyConfigID); err != nil {
+			return err
+		}
+
+		switchingToCloudflare := current.Platform != model.SitePlatformCloudflare && merged.Platform == model.SitePlatformCloudflare
+		if switchingToCloudflare {
+			var incompatibleAccounts int64
+			if err := tx.Model(&model.SiteAccount{}).
+				Where("site_id = ?", req.ID).
+				Where("credential_type NOT IN ?", []model.SiteCredentialType{model.SiteCredentialTypeAccessToken, model.SiteCredentialTypeAPIKey}).
+				Count(&incompatibleAccounts).Error; err != nil {
+				return fmt.Errorf("failed to validate cloudflare account migration: %w", err)
+			}
+			if incompatibleAccounts > 0 {
+				return fmt.Errorf("cannot switch site to cloudflare workers ai while username/password accounts exist; migrate them to access token or api key first")
 			}
 		}
-	}
-	if req.Name != nil {
-		updates.Name = merged.Name
-	}
-	if req.Platform != nil {
-		updates.Platform = merged.Platform
-	}
-	if req.BaseURL != nil {
-		updates.BaseURL = merged.BaseURL
-	}
-	if req.DefaultRouteType != nil {
-		updates.DefaultRouteType = merged.DefaultRouteType
-	}
-	if req.Enabled != nil {
-		updates.Enabled = merged.Enabled
-	}
-	if req.ProxyMode != nil {
-		updates.ProxyMode = merged.ProxyMode
-	}
-	if req.ProxyConfigIDSet || (req.ProxyMode != nil && *req.ProxyMode != model.ProxyUsageModePool) {
-		updates.ProxyConfigID = merged.ProxyConfigID
-	}
-	if req.ExternalCheckinSet {
-		updates.ExternalCheckinURL = merged.ExternalCheckinURL
-	}
-	if req.IsPinned != nil {
-		updates.IsPinned = merged.IsPinned
-	}
-	if req.SortOrder != nil {
-		updates.SortOrder = merged.SortOrder
-	}
-	if req.GlobalWeight != nil {
-		updates.GlobalWeight = merged.GlobalWeight
-	}
-	if req.CustomHeader != nil {
-		updates.CustomHeader = merged.CustomHeader
-	}
-	if req.RouteBaseURLs != nil {
-		updates.RouteBaseURLs = merged.RouteBaseURLs
-	}
-	if req.Tags != nil {
-		updates.Tags = merged.Tags
-	}
-	if len(selectFields) > 0 {
-		if err := db.GetDB().WithContext(ctx).
-			Model(&model.Site{}).
+
+		if err := tx.Model(&model.Site{}).
 			Where("id = ?", req.ID).
 			Select(selectFields).
-			Updates(&updates).Error; err != nil {
-			return nil, fmt.Errorf("failed to update site: %w", err)
+			Updates(&merged).Error; err != nil {
+			return fmt.Errorf("failed to update site: %w", err)
 		}
+		if !switchingToCloudflare {
+			return nil
+		}
+		if err := tx.Model(&model.SiteAccount{}).
+			Where("site_id = ?", req.ID).
+			Updates(map[string]any{
+				"auto_checkin":         false,
+				"random_checkin":       false,
+				"next_auto_checkin_at": nil,
+			}).Error; err != nil {
+			return fmt.Errorf("failed to normalize cloudflare accounts: %w", err)
+		}
+		accountIDs := tx.Model(&model.SiteAccount{}).Select("id").Where("site_id = ?", req.ID)
+		if err := tx.Model(&model.SiteModel{}).
+			Where("site_account_id IN (?)", accountIDs).
+			Updates(map[string]any{
+				"route_type":        model.SiteModelRouteTypeOpenAIChat,
+				"route_source":      model.SiteModelRouteSourceSyncInferred,
+				"manual_override":   false,
+				"route_raw_payload": "",
+				"route_updated_at":  time.Now(),
+			}).Error; err != nil {
+			return fmt.Errorf("failed to normalize cloudflare model routes: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return SiteGet(req.ID, ctx)
 }
@@ -502,19 +566,44 @@ func SiteAccountGet(id int, ctx context.Context) (*model.SiteAccount, error) {
 	return &account, nil
 }
 
+func normalizeSiteAccountForPlatform(account *model.SiteAccount, platform model.SitePlatform) error {
+	if account == nil || platform != model.SitePlatformCloudflare {
+		return nil
+	}
+	switch account.CredentialType {
+	case model.SiteCredentialTypeAccessToken, model.SiteCredentialTypeAPIKey:
+	default:
+		return fmt.Errorf("cloudflare workers ai only supports access token or api key credentials")
+	}
+	account.AutoCheckin = false
+	account.RandomCheckin = false
+	account.NextAutoCheckinAt = nil
+	return nil
+}
+
 func SiteAccountCreate(account *model.SiteAccount, ctx context.Context) error {
 	if account == nil {
 		return fmt.Errorf("site account is nil")
 	}
-	if err := account.Validate(); err != nil {
-		return err
-	}
-	if account.ProxyMode == model.ProxyUsageModePool && account.ProxyConfigID != nil {
-		if _, err := ProxyURLForConfig(*account.ProxyConfigID, ctx); err != nil {
+
+	return db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		site, err := lockSiteByID(tx, account.SiteID)
+		if err != nil {
 			return err
 		}
-	}
-	if (account.EnabledSet && !account.Enabled) || (account.AutoSyncSet && !account.AutoSync) || (account.AutoCheckinSet && !account.AutoCheckin) {
+		if err := normalizeSiteAccountForPlatform(account, site.Platform); err != nil {
+			return err
+		}
+		if site.Platform == model.SitePlatformCloudflare {
+			account.AutoCheckinSet = true
+		}
+		if err := account.Validate(); err != nil {
+			return err
+		}
+		if err := validateProxyConfigurationTx(tx, account.ProxyMode, account.ProxyConfigID); err != nil {
+			return err
+		}
+
 		explicitEnabled := account.Enabled
 		explicitAutoSync := account.AutoSync
 		explicitAutoCheckin := account.AutoCheckin
@@ -528,12 +617,21 @@ func SiteAccountCreate(account *model.SiteAccount, ctx context.Context) error {
 		if account.AutoCheckinSet && !account.AutoCheckin {
 			updates["auto_checkin"] = false
 		}
-		err := db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Create(account).Error; err != nil {
+		// Tokens/groups/models/bindings nested in client payloads must never be
+		// cascade-inserted: they bypass ownership, platform and route validation.
+		// Children are only created through their dedicated op APIs.
+		account.Tokens = nil
+		account.UserGroups = nil
+		account.Models = nil
+		account.ChannelBindings = nil
+		if err := tx.Omit(clause.Associations).Create(account).Error; err != nil {
+			return err
+		}
+		if len(updates) > 0 {
+			if err := tx.Model(&model.SiteAccount{}).Where("id = ?", account.ID).Updates(updates).Error; err != nil {
 				return err
 			}
-			return tx.Model(&model.SiteAccount{}).Where("id = ?", account.ID).Updates(updates).Error
-		})
+		}
 		if account.EnabledSet {
 			account.Enabled = explicitEnabled
 		}
@@ -543,25 +641,13 @@ func SiteAccountCreate(account *model.SiteAccount, ctx context.Context) error {
 		if account.AutoCheckinSet {
 			account.AutoCheckin = explicitAutoCheckin
 		}
-		return err
-	}
-	return db.GetDB().WithContext(ctx).Create(account).Error
+		return nil
+	})
 }
 
-func SiteAccountUpdate(req *model.SiteAccountUpdateRequest, ctx context.Context) (*model.SiteAccount, error) {
-	if req == nil {
-		return nil, fmt.Errorf("site account update request is nil")
-	}
-
-	var account model.SiteAccount
-	if err := db.GetDB().WithContext(ctx).First(&account, req.ID).Error; err != nil {
-		return nil, fmt.Errorf("site account not found")
-	}
-
+func mergeSiteAccountUpdateRequest(account model.SiteAccount, req *model.SiteAccountUpdateRequest) (model.SiteAccount, []string) {
 	merged := account
-	var selectFields []string
-	updates := model.SiteAccount{ID: req.ID}
-
+	selectFields := make([]string, 0, 16)
 	if req.Name != nil {
 		merged.Name = *req.Name
 		selectFields = append(selectFields, "name")
@@ -634,77 +720,74 @@ func SiteAccountUpdate(req *model.SiteAccountUpdateRequest, ctx context.Context)
 		merged.CheckinRandomWindowMinutes = *req.CheckinRandomWindowMinutes
 		selectFields = append(selectFields, "checkin_random_window_minutes")
 	}
+	return merged, selectFields
+}
 
-	if len(selectFields) > 0 {
-		if err := merged.Validate(); err != nil {
-			return nil, err
+func SiteAccountUpdate(req *model.SiteAccountUpdateRequest, ctx context.Context) (*model.SiteAccount, error) {
+	if req == nil {
+		return nil, fmt.Errorf("site account update request is nil")
+	}
+
+	err := db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var accountRef struct {
+			SiteID int
 		}
-		if merged.ProxyMode == model.ProxyUsageModePool && merged.ProxyConfigID != nil {
-			if _, err := ProxyURLForConfig(*merged.ProxyConfigID, ctx); err != nil {
-				return nil, err
+		result := tx.Model(&model.SiteAccount{}).Select("site_id").Where("id = ?", req.ID).Take(&accountRef)
+		if result.Error != nil {
+			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("site account not found")
+			}
+			return result.Error
+		}
+		site, err := lockSiteByID(tx, accountRef.SiteID)
+		if err != nil {
+			return err
+		}
+		var account model.SiteAccount
+		result = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND site_id = ?", req.ID, site.ID).
+			First(&account)
+		if result.Error != nil {
+			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("site account not found")
+			}
+			return result.Error
+		}
+
+		merged, selectFields := mergeSiteAccountUpdateRequest(account, req)
+		if err := normalizeSiteAccountForPlatform(&merged, site.Platform); err != nil {
+			return err
+		}
+		if site.Platform == model.SitePlatformCloudflare {
+			if req.AutoCheckin != nil || account.AutoCheckin {
+				selectFields = appendUniqueString(selectFields, "auto_checkin")
+			}
+			if req.RandomCheckin != nil || account.RandomCheckin {
+				selectFields = appendUniqueString(selectFields, "random_checkin")
+			}
+			if account.NextAutoCheckinAt != nil {
+				selectFields = appendUniqueString(selectFields, "next_auto_checkin_at")
 			}
 		}
-	}
-	if req.Name != nil {
-		updates.Name = merged.Name
-	}
-	if req.CredentialType != nil {
-		updates.CredentialType = merged.CredentialType
-	}
-	if req.Username != nil {
-		updates.Username = merged.Username
-	}
-	if req.Password != nil {
-		updates.Password = merged.Password
-	}
-	if req.AccessToken != nil {
-		updates.AccessToken = merged.AccessToken
-	}
-	if req.APIKey != nil {
-		updates.APIKey = merged.APIKey
-	}
-	if req.RefreshToken != nil {
-		updates.RefreshToken = merged.RefreshToken
-	}
-	if req.TokenExpiresAt != nil {
-		updates.TokenExpiresAt = merged.TokenExpiresAt
-	}
-	if req.PlatformUserIDSet {
-		updates.PlatformUserID = merged.PlatformUserID
-	}
-	if req.ProxyMode != nil {
-		updates.ProxyMode = merged.ProxyMode
-	}
-	if req.ProxyConfigIDSet || (req.ProxyMode != nil && *req.ProxyMode != model.ProxyUsageModePool) {
-		updates.ProxyConfigID = merged.ProxyConfigID
-	}
-	if req.Enabled != nil {
-		updates.Enabled = merged.Enabled
-	}
-	if req.AutoSync != nil {
-		updates.AutoSync = merged.AutoSync
-	}
-	if req.AutoCheckin != nil {
-		updates.AutoCheckin = merged.AutoCheckin
-	}
-	if req.RandomCheckin != nil {
-		updates.RandomCheckin = merged.RandomCheckin
-	}
-	if req.CheckinIntervalHours != nil {
-		updates.CheckinIntervalHours = merged.CheckinIntervalHours
-	}
-	if req.CheckinRandomWindowMinutes != nil {
-		updates.CheckinRandomWindowMinutes = merged.CheckinRandomWindowMinutes
-	}
-
-	if len(selectFields) > 0 {
-		if err := db.GetDB().WithContext(ctx).
-			Model(&model.SiteAccount{}).
-			Where("id = ?", req.ID).
-			Select(selectFields).
-			Updates(&updates).Error; err != nil {
-			return nil, fmt.Errorf("failed to update site account: %w", err)
+		if len(selectFields) == 0 {
+			return nil
 		}
+		if err := merged.Validate(); err != nil {
+			return err
+		}
+		if err := validateProxyConfigurationTx(tx, merged.ProxyMode, merged.ProxyConfigID); err != nil {
+			return err
+		}
+		if err := tx.Model(&model.SiteAccount{}).
+			Where("id = ? AND site_id = ?", req.ID, site.ID).
+			Select(selectFields).
+			Updates(&merged).Error; err != nil {
+			return fmt.Errorf("failed to update site account: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return SiteAccountGet(req.ID, ctx)
 }
@@ -782,43 +865,239 @@ func SiteAvailableModels(siteID int, ctx context.Context) ([]string, error) {
 	return models, nil
 }
 
-func SiteModelRouteUpdate(accountID int, groupKey string, modelName string, routeType model.SiteModelRouteType, source model.SiteModelRouteSource, manualOverride bool, routeRawPayload string, ctx context.Context) error {
-	now := time.Now()
-	updates := map[string]any{
-		"route_type":        model.NormalizeSiteModelRouteType(routeType),
-		"route_source":      model.NormalizeSiteModelRouteSource(source, manualOverride),
-		"manual_override":   manualOverride,
-		"route_raw_payload": strings.TrimSpace(routeRawPayload),
-		"route_updated_at":  &now,
+func validateSiteModelRouteForPlatform(platform model.SitePlatform, routeType model.SiteModelRouteType) (model.SiteModelRouteType, error) {
+	if platform != model.SitePlatformCloudflare {
+		return model.NormalizeSiteModelRouteType(routeType), nil
 	}
-	return db.GetDB().WithContext(ctx).
-		Model(&model.SiteModel{}).
-		Where("site_account_id = ? AND group_key = ? AND model_name = ?", accountID, model.NormalizeSiteGroupKey(groupKey), strings.TrimSpace(modelName)).
-		Updates(updates).Error
+	trimmed := model.SiteModelRouteType(strings.TrimSpace(string(routeType)))
+	if trimmed != model.SiteModelRouteTypeOpenAIChat {
+		return "", fmt.Errorf("unsupported route type: cloudflare workers ai only supports the openai chat route")
+	}
+	return trimmed, nil
+}
+
+func lockSiteAndAccount(tx *gorm.DB, siteID int, accountID int) (*model.Site, error) {
+	site, err := lockSiteByID(tx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	var account model.SiteAccount
+	result := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id", "site_id").
+		Where("id = ? AND site_id = ?", accountID, siteID).
+		Take(&account)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, newSiteChannelAccountNotFoundError()
+		}
+		return nil, result.Error
+	}
+	return site, nil
+}
+
+func lockSiteForAccount(tx *gorm.DB, accountID int) (*model.Site, error) {
+	var accountRef struct {
+		SiteID int
+	}
+	result := tx.Model(&model.SiteAccount{}).Select("site_id").Where("id = ?", accountID).Take(&accountRef)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("site account not found")
+		}
+		return nil, result.Error
+	}
+	return lockSiteAndAccount(tx, accountRef.SiteID, accountID)
+}
+
+func normalizeSiteModelRouteUpdateForPlatform(platform model.SitePlatform, routeType model.SiteModelRouteType, routeRawPayload string) (model.SiteModelRouteType, string, error) {
+	normalizedRouteType, err := validateSiteModelRouteForPlatform(platform, routeType)
+	if err != nil {
+		return "", "", err
+	}
+	normalizedPayload := strings.TrimSpace(routeRawPayload)
+	if platform == model.SitePlatformCloudflare {
+		normalizedPayload = ""
+	}
+	return normalizedRouteType, normalizedPayload, nil
+}
+
+func SiteModelRouteUpdate(accountID int, groupKey string, modelName string, routeType model.SiteModelRouteType, source model.SiteModelRouteSource, manualOverride bool, routeRawPayload string, ctx context.Context) error {
+	return db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		site, err := lockSiteForAccount(tx, accountID)
+		if err != nil {
+			return err
+		}
+		normalizedRouteType, normalizedPayload, err := normalizeSiteModelRouteUpdateForPlatform(site.Platform, routeType, routeRawPayload)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		return tx.Model(&model.SiteModel{}).
+			Where("site_account_id = ? AND group_key = ? AND model_name = ?", accountID, model.NormalizeSiteGroupKey(groupKey), strings.TrimSpace(modelName)).
+			Updates(map[string]any{
+				"route_type":        normalizedRouteType,
+				"route_source":      model.NormalizeSiteModelRouteSource(source, manualOverride),
+				"manual_override":   manualOverride,
+				"route_raw_payload": normalizedPayload,
+				"route_updated_at":  &now,
+			}).Error
+	})
+}
+
+// SiteModelRoutesUpdate validates account ownership and every target before
+// writing, then persists the complete batch atomically.
+func SiteModelRoutesUpdate(siteID int, accountID int, items []model.SiteModelRouteUpdateRequest, ctx context.Context) error {
+	type normalizedUpdate struct {
+		modelID                 int
+		routeType               model.SiteModelRouteType
+		routeRawPayload         string
+		disableProtocolFallback *bool
+	}
+
+	return db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		site, err := lockSiteAndAccount(tx, siteID, accountID)
+		if err != nil {
+			return err
+		}
+		normalized := make([]normalizedUpdate, 0, len(items))
+		seen := make(map[string]struct{}, len(items))
+		for _, item := range items {
+			groupKey := model.NormalizeSiteGroupKey(item.GroupKey)
+			modelName := strings.TrimSpace(item.ModelName)
+			if modelName == "" {
+				return fmt.Errorf("model name is required")
+			}
+			key := groupKey + "\x00" + modelName
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("duplicate model route target: %s/%s", groupKey, modelName)
+			}
+			seen[key] = struct{}{}
+			routeType, routeRawPayload, err := normalizeSiteModelRouteUpdateForPlatform(site.Platform, item.RouteType, item.RouteRawPayload)
+			if err != nil {
+				return err
+			}
+			var target model.SiteModel
+			result := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select("id").
+				Where("site_account_id = ? AND group_key = ? AND model_name = ?", accountID, groupKey, modelName).
+				Take(&target)
+			if result.Error != nil {
+				if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("site model not found: %s/%s", groupKey, modelName)
+				}
+				return result.Error
+			}
+			normalized = append(normalized, normalizedUpdate{
+				modelID:                 target.ID,
+				routeType:               routeType,
+				routeRawPayload:         routeRawPayload,
+				disableProtocolFallback: item.DisableProtocolFallback,
+			})
+		}
+
+		now := time.Now()
+		for _, update := range normalized {
+			updates := map[string]any{
+				"route_type":        update.routeType,
+				"route_source":      model.SiteModelRouteSourceManualOverride,
+				"manual_override":   true,
+				"route_raw_payload": update.routeRawPayload,
+				"route_updated_at":  &now,
+			}
+			// 只在请求显式携带协议勾选时改写，未携带的旧客户端保持原值。
+			// 非 OpenAI 文本路由不存在协议降级，统一归零避免留下无意义的锁定。
+			if update.routeType != model.SiteModelRouteTypeOpenAIChat &&
+				update.routeType != model.SiteModelRouteTypeOpenAIResponse {
+				updates["disable_protocol_fallback"] = false
+			} else if update.disableProtocolFallback != nil {
+				updates["disable_protocol_fallback"] = *update.disableProtocolFallback
+			}
+			if err := tx.Model(&model.SiteModel{}).
+				Where("id = ? AND site_account_id = ?", update.modelID, accountID).
+				Updates(updates).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func SiteModelRouteUpdateIfNotManual(accountID int, groupKey string, modelName string, routeType model.SiteModelRouteType, source model.SiteModelRouteSource, routeRawPayload string, ctx context.Context) (bool, error) {
-	now := time.Now()
-	updates := map[string]any{
-		"route_type":        model.NormalizeSiteModelRouteType(routeType),
-		"route_source":      model.NormalizeSiteModelRouteSource(source, false),
-		"manual_override":   false,
-		"route_raw_payload": strings.TrimSpace(routeRawPayload),
-		"route_updated_at":  &now,
-	}
-	result := db.GetDB().WithContext(ctx).
-		Model(&model.SiteModel{}).
-		Where("site_account_id = ? AND group_key = ? AND model_name = ? AND manual_override = ?", accountID, model.NormalizeSiteGroupKey(groupKey), strings.TrimSpace(modelName), false).
-		Updates(updates)
-	if result.Error != nil {
-		return false, result.Error
-	}
-	return result.RowsAffected > 0, nil
+	updated := false
+	err := db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		site, err := lockSiteForAccount(tx, accountID)
+		if err != nil {
+			return err
+		}
+		normalizedRouteType, normalizedPayload, err := normalizeSiteModelRouteUpdateForPlatform(site.Platform, routeType, routeRawPayload)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		result := tx.Model(&model.SiteModel{}).
+			Where("site_account_id = ? AND group_key = ? AND model_name = ? AND manual_override = ? AND (route_type IS NULL OR route_type <> ?)", accountID, model.NormalizeSiteGroupKey(groupKey), strings.TrimSpace(modelName), false, normalizedRouteType).
+			Updates(map[string]any{
+				"route_type":        normalizedRouteType,
+				"route_source":      model.NormalizeSiteModelRouteSource(source, false),
+				"manual_override":   false,
+				"route_raw_payload": normalizedPayload,
+				"route_updated_at":  &now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		updated = result.RowsAffected > 0
+		return nil
+	})
+	return updated, err
 }
 
-func SiteModelDisabledUpdate(accountID int, groupKey string, modelName string, disabled bool, ctx context.Context) error {
-	return db.GetDB().WithContext(ctx).
-		Model(&model.SiteModel{}).
-		Where("site_account_id = ? AND group_key = ? AND model_name = ?", accountID, model.NormalizeSiteGroupKey(groupKey), strings.TrimSpace(modelName)).
-		Update("disabled", disabled).Error
+func SiteModelsDisabledUpdate(siteID int, accountID int, items []model.SiteModelDisableUpdateRequest, ctx context.Context) error {
+	type normalizedUpdate struct {
+		modelID  int
+		disabled bool
+	}
+
+	return db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockSiteAndAccount(tx, siteID, accountID); err != nil {
+			return err
+		}
+		normalized := make([]normalizedUpdate, 0, len(items))
+		seen := make(map[string]struct{}, len(items))
+		for _, item := range items {
+			groupKey := model.NormalizeSiteGroupKey(item.GroupKey)
+			modelName := strings.TrimSpace(item.ModelName)
+			if modelName == "" {
+				return fmt.Errorf("model name is required")
+			}
+			key := groupKey + "\x00" + modelName
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("duplicate model disabled target: %s/%s", groupKey, modelName)
+			}
+			seen[key] = struct{}{}
+			var target model.SiteModel
+			result := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select("id").
+				Where("site_account_id = ? AND group_key = ? AND model_name = ?", accountID, groupKey, modelName).
+				Take(&target)
+			if result.Error != nil {
+				if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("site model not found: %s/%s", groupKey, modelName)
+				}
+				return result.Error
+			}
+			normalized = append(normalized, normalizedUpdate{
+				modelID:  target.ID,
+				disabled: item.Disabled,
+			})
+		}
+		for _, update := range normalized {
+			if err := tx.Model(&model.SiteModel{}).
+				Where("id = ? AND site_account_id = ?", update.modelID, accountID).
+				Update("disabled", update.disabled).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }

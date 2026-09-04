@@ -99,6 +99,15 @@ type SiteChannelModel struct {
 	ProjectedChannelID *int                     `json:"projected_channel_id,omitempty"`
 	RouteMetadata      *SiteModelRouteMetadata  `json:"route_metadata,omitempty"`
 	History            *SiteModelHistorySummary `json:"history,omitempty"`
+	// DisableProtocolFallback 回显操作者的协议勾选：false 表示两个 OpenAI
+	// 文本协议都允许（真实能力交给运行时探测），true 表示只允许 RouteType
+	// 指定的那一个。
+	DisableProtocolFallback bool `json:"disable_protocol_fallback"`
+	// OpenAIChatCapability / OpenAIResponsesCapability 是投影渠道当前学到的
+	// 真实协议能力，供前端把勾选渲染成"已验证支持 / 已验证不支持 / 未知"。
+	// 没有投影渠道时为空字符串。
+	OpenAIChatCapability      OpenAIProtocolCapability `json:"openai_chat_capability,omitempty"`
+	OpenAIResponsesCapability OpenAIProtocolCapability `json:"openai_responses_capability,omitempty"`
 }
 
 type SiteModelHistorySummary struct {
@@ -120,6 +129,11 @@ type SiteModelRouteUpdateRequest struct {
 	ModelName       string             `json:"model_name" binding:"required"`
 	RouteType       SiteModelRouteType `json:"route_type" binding:"required"`
 	RouteRawPayload string             `json:"route_raw_payload,omitempty"`
+	// DisableProtocolFallback 对应 UI 上的协议勾选：两个协议都勾选时为 nil
+	// 或 false（允许在 Chat/Responses 之间降级，真实能力交给运行时探测），
+	// 只勾一个时为 true（把投影渠道锁定到 RouteType 指定的单协议）。
+	// 指针类型让"未携带该字段"的旧客户端保持原值而不是被静默重置。
+	DisableProtocolFallback *bool `json:"disable_protocol_fallback,omitempty"`
 }
 
 type SiteModelDisableUpdateRequest struct {

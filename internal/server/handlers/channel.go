@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,10 +11,12 @@ import (
 	"github.com/bestruirui/octopus/internal/helper"
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
+	"github.com/bestruirui/octopus/internal/relay"
 	"github.com/bestruirui/octopus/internal/server/middleware"
 	"github.com/bestruirui/octopus/internal/server/resp"
 	"github.com/bestruirui/octopus/internal/server/router"
 	"github.com/bestruirui/octopus/internal/task"
+	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/bestruirui/octopus/internal/utils/safe"
 	"github.com/gin-gonic/gin"
 )
@@ -45,6 +48,10 @@ func init() {
 		AddRoute(
 			router.NewRoute("/fetch-model", http.MethodPost).
 				Handle(fetchModel),
+		).
+		AddRoute(
+			router.NewRoute("/probe-openai-protocol", http.MethodPost).
+				Handle(probeOpenAIProtocol),
 		)
 	router.NewGroupRouter("/api/v1/channel").
 		Use(middleware.Auth()).
@@ -132,6 +139,9 @@ func createChannel(c *gin.Context) {
 		helper.ChannelAutoGroup(&createdChannel, ctx)
 	})
 	resp.Success(c, channel)
+	if shouldTriggerOpenAIProtocolProbe(&channel, nil) {
+		triggerOpenAIProtocolProbe(&channel)
+	}
 }
 
 func updateChannel(c *gin.Context) {
@@ -158,6 +168,94 @@ func updateChannel(c *gin.Context) {
 		helper.ChannelAutoGroup(&updatedChannel, ctx)
 	})
 	resp.Success(c, channel)
+	if shouldTriggerOpenAIProtocolProbe(channel, &req) {
+		triggerOpenAIProtocolProbe(channel)
+	}
+}
+
+func probeOpenAIProtocol(c *gin.Context) {
+	var request struct {
+		ID int `json:"id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		resp.InvalidJSON(c)
+		return
+	}
+	if request.ID <= 0 {
+		resp.InvalidParam(c)
+		return
+	}
+
+	// Probe directly: relay.ProbeChannelOpenAIProtocols performs its own
+	// authoritative load, so an extra pre-check here would only add a
+	// check-then-act race (TOCTOU) and a second database round trip.
+	report, err := relay.ProbeChannelOpenAIProtocols(request.ID, c.Request.Context())
+	if err != nil {
+		// Missing channels are a stable typed 404. Every other failure (database
+		// or upstream) stays an opaque route-specific 500. Do not serialize the
+		// underlying error: it may contain a private base URL or upstream body.
+		if errors.Is(err, op.ErrChannelNotFound) {
+			resp.ErrorWithCode(c, http.StatusNotFound, codeChannelNotFound, "channel not found")
+			return
+		}
+		log.Warnf("OpenAI protocol probe failed (channel=%d)", request.ID)
+		resp.ErrorWithAppError(c, http.StatusInternalServerError, channelError(codeChannelProbeFailed, "channel protocol probe failed", err))
+		return
+	}
+
+	// Reload once after persistence so the response reflects the authoritative
+	// mode and effective capabilities, including manual overrides. A reload
+	// failure never fails the request: BuildProtocolProbeAPIResponse falls back
+	// to the safe snapshot captured inside the report.
+	after, reloadErr := op.ChannelGetAuthoritative(request.ID, c.Request.Context())
+	if reloadErr != nil {
+		log.Warnf("authoritative channel reload for protocol probe failed (channel=%d)", request.ID)
+		after = nil
+	}
+	resp.Success(c, relay.BuildProtocolProbeAPIResponse(request.ID, report, after))
+}
+
+// shouldTriggerOpenAIProtocolProbe limits automatic probes to persisted changes
+// that can affect endpoint compatibility or the transport used to check it.
+func shouldTriggerOpenAIProtocolProbe(channel *model.Channel, req *model.ChannelUpdateRequest) bool {
+	if channel == nil || channel.ID <= 0 || !model.IsOpenAITextChannelType(channel.Type) ||
+		channel.OpenAIProtocolMode.Normalize() != model.OpenAIProtocolModeAuto {
+		return false
+	}
+	if req == nil {
+		return true
+	}
+	if req.Type != nil || req.BaseUrls != nil || req.Model != nil || req.CustomModel != nil ||
+		req.CustomHeader != nil || req.ParamOverride != nil || req.ProxyMode != nil || req.ProxyConfigID != nil ||
+		len(req.KeysToAdd) > 0 || len(req.KeysToDelete) > 0 {
+		return true
+	}
+	if req.OpenAIProtocolMode != nil {
+		return req.OpenAIProtocolMode.Normalize() == model.OpenAIProtocolModeAuto
+	}
+	for _, key := range req.KeysToUpdate {
+		if key.Enabled != nil || key.ChannelKey != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func triggerOpenAIProtocolProbe(channel *model.Channel) {
+	if channel == nil || !model.IsOpenAITextChannelType(channel.Type) || channel.ID <= 0 ||
+		channel.OpenAIProtocolMode.Normalize() != model.OpenAIProtocolModeAuto {
+		return
+	}
+	channelID := channel.ID
+	safe.Go("channel-openai-protocol-probe", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		if _, err := relay.ProbeChannelOpenAIProtocols(channelID, ctx); err != nil {
+			// The create/update request has already succeeded; probing is best effort.
+			// Keep the detail in server logs only and never return upstream content.
+			log.Warnf("automatic OpenAI protocol probe failed (channel=%d): %v", channelID, err)
+		}
+	})
 }
 
 func enableChannel(c *gin.Context) {

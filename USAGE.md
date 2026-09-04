@@ -146,7 +146,7 @@ Click Add Site and fill in:
 |-------|-------------|
 | **Site Name** | Any name for your reference, e.g., "Main OneAPI" |
 | **Platform Type** | See table below; if unsure, leave as "Auto Detect" (only available during creation, occasionally inaccurate — select manually if so) |
-| **Site URL** | **Domain only**, e.g., `https://example.com` — **don't include** `/v1`, `/api`, or other paths |
+| **Site URL** | Usually the domain only; for Cloudflare Workers AI use the account-scoped base URL: `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai` (`/v1` is also accepted) |
 | **Default Protocol** | Only for "API Direct" platform: choose which protocol this site uses by default (OpenAI Chat / Anthropic / Gemini) |
 | **Manual Check-in URL** (optional) | If set, you can "one-click open" this page from the site overview for manual check-in |
 | **Proxy** | Direct / System Proxy / Proxy Pool (see [12.x Proxy Pool](#1213-proxy-pool)) |
@@ -162,6 +162,7 @@ Supported **Platform Types**:
 | **AnyRouter** | LinuxDO-based "any" sites (credentials use cookies, see below) |
 | **One API / One Hub / Done Hub** | Corresponding open-source panels |
 | **Sub2API** | sub2api sites |
+| **Cloudflare Workers AI** | Cloudflare-hosted Workers AI; syncs text-generation models and projects an OpenAI-compatible channel |
 | **API Direct** | Official or direct providers (OpenAI / Claude / Gemini). Requires selecting a **default protocol** (see note below) |
 
 > 💡 **API Direct platform's "Default Protocol"**: After selecting API Direct, you need to specify a **default protocol type** (OpenAI Chat / Anthropic / Gemini) to tell Octopus which protocol to use by default. Platform detection will automatically recommend a suitable protocol. The old separate OpenAI / Claude / Gemini platform types have been automatically merged into "API Direct" — no manual action needed after upgrading.
@@ -179,6 +180,7 @@ The way to fill in Access Token varies by platform — this is the biggest pitfa
 | **New API** | Access Token | The site's **"System Access Token"** (not the login password!) | Must fill **Platform User ID** (user ID on the relay site) |
 | **AnyRouter (any)** | Access Token | **Cookie**, format: `session=MTc1234567890` | — |
 | **Sub2API** | Access Token | The site's access token | Recommended to also fill `refresh_token` and `token_expires_at` (get via F12, auto-refreshes on 401) |
+| **Cloudflare Workers AI** | Access Token | A Cloudflare Workers AI API Token with `Workers AI Read` or `Workers AI Edit` permission | Account ID is included in the Site URL |
 | **OpenAI/Claude/Gemini (API Direct)** | API Key or Access Token | The corresponding key | — |
 
 > 🔎 **Where is the "System Access Token" for New API sites?**
@@ -409,8 +411,9 @@ Key fields:
 | Field | Description |
 |-------|-------------|
 | Channel Name | Custom |
-| Channel Type | OpenAI Chat / OpenAI Response / Anthropic / Gemini / Volcengine / OpenAI Embedding |
-| Base URLs | Only the base address — the program auto-appends `/chat/completions`, `/responses`, `/messages`, etc. based on type; multiple endpoints enable "lowest latency selection" |
+| Channel Type | OpenAI / Anthropic / Gemini / Volcengine / OpenAI Embedding |
+| OpenAI Protocol Mode | OpenAI text channels only: Auto-detect / Chat Completions only / Responses only / Both supported. Auto-detect is recommended unless the provider contract is known |
+| Base URLs | Only the base address. Octopus appends `/chat/completions`, `/responses`, `/messages`, etc. for the selected/effective protocol; multiple endpoints enable lowest-latency selection |
 | API Key | **Can add multiple Keys** (enabling multi-Key rotation, see FAQ Q6) |
 | Advanced Settings | Custom Headers, channel proxy, parameter override (JSON), auto-sync, auto-group, Responses WS mode, match regex, notes |
 
@@ -429,11 +432,11 @@ Octopus supports **OpenAI Chat / OpenAI Responses / Anthropic** format interconv
 
 **Core rules**:
 
-- **Just add a channel to a group** — when the downstream request format doesn't match the channel's format, **conversion happens automatically**. No extra configuration needed.
-- **Don't configure two endpoint formats for the same model**. Recommend setting everything to **Response** — after adding to a group, Chat format requests still work (auto-converted).
-- **Passthrough**: `Response` format and `Anthropic message` format pass through unchanged when both ends match; once format conversion occurs, it's no longer passthrough. Codex's `fast` and remote compact endpoints (Responses compact proxy) pass through when the entire pipeline is Response format.
-
-> So "Claude Code calling Response-format GPT" basically works fine; for Gemini format you can try it — bug reports welcome.
+- **Just add a channel to a group**. The downstream request format determines protocol priority; a directly compatible endpoint is preferred, and representable requests can be converted when needed.
+- For OpenAI channels, **Auto-detect** probes an unknown Chat or Responses endpoint once. Explicit endpoint-routing failures are persisted as unsupported, successful attempts as supported, and later requests skip the known-incompatible endpoint. Model-scoped failures do not disable a protocol for the whole channel.
+- Use **Chat Completions only**, **Responses only**, or **Both supported** when the provider contract is known. Cloudflare Workers AI channels are always Chat-only.
+- Protocol fallback is allowed only before response payload is written and only when the request can be represented by the alternate protocol.
+- **Passthrough**: `Response` format and `Anthropic message` format pass through unchanged when both ends match; once format conversion occurs, it is no longer passthrough. Codex's `fast` and remote compact endpoints (Responses compact proxy) pass through when the entire pipeline is Response format.
 
 ---
 
@@ -502,10 +505,11 @@ Because **you haven't created a group yet**. In Octopus, "group name = available
 - **New API**: The site's "Profile → Account Management → Security Settings → **System Access Token**" — **don't use username/password login**. New API also requires **Platform User ID**.
 - **any (AnyRouter)**: A **cookie**, format: `session=MTc1234567890`. Platform type must be **AnyRouter**, not New API.
 - **API Direct (OpenAI/Claude/Gemini)**: The corresponding API Key or Access Token, and select the correct **default protocol**.
-- For all platforms except AnyRouter, use the System Access Token — **don't use cookies**.
+- **Cloudflare Workers AI**: Enter the Workers AI API Token. The Site URL must include the Account ID, for example `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai`.
+- For platforms other than AnyRouter, API Direct, and Cloudflare Workers AI, use the System Access Token and **don't use cookies**.
 
 ### Q5. How to fill in the site URL?
-**Domain only**, e.g., `https://wzw.pp.ua` — **don't include** `/v1` or other paths.
+For most platforms, enter the domain only, e.g. `https://wzw.pp.ua`, without `/v1`. **Cloudflare Workers AI is the exception**: enter the account-scoped base URL `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai`; the documented `/ai/v1` form is also accepted.
 
 ### Q6. One channel has multiple Keys — how to rotate them?
 Use a **Manual Channel** and add multiple Keys inside it; then set the channel's **group "Session Affinity" to 0**. This way each Key's cumulative cost will tend to equalize — if each request costs about the same, it approximates rotation. Non-zero session affinity "sticks" to one Key. The manual channel panel shows each Key's usage cost — run a few requests and you'll see.

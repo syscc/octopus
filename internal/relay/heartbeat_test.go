@@ -239,6 +239,27 @@ func TestEarlyHeartbeat_NilSafe(t *testing.T) {
 	}
 }
 
+func TestEarlyHeartbeat_FlushOrError_WriterCommittedByStreamHeartbeat(t *testing.T) {
+	setupRelayTestDB(t)
+	setHeartbeatSettings(t, "0", "0")
+	c, w := newTestGinContext(t)
+	hb := startEarlyHeartbeat(c, true)
+	defer hb.Stop()
+	if hb.HeaderWritten() {
+		t.Fatal("disabled early heartbeat unexpectedly wrote headers")
+	}
+	_, _ = c.Writer.Write([]byte(":\n\n"))
+	c.Writer.Flush()
+	hb.FlushOrError(c, http.StatusBadGateway, "channel failed")
+	body := w.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, `"code":502`) {
+		t.Fatalf("committed stream must receive SSE error, got %q", body)
+	}
+	if strings.Contains(w.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("committed SSE stream was rewritten as JSON: %q", w.Header().Get("Content-Type"))
+	}
+}
+
 func TestEarlyHeartbeat_TickerProducesAdditional(t *testing.T) {
 	setupRelayTestDB(t)
 	setHeartbeatSettings(t, "1", "1")

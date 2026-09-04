@@ -1,7 +1,6 @@
 package relay
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -21,16 +20,29 @@ import (
 	"github.com/bestruirui/octopus/internal/helper"
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
+	"github.com/bestruirui/octopus/internal/outlierwindow"
 	"github.com/bestruirui/octopus/internal/price"
 	"github.com/bestruirui/octopus/internal/relay/balancer"
 	"github.com/bestruirui/octopus/internal/relay/bodycache"
+	"github.com/bestruirui/octopus/internal/relay/stream"
 	"github.com/bestruirui/octopus/internal/server/resp"
+	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
 	"github.com/bestruirui/octopus/internal/transformer/outbound"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/gin-gonic/gin"
 )
 
 const imagesUpstreamErrorBodyLimit = 16 * 1024
+
+// errDownstreamWriteFailed is shared with the regular stream relay so all
+// downstream writer failures receive the same health-accounting classification.
+var errDownstreamWriteFailed = stream.ErrDownstreamWriteFailed
+
+// downstreamWriteError wraps a downstream writer error while preserving its
+// underlying chain for diagnostics.
+func downstreamWriteError(err error) error {
+	return stream.WrapDownstreamWriteError(err)
+}
 
 // ImagesHandler 是 OpenAI Images API 的统一 relay 入口。
 // endpoint 形如：/images/generations、/images/edits、/images/variations（不含 /v1 前缀）。
@@ -127,9 +139,13 @@ func ImagesHandler(endpoint string, c *gin.Context) {
 	// 流式：启动早期心跳协程，覆盖前置阶段（连接慢、failover、退避）期间向客户端发 SSE 注释字节
 	// 非流式：无法发送 SSE 注释（破坏 application/json 协议），不施加本地超时
 	hb := startEarlyHeartbeat(c, stream)
-	defer hb.Stop()
+	defer func() { hb.Stop() }()
 
-	var lastErr error
+	var (
+		lastErr        error
+		lastStatusCode int
+		lastRetryAfter time.Duration
+	)
 
 	for iter.Next() {
 		select {
@@ -138,6 +154,13 @@ func ImagesHandler(endpoint string, c *gin.Context) {
 			metrics.SaveWithChannelStats(ctx, false, context.Canceled, iter.Attempts(), false)
 			return
 		default:
+		}
+
+		// proxySSE hands exclusive writer ownership to StreamProcessor. If that
+		// attempt produces no payload and fails over, start a fresh pre-stream
+		// heartbeat for the next candidate's connection/response wait.
+		if hb.NeedsRestart() {
+			hb = startEarlyHeartbeat(c, stream)
 		}
 
 		item := iter.Item()
@@ -161,14 +184,29 @@ func ImagesHandler(endpoint string, c *gin.Context) {
 			continue
 		}
 
-		usedKey := channel.GetChannelKey()
-		if usedKey.ChannelKey == "" {
-			iter.Skip(channel.ID, 0, channel.Name, "no available key")
-			continue
+		selectOpts := model.ChannelKeySelectOptions{
+			ExcludeKeyIDs:  make(map[int]struct{}),
+			PreferredKeyID: iter.StickyKeyID(),
 		}
-
-		// 熔断检查（熔断 key 使用 actualModel=item.ModelName）
-		if iter.SkipCircuitBreak(channel.ID, usedKey.ID, channel.Name) {
+		var usedKey model.ChannelKey
+		for {
+			usedKey = channel.GetChannelKey(selectOpts)
+			if usedKey.ChannelKey == "" {
+				break
+			}
+			// A tripped credential does not make the entire channel unavailable.
+			// Continue through the channel's remaining enabled keys, matching the
+			// ordinary Relay and Compact selection policy.
+			if !iter.SkipCircuitBreak(channel.ID, usedKey.ID, channel.Name) {
+				break
+			}
+			selectOpts.ExcludeKeyIDs[usedKey.ID] = struct{}{}
+			usedKey = model.ChannelKey{}
+		}
+		if usedKey.ChannelKey == "" {
+			if len(selectOpts.ExcludeKeyIDs) == 0 {
+				iter.Skip(channel.ID, 0, channel.Name, "no available key")
+			}
 			continue
 		}
 
@@ -179,20 +217,20 @@ func ImagesHandler(endpoint string, c *gin.Context) {
 		span := iter.StartAttempt(channel.ID, usedKey.ID, channel.Name)
 
 		// 尝试一次转发
-		statusCode, written, usage, upstreamCT, fwdErr := imagesAttempt(ctx, endpoint, c, bc, isMultipart, boundary, jsonPayload, stream, channel, usedKey.ChannelKey, group.FirstTokenTimeOut, metrics, item.ModelName, hb)
+		metrics.resetAttemptUsage(item.ModelName)
+		statusCode, written, usage, upstreamCT, retryAfter, fwdErr := imagesAttempt(ctx, endpoint, c, bc, isMultipart, boundary, jsonPayload, stream, channel, usedKey.ChannelKey, group.FirstTokenTimeOut, metrics, item.ModelName, hb)
 
-		// 更新 channel key 状态
+		// 更新 channel key 状态，并保留已经完成的上游 usage，即使下游
+		// 随后的写出失败。此类请求仍可能已经由 provider 计费。
 		usedKey.StatusCode = statusCode
 		usedKey.LastUseTimeStamp = time.Now().Unix()
+		if usage != nil {
+			metrics.SetUsageFromImages(item.ModelName, *usage)
+			metrics.ResponseContent = buildImagesResponseContentForLog(stream, upstreamCT, usage)
+		}
 
 		if fwdErr == nil {
 			// ====== 成功 ======
-			metrics.ActualModel = item.ModelName
-			if usage != nil {
-				metrics.SetUsageFromImages(item.ModelName, *usage)
-			}
-			metrics.ResponseContent = buildImagesResponseContentForLog(stream, upstreamCT, usage)
-
 			usedKey.TotalCost += metrics.Stats.InputCost + metrics.Stats.OutputCost
 			op.ChannelKeyUpdate(usedKey)
 
@@ -204,8 +242,9 @@ func ImagesHandler(endpoint string, c *gin.Context) {
 				RequestSuccess: 1,
 			})
 
-			// 熔断器：记录成功
+			// 熔断器：记录成功，并补充 outlier 健康记账（与普通 relay 一致）
 			balancer.RecordSuccess(channel.ID, usedKey.ID, item.ModelName)
+			outlierwindow.Report(channel.ID, true, statusCode, time.Now())
 			// 会话保持：更新粘性记录
 			balancer.SetSticky(apiKeyID, requestModel, channel.ID, usedKey.ID)
 
@@ -214,8 +253,28 @@ func ImagesHandler(endpoint string, c *gin.Context) {
 		}
 
 		// ====== 失败 ======
+		lastStatusCode = statusCode
+		lastRetryAfter = retryAfter
+		if usage != nil {
+			usedKey.TotalCost += metrics.Stats.InputCost + metrics.Stats.OutputCost
+		}
 		op.ChannelKeyUpdate(usedKey)
 		span.End(model.AttemptFailed, statusCode, fwdErr.Error())
+
+		// 客户端取消与普通 relay 语义一致：不算上游失败/成功，直接结束。
+		if isClientCancellation(ctx, fwdErr) {
+			metrics.SaveWithChannelStats(ctx, false, fwdErr, iter.Attempts(), false)
+			return
+		}
+
+		// 下游写断开：错误源自向客户端写出失败，与上游健康无关；
+		// payload 已可见时同时禁止 retry/failover。
+		if errors.Is(fwdErr, errDownstreamWriteFailed) {
+			// A broken downstream cannot be repaired by retrying another provider.
+			// Stop even when the failed write accepted zero bytes.
+			metrics.SaveWithChannelStats(ctx, false, fwdErr, iter.Attempts(), false)
+			return
+		}
 
 		// Channel 维度统计
 		op.StatsChannelUpdate(channel.ID, model.StatsMetrics{
@@ -223,10 +282,13 @@ func ImagesHandler(endpoint string, c *gin.Context) {
 			RequestFailed: 1,
 		})
 
-		// 熔断器：记录失败
+		// 熔断器：记录失败；真实上游失败同时补充 outlier 记账
 		balancer.RecordFailure(channel.ID, usedKey.ID, item.ModelName, circuitFailureKind(group.RetryEnabled, statusCode))
+		outlierwindow.Report(channel.ID, false, statusCode, time.Now())
 
 		if written {
+			// 上游在 payload 已输出后失败：渠道仍需失败记账（与 relay 的
+			// incomplete 语义一致），但 payload 已可见，禁止 retry/failover。
 			metrics.SaveWithChannelStats(ctx, false, fwdErr, iter.Attempts(), false)
 			return
 		}
@@ -234,9 +296,16 @@ func ImagesHandler(endpoint string, c *gin.Context) {
 		lastErr = fmt.Errorf("channel %s failed: %v", channel.Name, fwdErr)
 	}
 
-	// 所有通道都失败
+	// 所有通道都失败。无上游响应或 2xx 语义失败统一为 502；明确的
+	// upstream 状态保留给调用方，429/503 同时透传有界 Retry-After。
 	metrics.SaveWithChannelStats(ctx, false, lastErr, iter.Attempts(), false)
-	hb.FlushOrError(c, http.StatusBadGateway, "all channels failed")
+	if lastStatusCode <= 0 || (lastStatusCode >= 200 && lastStatusCode < 300) {
+		lastStatusCode = http.StatusBadGateway
+	}
+	if isPassthroughStatus(lastStatusCode) && lastRetryAfter > 0 {
+		c.Header("Retry-After", fmt.Sprintf("%d", int(lastRetryAfter.Seconds())))
+	}
+	hb.FlushOrError(c, lastStatusCode, "all channels failed")
 }
 
 type imagesUsage struct {
@@ -272,8 +341,17 @@ func (m *imagesRelayMetrics) SetFirstTokenTime(t time.Time) {
 	}
 }
 
-func (m *imagesRelayMetrics) SetUsageFromImages(actualModel string, u imagesUsage) {
+func (m *imagesRelayMetrics) resetAttemptUsage(actualModel string) {
 	m.ActualModel = actualModel
+	m.Stats.InputToken = 0
+	m.Stats.OutputToken = 0
+	m.Stats.InputCost = 0
+	m.Stats.OutputCost = 0
+	m.ResponseContent = ""
+}
+
+func (m *imagesRelayMetrics) SetUsageFromImages(actualModel string, u imagesUsage) {
+	m.resetAttemptUsage(actualModel)
 	m.Stats.InputToken = int64(u.InputTokens)
 	m.Stats.OutputToken = int64(u.OutputTokens)
 
@@ -541,12 +619,12 @@ func imagesAttempt(
 	metrics *imagesRelayMetrics,
 	actualModel string,
 	hb *earlyHeartbeat,
-) (statusCode int, written bool, usage *imagesUsage, upstreamCT string, err error) {
+) (statusCode int, written bool, usage *imagesUsage, upstreamCT string, retryAfter time.Duration, err error) {
 	// 构建 URL（baseUrl.Path 后追加 endpoint）
 	baseURL := channel.GetBaseUrl()
 	parsedURL, err := url.Parse(strings.TrimSuffix(baseURL, "/"))
 	if err != nil {
-		return 0, false, nil, "", fmt.Errorf("failed to parse base url: %w", err)
+		return 0, false, nil, "", 0, fmt.Errorf("failed to parse base url: %w", err)
 	}
 	parsedURL.Path = parsedURL.Path + endpoint
 
@@ -582,12 +660,12 @@ func imagesAttempt(
 		// JSON：仅改写 model 字段，其余保持不变
 		// 注意：每次尝试都重新 marshal 生成 body，确保可重试重建
 		if jsonPayload == nil {
-			return 0, false, nil, "", errors.New("nil json payload")
+			return 0, false, nil, "", 0, errors.New("nil json payload")
 		}
 		jsonPayload["model"] = actualModel
 		b, err := json.Marshal(jsonPayload)
 		if err != nil {
-			return 0, false, nil, "", fmt.Errorf("failed to marshal json: %w", err)
+			return 0, false, nil, "", 0, fmt.Errorf("failed to marshal json: %w", err)
 		}
 		bodyReader = bytes.NewReader(b)
 		contentType = "application/json"
@@ -595,7 +673,7 @@ func imagesAttempt(
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "", bodyReader)
 	if err != nil {
-		return 0, false, nil, "", fmt.Errorf("failed to create request: %w", err)
+		return 0, false, nil, "", 0, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.URL = parsedURL
 	req.Method = http.MethodPost
@@ -606,45 +684,57 @@ func imagesAttempt(
 	// 发送请求
 	httpClient, err := helper.ChannelHTTPClientWithContext(ctx, channel)
 	if err != nil {
-		return 0, false, nil, "", err
+		return 0, false, nil, "", 0, err
 	}
 
 	respUp, err := httpClient.Do(req)
 	if err != nil {
-		return 0, false, nil, "", fmt.Errorf("failed to send request: %w", err)
+		return 0, false, nil, "", 0, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer respUp.Body.Close()
 
 	upstreamCT = respUp.Header.Get("Content-Type")
+	retryAfter = parseRetryAfter(respUp.Header.Get("Retry-After"))
 
 	// stream=true：逐行解析 event/data/空行边界透传
 	if stream {
 		if respUp.StatusCode < 200 || respUp.StatusCode >= 300 {
 			b, _ := io.ReadAll(io.LimitReader(respUp.Body, imagesUpstreamErrorBodyLimit))
-			return respUp.StatusCode, false, nil, upstreamCT, fmt.Errorf("upstream error: %d: %s", respUp.StatusCode, string(b))
+			return respUp.StatusCode, false, nil, upstreamCT, retryAfter, newUpstreamHTTPError(respUp.StatusCode, b)
 		}
-		u, w, err := proxySSE(ctx, c, respUp, firstTokenTimeOutSec, metrics, hb)
-		return respUp.StatusCode, w, u, upstreamCT, err
+		u, w, proxyErr := proxySSE(ctx, c, respUp, firstTokenTimeOutSec, metrics, hb)
+		return imagesStatusForError(respUp.StatusCode, proxyErr), w, u, upstreamCT, retryAfter, proxyErr
 	}
 
 	// 非流式：2xx 透传，否则读取限长错误体用于错误信息与重试判定
 	if respUp.StatusCode < 200 || respUp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(respUp.Body, imagesUpstreamErrorBodyLimit))
-		return respUp.StatusCode, false, nil, upstreamCT, fmt.Errorf("upstream error: %d: %s", respUp.StatusCode, string(b))
+		return respUp.StatusCode, false, nil, upstreamCT, retryAfter, newUpstreamHTTPError(respUp.StatusCode, b)
 	}
 
-	u, w, err := proxyNonStream(c, respUp)
-	return respUp.StatusCode, w, u, upstreamCT, err
+	u, w, proxyErr := proxyNonStream(c, respUp)
+	return imagesStatusForError(respUp.StatusCode, proxyErr), w, u, upstreamCT, retryAfter, proxyErr
+}
+
+func imagesStatusForError(upstreamStatus int, err error) int {
+	if err == nil || isDownstreamWriteError(err) {
+		return upstreamStatus
+	}
+	if terminalStatus := passthroughTerminalStatus(err); terminalStatus > 0 {
+		return terminalStatus
+	}
+	if upstreamStatus >= 400 {
+		return upstreamStatus
+	}
+	return http.StatusBadGateway
 }
 
 func copyHeadersToUpstream(req *http.Request, c *gin.Context, channel *model.Channel, channelKey string, contentType string, stream bool) {
-	for k, values := range c.Request.Header {
-		if hopByHopHeaders[strings.ToLower(k)] {
-			continue
-		}
-		for _, v := range values {
-			req.Header.Add(k, v)
-		}
+	if req == nil {
+		return
+	}
+	if c != nil && c.Request != nil {
+		copySafeUpstreamHeaders(req.Header, c.Request.Header)
 	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
@@ -654,17 +744,18 @@ func copyHeadersToUpstream(req *http.Request, c *gin.Context, channel *model.Cha
 	} else if req.Header.Get("Accept") == "" {
 		req.Header.Set("Accept", "application/json")
 	}
-	req.Header.Set("Authorization", "Bearer "+channelKey)
+	applySelectedCredentialHeader(req.Header, outbound.OutboundTypeOpenAIChat, channelKey)
 
 	// 防止 Go 默认 User-Agent 泄露到上游
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", "")
 	}
 
-	if len(channel.CustomHeader) > 0 {
-		for _, h := range channel.CustomHeader {
-			req.Header.Set(h.HeaderKey, h.HeaderValue)
-		}
+	if channel != nil {
+		applySafeChannelHeaders(req.Header, channel.CustomHeader)
+		// CustomHeader is applied after defaults for ordinary metadata, but it
+		// can never replace the selected channel credential.
+		applySelectedCredentialHeader(req.Header, outbound.OutboundTypeOpenAIChat, channelKey)
 	}
 }
 
@@ -719,181 +810,118 @@ func proxyNonStream(c *gin.Context, respUp *http.Response) (*imagesUsage, bool, 
 	if ct == "" {
 		ct = "application/json"
 	}
-	c.Header("Content-Type", ct)
-	c.Status(respUp.StatusCode)
 
 	scanner := newUsageScanner()
-
+	wrotePayload := false
 	buf := make([]byte, 32*1024)
 	for {
 		n, rerr := respUp.Body.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
 			scanner.Feed(chunk)
-			if _, werr := c.Writer.Write(chunk); werr != nil {
-				return scanner.Usage(), true, werr
+			if !wrotePayload {
+				// Keep response metadata tentative until an actual body chunk is ready.
+				// An empty/read-failed attempt may still fail over to another channel or
+				// end as a JSON relay error.
+				c.Header("Content-Type", ct)
+				c.Status(respUp.StatusCode)
 			}
+			written, werr := c.Writer.Write(chunk)
+			if werr != nil {
+				return scanner.Usage(), written > 0, downstreamWriteError(werr)
+			}
+			if written != len(chunk) {
+				return scanner.Usage(), written > 0, downstreamWriteError(io.ErrShortWrite)
+			}
+			wrotePayload = true
 		}
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
 				break
 			}
-			return scanner.Usage(), c.Writer.Written(), rerr
+			return scanner.Usage(), wrotePayload, fmt.Errorf("failed to read upstream image response: %w", rerr)
 		}
 	}
 
-	return scanner.Usage(), c.Writer.Written(), nil
+	if !wrotePayload {
+		return scanner.Usage(), false, stream.ErrEmptyUpstreamStream
+	}
+	return scanner.Usage(), true, nil
 }
 
 // proxySSE 将上游 SSE 逐行解析 event/data/空行并透传到下游；首事件计为 FirstTokenTime；支持 FirstTokenTimeOut 切换。
 func proxySSE(ctx context.Context, c *gin.Context, respUp *http.Response, firstTokenTimeOutSec int, metrics *imagesRelayMetrics, hb *earlyHeartbeat) (*imagesUsage, bool, error) {
 	if ct := respUp.Header.Get("Content-Type"); ct != "" && !strings.Contains(strings.ToLower(ct), "text/event-stream") {
-		b, _ := io.ReadAll(io.LimitReader(respUp.Body, imagesUpstreamErrorBodyLimit))
-		return nil, false, fmt.Errorf("upstream returned non-SSE content-type %q for stream request: %s", ct, string(b))
+		return nil, false, errors.New("upstream returned non-SSE content-type for image stream")
 	}
 
-	// 交接早期心跳给本函数内层 ticker
-	hb.Hand()
-
-	// 设置 SSE 响应头
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-
-	heartbeatTicker, heartbeatC := newStreamHeartbeatTicker()
-	if heartbeatTicker != nil {
-		defer heartbeatTicker.Stop()
+	// Stop the pre-stream heartbeat before the stream processor becomes the
+	// sole owner of the downstream writer.
+	if hb != nil {
+		hb.Hand()
 	}
 
-	type lineResult struct {
-		line []byte
-		err  error
-		eof  bool
-	}
-
-	results := make(chan lineResult, 1)
-	go func() {
-		defer close(results)
-		br := bufio.NewReaderSize(respUp.Body, 64*1024)
-		for {
-			line, err := readLineLimited(br, maxSSEEventSize)
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					results <- lineResult{eof: true}
-					return
-				}
-				results <- lineResult{err: err}
-				return
-			}
-			results <- lineResult{line: line}
-		}
-	}()
-
-	var firstTokenTimer *time.Timer
-	var firstTokenC <-chan time.Time
+	var firstTokenTimeout time.Duration
 	if firstTokenTimeOutSec > 0 {
-		firstTokenTimer = time.NewTimer(time.Duration(firstTokenTimeOutSec) * time.Second)
-		firstTokenC = firstTokenTimer.C
-		defer func() {
-			if firstTokenTimer != nil {
-				firstTokenTimer.Stop()
-			}
-		}()
+		firstTokenTimeout = time.Duration(firstTokenTimeOutSec) * time.Second
 	}
 
-	var (
-		firstWrite       = true
-		currentEvent     string
-		completedScanner = newUsageScanner()
-	)
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Infof("client disconnected, stopping stream")
-			return completedScanner.Usage(), !firstWrite, nil
-
-		case <-firstTokenC:
-			log.Warnf("first token timeout (%ds), switching channel", firstTokenTimeOutSec)
-			_ = respUp.Body.Close()
-			return completedScanner.Usage(), !firstWrite, fmt.Errorf("first token timeout (%ds)", firstTokenTimeOutSec)
-
-		case <-heartbeatC:
-			if err := writeSSEHeartbeat(c.Writer); err != nil {
-				return completedScanner.Usage(), false, err
-			}
-
-		case r, ok := <-results:
-			if !ok {
-				return completedScanner.Usage(), !firstWrite, nil
-			}
-			if r.eof {
-				return completedScanner.Usage(), !firstWrite, nil
-			}
-			if r.err != nil {
-				return completedScanner.Usage(), !firstWrite, fmt.Errorf("failed to read stream line: %w", r.err)
-			}
-
-			line := r.line
-			trimmed := bytes.TrimRight(line, "\r\n")
-			if len(trimmed) == 0 {
-				// 空行：事件边界
-				currentEvent = ""
-			} else if bytes.HasPrefix(trimmed, []byte("event:")) {
-				currentEvent = strings.TrimSpace(string(trimmed[len("event:"):]))
-			} else if bytes.HasPrefix(trimmed, []byte("data:")) {
-				// 仅在 completed 事件上尝试提取 usage（避免解析/分配巨大 b64_json）
-				payload := bytes.TrimSpace(trimmed[len("data:"):])
-				if currentEvent == "image_generation.completed" || bytes.Contains(payload, []byte(`"type":"image_generation.completed"`)) {
-					completedScanner.Feed(payload)
-				}
-			}
-
-			if _, werr := c.Writer.Write(line); werr != nil {
-				return completedScanner.Usage(), true, werr
-			}
-			c.Writer.Flush()
-
-			if firstWrite {
-				metrics.SetFirstTokenTime(time.Now())
-				firstWrite = false
-				if firstTokenTimer != nil {
-					if !firstTokenTimer.Stop() {
-						select {
-						case <-firstTokenTimer.C:
-						default:
-						}
-					}
-					firstTokenTimer = nil
-					firstTokenC = nil
-				}
-			}
-		}
+	cfg := transformerModel.PassthroughConfig{
+		TerminalEvents: map[string]struct{}{
+			"image_generation.completed": {},
+		},
+		FailureEvents: map[string]struct{}{
+			"image_generation.failed": {},
+			"error":                   {},
+		},
+		IncompleteEvents: map[string]struct{}{
+			"image_generation.incomplete": {},
+		},
+		CancelledEvents: map[string]struct{}{
+			"image_generation.cancelled": {},
+			"image_generation.canceled":  {},
+		},
 	}
-}
-
-func readLineLimited(br *bufio.Reader, limit int) ([]byte, error) {
-	var out []byte
-	for {
-		part, err := br.ReadSlice('\n')
-		out = append(out, part...)
-		if len(out) > limit {
-			return nil, fmt.Errorf("sse line exceeds limit %d bytes", limit)
+	framer := newPassthroughSSETransform(cfg, false)
+	completedScanner := newUsageScanner()
+	observeUsage := func(result stream.StreamTransformResult) stream.StreamTransformResult {
+		if result.Outcome == transformerModel.PassthroughTerminalOutcomeCompleted && len(result.Output) > 0 {
+			// Only the terminal block can contain usage. Scanning it avoids retaining
+			// or decoding potentially large base64 image payloads.
+			completedScanner.Feed(result.Output)
 		}
-		if err == nil {
-			return out, nil
-		}
-		if errors.Is(err, bufio.ErrBufferFull) {
-			continue
-		}
-		// 允许返回已读部分 + err（调用方按 err 处理）
-		return out, err
+		return result
 	}
+
+	processor := stream.NewStreamProcessor(stream.StreamConfig{
+		Source: stream.NewRawSource(respUp.Body, 32*1024),
+		TransformWithOutcome: func(transformCtx context.Context, data []byte, payloadWritten bool) stream.StreamTransformResult {
+			return observeUsage(framer.transform(transformCtx, data, payloadWritten))
+		},
+		FinalizeWithOutcome: func(finalizeCtx context.Context) stream.StreamTransformResult {
+			result := observeUsage(framer.finalize(finalizeCtx, framer.seenPayload))
+			if result.Outcome == transformerModel.PassthroughTerminalOutcomeNone && result.Err == nil && framer.seenPayload {
+				result.Err = fmt.Errorf("%w: image stream ended without a terminal event", transformerModel.ErrIncompleteUpstreamStream)
+			}
+			return result
+		},
+		Writer:            c.Writer,
+		Context:           ctx,
+		FirstTokenTimeout: firstTokenTimeout,
+		HeartbeatInterval: streamHeartbeatInterval(),
+		MaxEventSize:      maxSSEEventSize,
+		OnFirstToken: func() {
+			metrics.SetFirstTokenTime(time.Now())
+		},
+	})
+
+	err := processor.Run()
+	return completedScanner.Usage(), processor.PayloadWritten(), err
 }
 
 type usageScanner struct {
 	matchIdx       int
+	matchedKey     bool
 	waitForObject  bool
 	collecting     bool
 	braceDepth     int
@@ -909,13 +937,13 @@ func newUsageScanner() *usageScanner {
 	return &usageScanner{maxCollectSize: 64 * 1024}
 }
 
-// Feed 逐字节扫描输入，定位 "usage":{...} 并仅解析 usage 子对象。
-// 该实现用于避免整体 json.Unmarshal 造成 b64_json 巨大内存分配。
+// Feed 逐字节扫描输入，定位 usage 键并仅解析其对象值。
+// 键、冒号、对象之间允许 JSON 空白，状态可跨任意 transport chunk 保留。
 func (s *usageScanner) Feed(p []byte) {
 	if s.done || len(p) == 0 {
 		return
 	}
-	const pat = `"usage":`
+	const key = `"usage"`
 
 	for _, b := range p {
 		if s.done {
@@ -952,9 +980,9 @@ func (s *usageScanner) Feed(p []byte) {
 			case '}':
 				s.braceDepth--
 				if s.braceDepth == 0 {
-					var u imagesUsage
-					if err := json.Unmarshal(s.buf.Bytes(), &u); err == nil {
-						s.usage = &u
+					var usage imagesUsage
+					if err := json.Unmarshal(s.buf.Bytes(), &usage); err == nil {
+						s.usage = &usage
 					}
 					s.done = true
 					s.collecting = false
@@ -975,7 +1003,6 @@ func (s *usageScanner) Feed(p []byte) {
 				s.waitForObject = false
 				continue
 			}
-			// 跳过空白，遇到其他字符则放弃
 			if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
 				continue
 			}
@@ -983,18 +1010,27 @@ func (s *usageScanner) Feed(p []byte) {
 			continue
 		}
 
-		// 匹配 "usage":
-		if b == pat[s.matchIdx] {
-			s.matchIdx++
-			if s.matchIdx == len(pat) {
+		if s.matchedKey {
+			if b == ':' {
+				s.matchedKey = false
 				s.waitForObject = true
+				continue
+			}
+			if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+				continue
+			}
+			s.matchedKey = false
+		}
+
+		if b == key[s.matchIdx] {
+			s.matchIdx++
+			if s.matchIdx == len(key) {
 				s.matchIdx = 0
+				s.matchedKey = true
 			}
 			continue
 		}
-
-		// 失败回退：若当前字符可能是 pat[0]，则 matchIdx=1
-		if b == pat[0] {
+		if b == key[0] {
 			s.matchIdx = 1
 		} else {
 			s.matchIdx = 0

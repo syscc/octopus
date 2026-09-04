@@ -268,7 +268,10 @@ func responsesReplayStateToSticky(state *wsConversationState) *balancer.SessionE
 }
 
 func resetResponsesReplayStore() {
-	responsesReplayStore = sync.Map{}
+	responsesReplayStore.Range(func(key, value interface{}) bool {
+		responsesReplayStore.Delete(key)
+		return true
+	})
 	responsesReplayStoreStats.entries.Store(0)
 	responsesReplayStoreStats.totalSize.Store(0)
 }

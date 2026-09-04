@@ -26,10 +26,11 @@ const (
 type StreamEvent struct {
 	Kind StreamEventKind `json:"kind"`
 
-	ID    string `json:"id,omitempty"`
-	Model string `json:"model,omitempty"`
-	Index int    `json:"index,omitempty"`
-	Role  string `json:"role,omitempty"`
+	ID      string `json:"id,omitempty"`
+	Model   string `json:"model,omitempty"`
+	Created int64  `json:"created,omitempty"`
+	Index   int    `json:"index,omitempty"`
+	Role    string `json:"role,omitempty"`
 
 	ContentBlock *StreamContentBlock `json:"content_block,omitempty"`
 	Delta        *StreamDelta        `json:"delta,omitempty"`
@@ -63,15 +64,46 @@ type StreamDelta struct {
 	ProviderExtensions *ProviderExtensions `json:"provider_extensions,omitempty"`
 }
 
+// SplitStreamEventsAtTerminal keeps the payload prefix before the first wire
+// terminal. A real error wins over Done even when it appears later in the same
+// provider batch; content between Done and that error is discarded.
+func SplitStreamEventsAtTerminal(events []StreamEvent) (prefix []StreamEvent, errorEvent *StreamEvent, done bool) {
+	errorIndex := -1
+	doneIndex := -1
+	for index, event := range events {
+		if errorIndex < 0 && event.Kind == StreamEventKindError && event.Error != nil {
+			errorIndex = index
+		}
+		if doneIndex < 0 && event.Kind == StreamEventKindDone {
+			doneIndex = index
+		}
+	}
+	if errorIndex >= 0 {
+		cutoff := errorIndex
+		if doneIndex >= 0 && doneIndex < cutoff {
+			cutoff = doneIndex
+		}
+		error := events[errorIndex]
+		return events[:cutoff], &error, false
+	}
+	if doneIndex >= 0 {
+		return events[:doneIndex], nil, true
+	}
+	return events, nil, false
+}
+
 func StreamEventsFromInternalResponse(response *InternalLLMResponse) []StreamEvent {
 	if response == nil {
 		return nil
 	}
+	// A malformed provider response can carry both an error and a transport
+	// Done marker. The semantic error must win; otherwise adapters can commit a
+	// successful terminal and discard the failure evidence.
+	if response.Error != nil {
+		return []StreamEvent{{Kind: StreamEventKindError, ID: response.ID, Model: response.Model, Created: response.Created, Error: response.Error}}
+	}
 	if response.Object == "[DONE]" {
 		return []StreamEvent{{Kind: StreamEventKindDone}}
-	}
-	if response.Error != nil {
-		return []StreamEvent{{Kind: StreamEventKindError, ID: response.ID, Model: response.Model, Error: response.Error}}
 	}
 	events := make([]StreamEvent, 0, len(response.Choices)+1)
 	for _, choice := range response.Choices {
@@ -143,6 +175,9 @@ func StreamEventsFromInternalResponse(response *InternalLLMResponse) []StreamEve
 		}
 		events = append(events, event)
 	}
+	for index := range events {
+		events[index].Created = response.Created
+	}
 	return events
 }
 
@@ -152,15 +187,20 @@ func InternalResponseFromStreamEvents(events []StreamEvent) *InternalLLMResponse
 	}
 	response := &InternalLLMResponse{Object: "chat.completion.chunk"}
 	choices := make(map[int]*Choice)
+	hasPayloadEvent := false
 	for _, event := range events {
 		if event.Kind == StreamEventKindDone {
-			return &InternalLLMResponse{Object: "[DONE]"}
+			continue
 		}
+		hasPayloadEvent = true
 		if event.ID != "" {
 			response.ID = event.ID
 		}
 		if event.Model != "" {
 			response.Model = event.Model
+		}
+		if event.Created != 0 {
+			response.Created = event.Created
 		}
 		if event.Usage != nil {
 			response.Usage = event.Usage
@@ -227,6 +267,9 @@ func InternalResponseFromStreamEvents(events []StreamEvent) *InternalLLMResponse
 			}
 			choice.StopSequence = event.StopSequence
 		}
+	}
+	if !hasPayloadEvent {
+		return &InternalLLMResponse{Object: "[DONE]"}
 	}
 	indices := make([]int, 0, len(choices))
 	for idx := range choices {

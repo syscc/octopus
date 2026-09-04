@@ -85,9 +85,37 @@ func (m *RelayMetrics) SetWSRecovery(recovery model.RelayLogWSRecovery) {
 	m.WSRecovery = wsRecoveryPtr(recovery)
 }
 
+// ClearWSUsage 无条件清空由上一次 WS attempt 产生的 usage/费用字段。
+// WS passthrough/transform 在同一 relayRequest 上可能连续多次接触上游
+// （重拨、协议降级、候选渠道切换），失败 attempt 已写入的 usage 必须先
+// 清零，当前成功结果才不会被上一 attempt 的计量污染。
+func (m *RelayMetrics) ClearWSUsage() {
+	if m == nil {
+		return
+	}
+	m.Stats.InputToken = 0
+	m.Stats.OutputToken = 0
+	m.Stats.InputCost = 0
+	m.Stats.OutputCost = 0
+	m.BillInputTokens = nil
+	m.CacheReadTokens = nil
+	m.CacheWriteTokens = nil
+}
+
 func (m *RelayMetrics) SetInternalResponse(resp *transformerModel.InternalLLMResponse, actualModel string) {
 	m.InternalResponse = resp
 	m.ActualModel = actualModel
+
+	// 先重置可能被上一（失败）attempt 写入的 usage/费用字段，再应用当前
+	// response：同一 relayRequest 上的多次网络尝试共享 metrics，失败
+	// attempt 的 usage 不能污染后续成功但无 usage 的最终结果。
+	m.Stats.InputToken = 0
+	m.Stats.OutputToken = 0
+	m.Stats.InputCost = 0
+	m.Stats.OutputCost = 0
+	m.BillInputTokens = nil
+	m.CacheReadTokens = nil
+	m.CacheWriteTokens = nil
 
 	if resp == nil {
 		return

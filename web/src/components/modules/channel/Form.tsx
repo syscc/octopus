@@ -1,4 +1,4 @@
-import { ChannelType, type AutoGroupType, type Channel, type ChannelWSMode, useFetchModel } from '@/api/endpoints/channel';
+import { ChannelType, type AutoGroupType, type Channel, type ChannelWSMode, type OpenAIProtocolCapability, type OpenAIProtocolMode, type OpenAIProtocolProbeResult, isOpenAIChannelType, useFetchModel, useProbeOpenAIProtocol } from '@/api/endpoints/channel';
 import { ProxySelector } from '@/components/modules/proxy-pool/ProxySelector';
 import {
     Select,
@@ -15,12 +15,174 @@ import { toast } from '@/components/common/Toast';
 import { useTranslations } from 'next-intl';
 import { useEffect, useRef, useState } from 'react';
 import { RefreshCw, X, Plus } from 'lucide-react';
+import { cn } from '@/lib/utils';
 
 const OPENAI_CHANNEL_TYPE_VALUE = 'openai';
 
-function isOpenAIChannelType(type: ChannelType) {
-    return type === ChannelType.OpenAIChat || type === ChannelType.OpenAIResponse;
+/**
+ * Displays a Chat/Responses capability and can optionally act as the editable
+ * protocol selector used by the OpenAI channel form.
+ */
+export function ProtocolCapabilityIndicator({
+    capability,
+    endpoint,
+    checked,
+    editable = false,
+    disabled = false,
+    onCheckedChange,
+}: {
+    capability: OpenAIProtocolCapability;
+    endpoint: 'OpenAI Chat' | 'OpenAI Responses';
+    checked?: boolean;
+    editable?: boolean;
+    disabled?: boolean;
+    onCheckedChange?: (checked: boolean) => void;
+}) {
+    const t = useTranslations('channel.form');
+    const ref = useRef<HTMLInputElement>(null);
+    const isChecked = checked ?? capability === 'supported';
+
+    useEffect(() => {
+        if (ref.current) {
+            ref.current.indeterminate = !editable && capability === 'unknown';
+        }
+    }, [capability, editable]);
+
+    const input = (
+        <input
+            ref={ref}
+            type="checkbox"
+            checked={isChecked}
+            readOnly={!editable}
+            disabled={disabled}
+            aria-readonly={!editable}
+            aria-label={`${endpoint} ${t(protocolCapabilityLabelKey(capability))}`}
+            onChange={editable ? (event) => onCheckedChange?.(event.target.checked) : undefined}
+            onClick={!editable ? (event) => event.preventDefault() : undefined}
+            onKeyDown={!editable ? (event) => event.preventDefault() : undefined}
+            className={cn(
+                'size-4 shrink-0 rounded border-border bg-background accent-primary',
+                editable ? 'cursor-pointer' : 'pointer-events-none cursor-default',
+                disabled && 'cursor-not-allowed opacity-50',
+            )}
+        />
+    );
+
+    const content = (
+        <>
+            {input}
+            <span className="font-medium text-card-foreground">{endpoint}</span>
+            {t(protocolCapabilityLabelKey(capability))}
+        </>
+    );
+
+    return editable ? (
+        <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+            {content}
+        </label>
+    ) : (
+        <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            {content}
+        </span>
+    );
 }
+
+export type OpenAIProtocolProbeAction = (
+    channelId: number,
+    onProbed?: (result: OpenAIProtocolProbeResult) => void,
+    options?: { notify?: boolean },
+) => void;
+
+/**
+ * 显式重新探测已保存渠道的 OpenAI 协议能力，并统一处理 loading/成功/部分失败/失败提示。
+ * 请求仅携带渠道 ID，探测使用服务端权威配置；
+ * 提示只包含本地化 outcome，不透出响应中的密钥或上游原始错误。
+ */
+export function useOpenAIProtocolProbeAction() {
+    const t = useTranslations('channel.form');
+    const probe = useProbeOpenAIProtocol();
+
+    const probeOpenAIProtocol: OpenAIProtocolProbeAction = (
+        channelId,
+        onProbed,
+        options,
+    ) => {
+        if (!Number.isInteger(channelId) || channelId <= 0 || probe.isPending) return;
+        const notify = options?.notify ?? true;
+        probe.mutate(channelId, {
+            onSuccess: (result) => {
+                if (notify) {
+                    const hasChatEndpoint = result.endpoints.some((endpoint) => endpoint.endpoint === 'chat');
+                    const hasResponsesEndpoint = result.endpoints.some((endpoint) => endpoint.endpoint === 'responses');
+                    const incomplete = result.endpoints.length !== 2 || !hasChatEndpoint || !hasResponsesEndpoint;
+                    const failed = result.endpoints.filter((endpoint) => endpoint.outcome === 'failed');
+                    if (result.skipped) {
+                        // 后端明确跳过：这是有结论的正常状态，但不是一次成功的上游检查。
+                        toast.info(t('protocolProbeSkipped'));
+                    } else if (incomplete || failed.length > 0) {
+                        const detail = failed
+                            .map((endpoint) => `${endpoint.endpoint === 'chat' ? 'OpenAI Chat' : 'OpenAI Responses'}: ${t('protocolProbeEndpointFailed')}`);
+                        if (incomplete && detail.length === 0) {
+                            detail.push(t('protocolProbeEndpointFailed'));
+                        }
+                        toast.warning(t('protocolProbePartialFailed'), { description: detail.join('; ') });
+                    } else {
+                        toast.success(t('protocolProbeSuccess'));
+                    }
+                }
+                onProbed?.(result);
+            },
+            onError: () => {
+                // API hook 只记录安全错误；隐式探测不应打扰用户，显式探测才显示提示。
+                if (notify) toast.error(t('protocolProbeFailed'));
+            },
+        });
+    };
+
+    return { probeOpenAIProtocol, isPending: probe.isPending };
+}
+
+// i18n keys under the `channel.form` namespace
+export function protocolCapabilityLabelKey(capability: OpenAIProtocolCapability) {
+    switch (capability) {
+        case 'supported':
+            return 'capabilitySupported';
+        case 'unsupported':
+            return 'capabilityUnsupported';
+        default:
+            return 'capabilityUnknown';
+    }
+}
+
+// i18n key under the `channel.form` namespace
+export function protocolModeLabelKey(mode: OpenAIProtocolMode) {
+    switch (mode) {
+        case 'chat_only':
+            return 'protocolModeChatOnly';
+        case 'responses_only':
+            return 'protocolModeResponsesOnly';
+        case 'both':
+            return 'protocolModeBoth';
+        case 'auto':
+        default:
+            return 'protocolModeAuto';
+    }
+}
+
+export function protocolModeFromSelections(
+    chatSelected: boolean,
+    responsesSelected: boolean,
+): OpenAIProtocolMode | null {
+    // 两个都勾表示"允许两个协议，真实能力交给运行时探测"，也就是 auto。
+    // 绝不能返回 both：both 是手动模式，EffectiveOpenAIProtocolCapability 会
+    // 对两个协议都硬返回 supported，运行时学习的 SQL 也只认 auto，写成 both
+    // 会让上游真实不支持的那个协议永远学不到，每次请求都白试一次。
+    if (chatSelected && responsesSelected) return 'auto';
+    if (chatSelected) return 'chat_only';
+    if (responsesSelected) return 'responses_only';
+    return null;
+}
+
 
 export interface ChannelKeyFormItem {
     id?: number;
@@ -48,11 +210,14 @@ export interface ChannelFormData {
     auto_sync: boolean;
     auto_group: AutoGroupType;
     match_regex: string;
+    openai_protocol_mode: OpenAIProtocolMode;
+    openai_chat_capability: OpenAIProtocolCapability;
+    openai_responses_capability: OpenAIProtocolCapability;
 }
 
 export interface ChannelFormProps {
     formData: ChannelFormData;
-    onFormDataChange: (data: ChannelFormData) => void;
+    onFormDataChange: React.Dispatch<React.SetStateAction<ChannelFormData>>;
     onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
     isPending: boolean;
     submitText: string;
@@ -60,6 +225,12 @@ export interface ChannelFormProps {
     onCancel?: () => void;
     cancelText?: string;
     idPrefix?: string;
+    persistedOpenAIProtocolMode?: OpenAIProtocolMode;
+    /** 已保存渠道 ID；仅已保存渠道允许显式 re-probe，创建表单不开放探测入口 */
+    persistedChannelId?: number | null;
+    /** 父组件提供的共享探测动作；详情卡和编辑表单共用同一个 mutation */
+    probeOpenAIProtocol?: OpenAIProtocolProbeAction;
+    isOpenAIProtocolProbePending?: boolean;
 }
 
 import {
@@ -78,6 +249,10 @@ export function ChannelForm({
     pendingText,
     onCancel,
     cancelText,
+    persistedOpenAIProtocolMode,
+    persistedChannelId,
+    probeOpenAIProtocol,
+    isOpenAIProtocolProbePending = false,
     idPrefix = 'channel',
 }: ChannelFormProps) {
     const t = useTranslations('channel.form');
@@ -111,6 +286,74 @@ export function ChannelForm({
     );
 
     const isOpenAIChannel = isOpenAIChannelType(formData.type);
+
+    // Switching a persisted manual override back to auto resets learned
+    // capabilities on the server, so reflect that pending reset before save.
+    const returningToAuto =
+        (formData.openai_protocol_mode ?? 'auto') === 'auto' &&
+        (persistedOpenAIProtocolMode ?? formData.openai_protocol_mode ?? 'auto') !== 'auto';
+    const previewChatCapability: OpenAIProtocolCapability = returningToAuto
+        ? 'unknown'
+        : (formData.openai_chat_capability ?? 'unknown');
+    const previewResponsesCapability: OpenAIProtocolCapability = returningToAuto
+        ? 'unknown'
+        : (formData.openai_responses_capability ?? 'unknown');
+
+    // Manual mode is represented by the selected protocol checkboxes. The
+    // backend already persists the equivalent enum, so the capability columns
+    // remain server-owned observations.
+    const manualMode = formData.openai_protocol_mode ?? 'auto';
+    // 勾选状态：手动模式按模式本身决定；auto 模式下两个协议都允许，但被运行时
+    // 证伪（unsupported）的不勾——跟站点渠道页保持一致，界面上的勾就是
+    // "网关实测支持、或尚未证伪"的意思。历史遗留的 both 也走这条分支。
+    const selectedChatProtocol =
+        manualMode === 'chat_only'
+            ? true
+            : manualMode === 'responses_only'
+                ? false
+                : previewChatCapability !== 'unsupported';
+    const selectedResponsesProtocol =
+        manualMode === 'responses_only'
+            ? true
+            : manualMode === 'chat_only'
+                ? false
+                : previewResponsesCapability !== 'unsupported';
+
+    const handleProtocolSelection = (endpoint: 'chat' | 'responses', checked: boolean) => {
+        const nextChat = endpoint === 'chat' ? checked : selectedChatProtocol;
+        const nextResponses = endpoint === 'responses' ? checked : selectedResponsesProtocol;
+        const nextMode = protocolModeFromSelections(nextChat, nextResponses);
+        // 至少留一个协议。不弹 toast，静默忽略这次点击。
+        if (!nextMode) return;
+        onFormDataChange((previous) => ({
+            ...previous,
+            openai_protocol_mode: nextMode,
+        }));
+    };
+
+    // Explicit re-probe is available only for a saved OpenAI channel in auto mode.
+    const canProbeOpenAIProtocol =
+        isOpenAIChannel &&
+        !returningToAuto &&
+        (formData.openai_protocol_mode ?? 'auto') === 'auto' &&
+        typeof persistedChannelId === 'number' &&
+        persistedChannelId > 0 &&
+        probeOpenAIProtocol != null;
+
+    const handleProbeOpenAIProtocol = () => {
+        if (!canProbeOpenAIProtocol || persistedChannelId == null || !probeOpenAIProtocol) return;
+        probeOpenAIProtocol(persistedChannelId, (result) => {
+            // Update only the automatic preview; a manual choice made in flight remains authoritative.
+            onFormDataChange((prev) => {
+                if ((prev.openai_protocol_mode ?? 'auto') !== 'auto' || !isOpenAIChannelType(prev.type)) return prev;
+                return {
+                    ...prev,
+                    openai_chat_capability: result.chat,
+                    openai_responses_capability: result.responses,
+                };
+            });
+        });
+    };
 
     // Keep the last concrete OpenAI storage value while the user temporarily
     // inspects another provider. This lets an existing type=1 channel return
@@ -291,6 +534,45 @@ export function ChannelForm({
                     </Select>
                 </div>
             </div>
+
+            {isOpenAIChannel ? (
+                <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                        <label className="text-sm font-medium text-card-foreground">
+                            {t('protocolMode')}
+                        </label>
+                        {canProbeOpenAIProtocol ? (
+                            <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                onClick={handleProbeOpenAIProtocol}
+                                disabled={isOpenAIProtocolProbePending}
+                                className="h-6 px-2 text-xs text-muted-foreground/50 hover:text-muted-foreground hover:bg-transparent"
+                            >
+                                <RefreshCw className={cn('h-3 w-3 mr-1', isOpenAIProtocolProbePending && 'animate-spin')} />
+                                {isOpenAIProtocolProbePending ? t('protocolProbing') : t('protocolReprobe')}
+                            </Button>
+                        ) : null}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border border-border/70 bg-muted/20 px-3 py-2">
+                        <ProtocolCapabilityIndicator
+                            capability={previewChatCapability}
+                            endpoint="OpenAI Chat"
+                            checked={selectedChatProtocol}
+                            editable
+                            onCheckedChange={(checked) => handleProtocolSelection('chat', checked)}
+                        />
+                        <ProtocolCapabilityIndicator
+                            capability={previewResponsesCapability}
+                            endpoint="OpenAI Responses"
+                            checked={selectedResponsesProtocol}
+                            editable
+                            onCheckedChange={(checked) => handleProtocolSelection('responses', checked)}
+                        />
+                    </div>
+                </div>
+            ) : null}
 
             <div className="space-y-2">
                 <div className="flex items-center justify-between">

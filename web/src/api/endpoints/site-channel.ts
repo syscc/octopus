@@ -2,7 +2,10 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../client';
 import { logger } from '@/lib/logger';
 import type { SitePlatform } from './site';
-import type { AutoGroupType } from './channel';
+import type { AutoGroupType, OpenAIProtocolCapability } from './channel';
+
+// 站点渠道视图直接复用渠道层的能力枚举：协议能力是渠道级事实，站点侧只是回显。
+export type { OpenAIProtocolCapability };
 
 export type SiteModelRouteType =
     | 'unknown'
@@ -12,6 +15,11 @@ export type SiteModelRouteType =
     | 'gemini'
     | 'volcengine'
     | 'openai_embedding';
+
+// 后端只在渠道存在且是 OpenAI 文本类型时才带上能力字段，其余情况按未知处理。
+function normalizeProtocolCapability(value: unknown): OpenAIProtocolCapability {
+    return value === 'supported' || value === 'unsupported' ? value : 'unknown';
+}
 
 export type SiteModelRouteSource =
     | 'sync_inferred'
@@ -62,6 +70,13 @@ export type SiteChannelModel = {
     projected_channel_id?: number | null;
     route_metadata?: SiteModelRouteMetadata | null;
     history?: SiteModelHistorySummary | null;
+    // 协议勾选：false = 两个 OpenAI 文本协议都允许（真实能力交给运行时探测），
+    // true = 只允许 route_type 指定的那一个。
+    disable_protocol_fallback: boolean;
+    // 投影渠道当前学到的真实协议能力，用来把勾选渲染成
+    // 已验证支持 / 已验证不支持 / 未知。没有投影渠道时缺省。
+    openai_chat_capability?: OpenAIProtocolCapability;
+    openai_responses_capability?: OpenAIProtocolCapability;
 };
 
 export type SiteProjectedChannelSettings = {
@@ -226,6 +241,10 @@ function normalizeSiteModel(model: SiteChannelModelServer): SiteChannelModel {
         route_type: normalizeSiteModelRouteType(model.route_type),
         projected_channel_id: model.projected_channel_id ?? null,
         route_metadata: normalizeSiteModelRouteMetadata(model.route_metadata),
+        // 后端字段仍在演进：缺省按"允许两个协议"处理，与后端零值一致。
+        disable_protocol_fallback: model.disable_protocol_fallback ?? false,
+        openai_chat_capability: normalizeProtocolCapability(model.openai_chat_capability),
+        openai_responses_capability: normalizeProtocolCapability(model.openai_responses_capability),
         history: model.history
             ? {
                 success_count:
@@ -345,6 +364,8 @@ export type SiteModelRouteUpdateRequest = {
     model_name: string;
     route_type: SiteModelRouteType;
     route_raw_payload?: string;
+    // 省略该字段时后端保持原值；只勾一个协议时传 true 锁定单协议。
+    disable_protocol_fallback?: boolean;
 };
 
 export type SiteModelDisableUpdateRequest = {

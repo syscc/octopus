@@ -40,9 +40,27 @@ func isFirstTokenTimeout(ctx context.Context, err error) bool {
 	return errors.Is(context.Cause(ctx), errFirstTokenTimeout)
 }
 
+func hasDefinitiveUpstreamFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *upstreamHTTPError
+	if errors.As(err, &httpErr) && httpErr != nil {
+		return true
+	}
+	return hasIndependentWSTransportFailure(err) ||
+		hasIndependentUpstreamFailure(attemptResult{UpstreamErr: err})
+}
+
 func isClientCancellation(ctx context.Context, err error) bool {
 	if isLocalRelayBudgetExceeded(ctx, err) || isLocalRelayBudgetExceeded(ctx, contextError(ctx)) ||
 		isFirstTokenTimeout(ctx, err) || isFirstTokenTimeout(ctx, contextError(ctx)) {
+		return false
+	}
+	// A provider response or typed protocol terminal is independent evidence of
+	// upstream failure. It remains health-accountable when the client context is
+	// cancelled concurrently after that evidence has already been obtained.
+	if hasDefinitiveUpstreamFailure(err) {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

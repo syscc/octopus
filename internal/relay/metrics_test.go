@@ -3,6 +3,8 @@ package relay
 import (
 	"testing"
 
+	"github.com/bestruirui/octopus/internal/model"
+
 	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
 )
 
@@ -61,5 +63,45 @@ func TestSetInternalResponseNoFallbackWhenCacheOnly(t *testing.T) {
 
 	if m.Stats.InputToken != 0 {
 		t.Fatalf("input token: got %d want 0 (cache-only is reported input)", m.Stats.InputToken)
+	}
+}
+
+func TestSetInternalResponseClearsPreviousAttemptUsage(t *testing.T) {
+	m := &RelayMetrics{
+		BillInputTokens:  intPtr(17),
+		CacheReadTokens:  intPtr(11),
+		CacheWriteTokens: intPtr(7),
+	}
+	m.Stats.InputToken = 17
+	m.Stats.OutputToken = 13
+	m.Stats.InputCost = 1.25
+	m.Stats.OutputCost = 2.5
+
+	m.SetInternalResponse(&transformerModel.InternalLLMResponse{}, "test-model")
+
+	if m.Stats.InputToken != 0 || m.Stats.OutputToken != 0 || m.Stats.InputCost != 0 || m.Stats.OutputCost != 0 {
+		t.Fatalf("previous attempt usage leaked into the replacement response: %#v", m.Stats)
+	}
+	if m.BillInputTokens != nil || m.CacheReadTokens != nil || m.CacheWriteTokens != nil {
+		t.Fatalf("previous attempt billing details leaked: bill=%v read=%v write=%v", m.BillInputTokens, m.CacheReadTokens, m.CacheWriteTokens)
+	}
+}
+
+func TestSyncWSTransportMetricsClearsExecModeAfterHTTPDowngrade(t *testing.T) {
+	metrics := &RelayMetrics{UsedWS: true}
+	metrics.SetWSExecMode(model.RelayLogWSExecModePassthrough)
+	metrics.SetWSRecovery(model.RelayLogWSRecoveryDowngrade)
+	ra := &relayAttempt{
+		relayRequest:  &relayRequest{metrics: metrics},
+		attemptUsedWS: false,
+	}
+
+	ra.syncWSTransportMetrics()
+
+	if metrics.UsedWS || metrics.WSExecMode != nil {
+		t.Fatalf("HTTP downgrade must clear final WS transport markers: used=%t exec=%v", metrics.UsedWS, metrics.WSExecMode)
+	}
+	if metrics.WSRecovery == nil || *metrics.WSRecovery != model.RelayLogWSRecoveryDowngrade {
+		t.Fatalf("HTTP downgrade must preserve recovery reason, got %v", metrics.WSRecovery)
 	}
 }

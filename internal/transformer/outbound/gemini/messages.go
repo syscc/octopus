@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bestruirui/octopus/internal/transformer/model"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/bestruirui/octopus/internal/utils/xurl"
 	"github.com/samber/lo"
@@ -115,11 +115,16 @@ func (o *MessagesOutbound) TransformRequest(ctx context.Context, request *model.
 }
 
 func (o *MessagesOutbound) TransformResponse(ctx context.Context, response *http.Response) (*model.InternalLLMResponse, error) {
-	body, err := io.ReadAll(response.Body)
+	body, err := httpbody.ReadResponse(response)
 	if err != nil {
+		if response != nil && httpbody.IsErrorStatus(response.StatusCode) {
+			return nil, &model.ResponseError{StatusCode: response.StatusCode}
+		}
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
-
+	if httpbody.IsErrorStatus(response.StatusCode) {
+		return nil, &model.ResponseError{StatusCode: response.StatusCode}
+	}
 	if len(body) == 0 {
 		return nil, fmt.Errorf("response body is empty")
 	}

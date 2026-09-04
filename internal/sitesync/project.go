@@ -75,7 +75,7 @@ func ProjectAccount(ctx context.Context, accountID int) ([]int, error) {
 		}
 		item.GroupKey = groupKey
 		item.ModelName = name
-		if !siteModelBelongsToProjectedGroup(item, groupKey) {
+		if !siteModelBelongsToProjectedGroup(item, groupKey, siteRecord.Platform) {
 			continue
 		}
 		if strings.TrimSpace(string(item.RouteType)) == "" {
@@ -141,6 +141,9 @@ func ProjectAccount(ctx context.Context, accountID int) ([]int, error) {
 				AutoSync:      false,
 				AutoGroup:     model.AutoGroupTypeNone,
 				CustomHeader:  siteRecord.CustomHeader,
+				// 协议勾选来自站点模型，渠道只是它的承载体。auto（默认）让
+				// 渠道自己探测两个协议的真实能力；整桶都关掉降级时锁定单协议。
+				OpenAIProtocolMode: aggregateProjectedProtocolMode(routeType, bucketModels),
 			}
 
 			binding, exists := bindingMap[bindingKey]
@@ -166,6 +169,7 @@ func ProjectAccount(ctx context.Context, accountID int) ([]int, error) {
 				if err := db.GetDB().WithContext(ctx).Create(&binding).Error; err != nil {
 					return nil, fmt.Errorf("failed to create site channel binding: %w", err)
 				}
+				op.SiteChannelBindingCacheInvalidate()
 				bindingMap[bindingKey] = binding
 				bindingChannelByKey[bindingKey] = channelPayload.ID
 				managedChannelIDs = append(managedChannelIDs, channelPayload.ID)
@@ -180,6 +184,7 @@ func ProjectAccount(ctx context.Context, accountID int) ([]int, error) {
 				if err := db.GetDB().WithContext(ctx).Delete(&binding).Error; err != nil {
 					return nil, fmt.Errorf("failed to delete broken site channel binding: %w", err)
 				}
+				op.SiteChannelBindingCacheInvalidate()
 				if err := op.ChannelCreate(&channelPayload, ctx); err != nil {
 					return nil, fmt.Errorf("failed to recreate managed channel: %w", err)
 				}
@@ -192,6 +197,7 @@ func ProjectAccount(ctx context.Context, accountID int) ([]int, error) {
 				if err := db.GetDB().WithContext(ctx).Create(&binding).Error; err != nil {
 					return nil, fmt.Errorf("failed to recreate site channel binding: %w", err)
 				}
+				op.SiteChannelBindingCacheInvalidate()
 				bindingChannelByKey[bindingKey] = channelPayload.ID
 				managedChannelIDs = append(managedChannelIDs, channelPayload.ID)
 				if effective := op.EffectiveProjectedChannelAutoGroup(channelPayload); effective != model.AutoGroupTypeNone {
@@ -200,7 +206,7 @@ func ProjectAccount(ctx context.Context, accountID int) ([]int, error) {
 				continue
 			}
 
-			updateReq := &model.ChannelUpdateRequest{ID: existingChannel.ID, Name: &channelPayload.Name, Type: &channelPayload.Type, Enabled: &channelPayload.Enabled, BaseUrls: &channelPayload.BaseUrls, Model: &channelPayload.Model, CustomModel: &channelPayload.CustomModel, ProxyMode: &channelPayload.ProxyMode, ProxyConfigID: channelPayload.ProxyConfigID, AutoSync: &channelPayload.AutoSync, CustomHeader: &channelPayload.CustomHeader, BypassManagedCheck: true}
+			updateReq := &model.ChannelUpdateRequest{ID: existingChannel.ID, Name: &channelPayload.Name, Type: &channelPayload.Type, Enabled: &channelPayload.Enabled, BaseUrls: &channelPayload.BaseUrls, Model: &channelPayload.Model, CustomModel: &channelPayload.CustomModel, ProxyMode: &channelPayload.ProxyMode, ProxyConfigID: channelPayload.ProxyConfigID, AutoSync: &channelPayload.AutoSync, CustomHeader: &channelPayload.CustomHeader, OpenAIProtocolMode: &channelPayload.OpenAIProtocolMode, BypassManagedCheck: true}
 			updateReq.KeysToAdd, updateReq.KeysToUpdate, updateReq.KeysToDelete = diffManagedChannelKeys(existingChannel.Keys, channelPayload.Keys)
 			if _, err := op.ChannelUpdate(updateReq, ctx); err != nil {
 				return nil, fmt.Errorf("failed to update managed channel: %w", err)
@@ -214,6 +220,7 @@ func ProjectAccount(ctx context.Context, accountID int) ([]int, error) {
 			if err := db.GetDB().WithContext(ctx).Model(&model.SiteChannelBinding{}).Where("id = ?", binding.ID).Updates(updateBinding).Error; err != nil {
 				return nil, fmt.Errorf("failed to update site channel binding: %w", err)
 			}
+			op.SiteChannelBindingCacheInvalidate()
 			bindingChannelByKey[bindingKey] = existingChannel.ID
 			managedChannelIDs = append(managedChannelIDs, existingChannel.ID)
 			updatedChannel, err := op.ChannelGet(existingChannel.ID, ctx)
@@ -261,6 +268,7 @@ func ProjectAccount(ctx context.Context, accountID int) ([]int, error) {
 		if err := db.GetDB().WithContext(ctx).Delete(&binding).Error; err != nil {
 			return nil, fmt.Errorf("failed to delete stale site channel binding: %w", err)
 		}
+		op.SiteChannelBindingCacheInvalidate()
 	}
 
 	// POR 覆盖：本次同步可能把数据面已退役的渠道重新 enabled，按退役状态压回 disabled。
@@ -331,6 +339,7 @@ func updateSiteChannelBindingGroup(ctx context.Context, bindingID int, group mod
 	if err := db.GetDB().WithContext(ctx).Model(&model.SiteChannelBinding{}).Where("id = ?", bindingID).Updates(updates).Error; err != nil {
 		return fmt.Errorf("failed to update paused site channel binding: %w", err)
 	}
+	op.SiteChannelBindingCacheInvalidate()
 	return nil
 }
 
@@ -370,6 +379,9 @@ func reuseManagedChannelByName(ctx context.Context, siteRecord *model.Site, acco
 		if binding.SiteID != siteRecord.ID || binding.SiteAccountID != account.ID {
 			return nil, false, fmt.Errorf("managed channel name %q is already bound to another site account", channelPayload.Name)
 		}
+		if model.NormalizeSiteGroupKey(binding.GroupKey) != model.NormalizeSiteGroupKey(bindingKey) {
+			return nil, false, fmt.Errorf("managed channel name %q is already bound to another group", channelPayload.Name)
+		}
 		return binding, true, nil
 	}
 
@@ -385,6 +397,7 @@ func reuseManagedChannelByName(ctx context.Context, siteRecord *model.Site, acco
 	if err := db.GetDB().WithContext(ctx).Create(&reusedBinding).Error; err != nil {
 		return nil, false, fmt.Errorf("failed to bind existing channel %q as managed channel: %w", channelPayload.Name, err)
 	}
+	op.SiteChannelBindingCacheInvalidate()
 	return &reusedBinding, true, nil
 }
 
@@ -396,6 +409,9 @@ func buildProjectedChannelBaseURL(siteRecord *model.Site) string {
 	baseURL := strings.TrimRight(strings.TrimSpace(siteRecord.BaseURL), "/")
 	if baseURL == "" {
 		return ""
+	}
+	if siteRecord.Platform == model.SitePlatformCloudflare {
+		return cloudflareWorkersAIBaseURL(baseURL) + "/v1"
 	}
 	if strings.HasSuffix(strings.ToLower(baseURL), "/v1") {
 		return baseURL
@@ -417,18 +433,23 @@ func resolveProjectedChannelBaseURL(siteRecord *model.Site, routeType model.Site
 
 // isUsableSiteToken reports whether a token can produce a projected channel
 // key: it must be ready, unmasked, and carry a non-empty normalized value.
+// A value that only carries an "Bearer " scheme prefix is not usable, because
+// projection strips that prefix before building the channel key.
 func isUsableSiteToken(token model.SiteToken) bool {
 	if !model.IsReadySiteToken(token) || model.IsMaskedSiteTokenValue(token.Token) {
 		return false
 	}
-	return strings.TrimSpace(token.Token) != ""
+	return stripBearerPrefix(token.Token) != ""
 }
 
-// hasUsableToken reports whether at least one token would yield a channel key,
-// keeping projection activation aligned with buildChannelKeys.
+// hasUsableToken reports whether at least one enabled token would yield a
+// channel key, keeping projection activation aligned with the data plane: a
+// group whose tokens are all disabled must not project an enabled channel.
+// buildChannelKeys still emits disabled key rows (Enabled=false) for the
+// management view and key diffing.
 func hasUsableToken(tokens []model.SiteToken) bool {
 	for _, token := range tokens {
-		if isUsableSiteToken(token) {
+		if token.Enabled && isUsableSiteToken(token) {
 			return true
 		}
 	}
@@ -441,7 +462,11 @@ func buildChannelKeys(tokens []model.SiteToken, platform model.SitePlatform) []m
 		if !isUsableSiteToken(token) {
 			continue
 		}
-		normalized := model.NormalizeSiteSyncTokenValueForPlatform(platform, token.Token)
+		// Strip any "Bearer " prefix the operator pasted along with the
+		// credential before normalizing: outbound transformers always emit
+		// "Bearer "+key, so keeping it here would produce a double scheme,
+		// and the new-api family would otherwise get "sk-Bearer ...".
+		normalized := model.NormalizeSiteSyncTokenValueForPlatform(platform, stripBearerPrefix(token.Token))
 		keys = append(keys, model.ChannelKey{Enabled: token.Enabled, ChannelKey: normalized, Remark: model.NormalizeSiteGroupName(token.GroupKey, token.GroupName)})
 	}
 	return keys
@@ -595,6 +620,35 @@ func partitionSiteModelsByRouteType(items []model.SiteModel, split bool, site *m
 	return buckets
 }
 
+// aggregateProjectedProtocolMode 汇总一个投影桶内所有站点模型的协议选择，
+// 得出该桶对应渠道的 OpenAIProtocolMode。
+//
+// 协议模式是渠道级开关，而 UI 上的协议勾选是模型级的，所以同一个桶里出现
+// 分歧时取最宽松的一侧（auto）：宁可多给 relay 一次换协议的机会，也不要
+// 因为个别模型的手动限制把整桶模型锁死在单协议上。只有整桶模型都明确关掉
+// 降级时，渠道才被锁定为单协议手动模式。
+//
+// auto 是默认结果，也是两个协议都打勾的含义：渠道保留两个能力列，由运行时
+// 探测决定 Chat/Responses 各自的真实能力，relay 再按"同协议优先、必要时
+// 换协议"排序候选。非 OpenAI 文本路由不携带协议模式，一律保持 auto。
+func aggregateProjectedProtocolMode(routeType model.SiteModelRouteType, items []model.SiteModel) model.OpenAIProtocolMode {
+	if routeType != model.SiteModelRouteTypeOpenAIChat && routeType != model.SiteModelRouteTypeOpenAIResponse {
+		return model.OpenAIProtocolModeAuto
+	}
+	if len(items) == 0 {
+		return model.OpenAIProtocolModeAuto
+	}
+	for i := range items {
+		if !items[i].DisableProtocolFallback {
+			return model.OpenAIProtocolModeAuto
+		}
+	}
+	if routeType == model.SiteModelRouteTypeOpenAIResponse {
+		return model.OpenAIProtocolModeResponsesOnly
+	}
+	return model.OpenAIProtocolModeChatOnly
+}
+
 func compactSiteModels(items []model.SiteModel) []model.SiteModel {
 	if len(items) == 0 {
 		return nil
@@ -626,7 +680,10 @@ func extractSiteModelNames(items []model.SiteModel) []string {
 	return names
 }
 
-func siteModelBelongsToProjectedGroup(item model.SiteModel, groupKey string) bool {
+func siteModelBelongsToProjectedGroup(item model.SiteModel, groupKey string, platform model.SitePlatform) bool {
+	if platform == model.SitePlatformCloudflare {
+		return true
+	}
 	metadata, ok := model.ParseSiteModelRouteMetadata(item.RouteRawPayload)
 	if !ok || len(metadata.EnableGroups) == 0 {
 		return true
@@ -683,7 +740,7 @@ func rewriteManagedGroupItemsForAccount(ctx context.Context, siteRecord *model.S
 		if !ok || !isSiteGroupProjectionActive(siteRecord, account, group, tokenGroups[baseGroupKey]) {
 			continue
 		}
-		if !siteModelBelongsToProjectedGroup(item, baseGroupKey) {
+		if !siteModelBelongsToProjectedGroup(item, baseGroupKey, siteRecord.Platform) {
 			continue
 		}
 		item.GroupKey = baseGroupKey
@@ -766,6 +823,9 @@ func rewriteManagedGroupItemsForAccount(ctx context.Context, siteRecord *model.S
 func shouldSplitForAccount(account *model.SiteAccount, site *model.Site) bool {
 	// 防御性检查：确保不会因 nil 输入而 panic
 	if site == nil || account == nil {
+		return false
+	}
+	if site.Platform == model.SitePlatformCloudflare {
 		return false
 	}
 

@@ -95,7 +95,7 @@ func TestCreateAccountTokenCreatesManagedKeyAndSyncsAccount(t *testing.T) {
 		t.Fatalf("SiteAccountCreate failed: %v", err)
 	}
 
-	result, err := CreateAccountToken(ctx, account.ID, model.SiteChannelKeyCreateRequest{GroupKey: "vip", Name: "managed-created-name"})
+	result, err := CreateAccountToken(ctx, site.ID, account.ID, model.SiteChannelKeyCreateRequest{GroupKey: "vip", Name: "managed-created-name"})
 	if err != nil {
 		t.Fatalf("CreateAccountToken returned error: %v", err)
 	}
@@ -278,7 +278,7 @@ func TestCreateAccountTokenCreatesSub2APIKeyAndSyncsAccount(t *testing.T) {
 		t.Fatalf("SiteAccountCreate failed: %v", err)
 	}
 
-	result, err := CreateAccountToken(context.Background(), account.ID, model.SiteChannelKeyCreateRequest{
+	result, err := CreateAccountToken(context.Background(), site.ID, account.ID, model.SiteChannelKeyCreateRequest{
 		GroupKey: "7",
 		Name:     "manual-sub2api-name",
 	})

@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/bestruirui/octopus/internal/helper"
 	dbmodel "github.com/bestruirui/octopus/internal/model"
+	"github.com/bestruirui/octopus/internal/transformer/outbound"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/coder/websocket"
 )
@@ -34,6 +37,26 @@ const (
 	wsHealthStaleAfter  = 10 * time.Minute // 无失败多久后清理健康条目
 )
 
+// 上游 WS 单条消息的读上限与协议层 maxSSEEventSize 解耦：
+// coder/websocket 的 SetReadLimit 会对上限做 n++，极端配置值（如 MaxInt）
+// 会溢出成负数并被库当作“取消限制”，因此必须先钳制到独立硬上限。
+const (
+	wsUpstreamMaxReadLimitBytes     int64 = httpbody.MaxLLMResponseBodyBytes
+	wsUpstreamDefaultReadLimitBytes int64 = 32 * 1024 * 1024
+)
+
+// upstreamWSReadLimit 把配置的事件上限钳制为安全的 socket 读上限：
+// 非正值回落到安全默认，超过硬上限的值被截断，其余保持原值。
+func upstreamWSReadLimit(configured int) int64 {
+	if configured <= 0 {
+		return wsUpstreamDefaultReadLimitBytes
+	}
+	if int64(configured) > wsUpstreamMaxReadLimitBytes {
+		return wsUpstreamMaxReadLimitBytes
+	}
+	return int64(configured)
+}
+
 // wsUpstreamPool manages persistent WebSocket connections to upstream providers.
 var wsUpstreamPool = newWSPool()
 
@@ -50,6 +73,7 @@ type pooledConn struct {
 	lastUsed  time.Time
 	busy      bool
 	queue     int
+	retire    bool
 	poolKey   wsPoolKey
 }
 
@@ -79,6 +103,7 @@ type wsPool struct {
 	// inFlight tracks Dial calls in progress per poolKey so concurrent cold
 	// starts cannot exceed wsMaxConnsPerPoolKey.
 	inFlight map[wsPoolKey]int
+	pingConn func(context.Context, *websocket.Conn) error
 
 	// Track channels that don't support WS to avoid repeated attempts
 	unsupported   map[int]time.Time
@@ -94,8 +119,11 @@ type wsPool struct {
 
 func newWSPool() *wsPool {
 	p := &wsPool{
-		conns:       make(map[wsPoolKey]*wsPoolEntry),
-		inFlight:    make(map[wsPoolKey]int),
+		conns:    make(map[wsPoolKey]*wsPoolEntry),
+		inFlight: make(map[wsPoolKey]int),
+		pingConn: func(ctx context.Context, conn *websocket.Conn) error {
+			return conn.Ping(ctx)
+		},
 		unsupported: make(map[int]time.Time),
 		health:      make(map[int]*wsChannelHealth),
 		stopCh:      make(chan struct{}),
@@ -128,15 +156,25 @@ func (p *wsPool) GetPreferred(key wsPoolKey, preferredConnID string) *pooledConn
 	if preferredConnID != "" {
 		for _, pc := range entry.conns {
 			if pc != nil && pc.id == preferredConnID && !pc.busy {
-				if !p.preflightPreferredConnLocked(key, entry, pc, now) {
-					return nil
-				}
+				// Reserve the connection before preflight releases p.mu for Ping.
+				// Other acquisitions must never observe it as idle in that window.
 				pc.busy = true
 				pc.queue++
+				if !p.preflightPreferredConnLocked(key, entry, pc, now) {
+					pc.busy = false
+					if pc.queue > 0 {
+						pc.queue--
+					}
+					return nil
+				}
 				pc.lastUsed = now
 				return pc
 			}
 		}
+		// A continuation is connection-affine. If the preferred connection is
+		// busy or absent, let the caller wait/fail instead of borrowing another
+		// idle connection that does not own the previous_response_id.
+		return nil
 	}
 	var selected *pooledConn
 	for _, pc := range entry.conns {
@@ -162,24 +200,42 @@ func (p *wsPool) Put(pc *pooledConn) {
 		return
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	pc.busy = false
 	if pc.queue > 0 {
 		pc.queue--
 	}
 	pc.lastUsed = time.Now()
 	entry := p.conns[pc.poolKey]
+	if pc.retire || time.Since(pc.createdAt) > wsConnMaxAge {
+		if entry != nil {
+			for i, existing := range entry.conns {
+				if existing == pc || (existing != nil && existing.id == pc.id) {
+					entry.conns = append(entry.conns[:i], entry.conns[i+1:]...)
+					break
+				}
+			}
+			if len(entry.conns) == 0 {
+				delete(p.conns, pc.poolKey)
+			}
+		}
+		p.mu.Unlock()
+		if pc.conn != nil {
+			_ = pc.conn.Close(websocket.StatusGoingAway, "connection retired")
+		}
+		return
+	}
 	if entry == nil {
 		entry = &wsPoolEntry{}
 		p.conns[pc.poolKey] = entry
 	}
 	for _, existing := range entry.conns {
 		if existing == pc || (existing != nil && existing.id == pc.id) {
+			p.mu.Unlock()
 			return
 		}
 	}
 	entry.conns = append(entry.conns, pc)
+	p.mu.Unlock()
 }
 
 // Remove removes and closes all connections for a pool key.
@@ -230,6 +286,24 @@ func (p *wsPool) pooledConnCount(key wsPoolKey) int {
 	return count + p.inFlight[key]
 }
 
+func (p *wsPool) hasConnection(key wsPoolKey, connID string) bool {
+	if connID == "" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry := p.conns[key]
+	if entry == nil {
+		return false
+	}
+	for _, pc := range entry.conns {
+		if pc != nil && pc.id == connID {
+			return true
+		}
+	}
+	return false
+}
+
 // reserveDial atomically checks the per-key cap and increments the in-flight
 // counter. Returns true when a dial is allowed; the caller must invoke
 // releaseDial exactly once after the dial completes (success or failure).
@@ -266,12 +340,29 @@ func (p *wsPool) preflightPreferredConnLocked(key wsPoolKey, entry *wsPoolEntry,
 	}
 	p.mu.Unlock()
 	pingCtx, cancel := context.WithTimeout(context.Background(), wsHealthCheckTimeout)
-	err := pc.conn.Ping(pingCtx)
+	ping := p.pingConn
+	if ping == nil {
+		ping = func(ctx context.Context, conn *websocket.Conn) error { return conn.Ping(ctx) }
+	}
+	err := ping(pingCtx, pc.conn)
 	cancel()
 	p.mu.Lock()
-	if err == nil {
+	stillPooled := p.conns[key] == entry
+	if stillPooled {
+		stillPooled = false
+		for _, existing := range entry.conns {
+			if existing == pc || (existing != nil && existing.id == pc.id) {
+				stillPooled = true
+				break
+			}
+		}
+	}
+	if err == nil && stillPooled {
 		pc.lastUsed = time.Now()
 		return true
+	}
+	if !stillPooled {
+		return false
 	}
 	log.Debugf("upstream WS preferred connection preflight failed (channel=%d, key=%d, conn_id=%s): %v", key.channelID, key.keyID, pc.id, err)
 	if entry != nil {
@@ -299,7 +390,14 @@ func (p *wsPool) pruneExpiredLocked(key wsPoolKey, entry *wsPoolEntry, now time.
 			continue
 		}
 		if now.Sub(pc.createdAt) > wsConnMaxAge {
-			_ = pc.conn.Close(websocket.StatusGoingAway, "connection expired")
+			if pc.busy {
+				pc.retire = true
+				kept = append(kept, pc)
+				continue
+			}
+			if pc.conn != nil {
+				_ = pc.conn.Close(websocket.StatusGoingAway, "connection expired")
+			}
 			continue
 		}
 		kept = append(kept, pc)
@@ -361,6 +459,20 @@ func (p *wsPool) RecordWSFailure(channelID int) {
 	log.Debugf("ws health: channel %d failure #%d, backoff until %v", channelID, h.consecutiveFailures, h.skipUntil.Format(time.TimeOnly))
 }
 
+// recordWSFailureForRequest keeps ordinary client cancellation from degrading
+// the channel's WS transport health for later requests. Service-side relay
+// budgets and first-token timeouts remain transport failures and are recorded,
+// matching the shared cancellation classifier.
+func (p *wsPool) recordWSFailureForRequest(ctx context.Context, channelID int, failure error) {
+	if failure == nil {
+		failure = contextError(ctx)
+	}
+	if p == nil || isClientCancellation(ctx, failure) {
+		return
+	}
+	p.RecordWSFailure(channelID)
+}
+
 // RecordWSSuccess resets the failure counter for a channel after a successful WS stream.
 func (p *wsPool) RecordWSSuccess(channelID int) {
 	p.healthMu.Lock()
@@ -415,7 +527,7 @@ func (p *wsPool) Dial(ctx context.Context, key wsPoolKey, channel *dbmodel.Chann
 	}
 
 	// Set read limit high for large responses (e.g., image generation)
-	conn.SetReadLimit(int64(maxSSEEventSize))
+	conn.SetReadLimit(upstreamWSReadLimit(maxSSEEventSize))
 
 	pc := &pooledConn{
 		id:        nextWSConnID(),
@@ -449,30 +561,37 @@ func (p *wsPool) Dial(ctx context.Context, key wsPoolKey, channel *dbmodel.Chann
 
 func buildUpstreamWSHeaders(clientHeaders http.Header, channel *dbmodel.Channel, key string) http.Header {
 	headers := http.Header{}
-	for name, values := range clientHeaders {
-		if !shouldProxyUpstreamWSHeader(name) {
-			continue
-		}
-		for _, value := range values {
-			headers.Add(name, value)
-		}
+	entries := collectNormalizedHeaderEntries(clientHeaders, func(name string) bool {
+		return shouldProxyUpstreamWSHeader(name)
+	})
+	for _, entry := range entries {
+		setHeaderValuesCaseInsensitive(headers, entry.name, entry.values)
 	}
-	if values, ok := headers["User-Agent"]; !ok || len(values) == 0 {
-		headers.Set("User-Agent", "")
+	userAgent := headerValuesCaseInsensitive(headers, "User-Agent")
+	if len(userAgent) == 0 {
+		setHeaderValuesCaseInsensitive(headers, "User-Agent", []string{""})
 	} else {
-		headers["User-Agent"] = values[:1]
+		setHeaderValuesCaseInsensitive(headers, "User-Agent", userAgent[:1])
 	}
 	if channel != nil {
-		for _, header := range channel.CustomHeader {
-			if strings.TrimSpace(header.HeaderKey) == "" {
-				continue
-			}
-			headers.Set(header.HeaderKey, header.HeaderValue)
-		}
+		applySafeWSChannelHeaders(headers, channel.CustomHeader)
 	}
-	headers.Set("Authorization", "Bearer "+key)
-	headers.Set("OpenAI-Beta", "responses_websockets=2026-02-06")
+	applySelectedCredentialHeader(headers, outbound.OutboundTypeOpenAIResponse, key)
+	setHeaderValuesCaseInsensitive(headers, "OpenAI-Beta", []string{"responses_websockets=2026-02-06"})
 	return headers
+}
+
+func applySafeWSChannelHeaders(dst http.Header, headers []dbmodel.CustomHeader) {
+	if dst == nil {
+		return
+	}
+	for _, header := range headers {
+		name := strings.TrimSpace(header.HeaderKey)
+		if !shouldProxyUpstreamWSChannelHeader(name) {
+			continue
+		}
+		setHeaderValuesCaseInsensitive(dst, name, []string{header.HeaderValue})
+	}
 }
 
 func shouldProxyUpstreamWSHeader(name string) bool {
@@ -480,7 +599,21 @@ func shouldProxyUpstreamWSHeader(name string) bool {
 	if lowerName == "" {
 		return false
 	}
-	if hopByHopHeaders[lowerName] {
+	if isBlockedUpstreamHeader(lowerName) {
+		return false
+	}
+	if strings.HasPrefix(lowerName, "sec-websocket-") {
+		return false
+	}
+	return true
+}
+
+func shouldProxyUpstreamWSChannelHeader(name string) bool {
+	lowerName := strings.ToLower(strings.TrimSpace(name))
+	if lowerName == "" {
+		return false
+	}
+	if isBlockedChannelHeader(lowerName) {
 		return false
 	}
 	if strings.HasPrefix(lowerName, "sec-websocket-") {
@@ -497,15 +630,23 @@ func wsHeaderSignature(headers http.Header) string {
 	if len(headers) == 0 {
 		return ""
 	}
-	keys := make([]string, 0, len(headers))
-	for key := range headers {
-		keys = append(keys, strings.ToLower(key))
+	normalized := make(map[string][]string, len(headers))
+	for key, values := range headers {
+		name := strings.ToLower(strings.TrimSpace(key))
+		if name == "" {
+			continue
+		}
+		normalized[name] = append(normalized[name], values...)
+	}
+	keys := make([]string, 0, len(normalized))
+	for key := range normalized {
+		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 
 	var builder strings.Builder
 	for _, key := range keys {
-		values := append([]string(nil), headers.Values(key)...)
+		values := append([]string(nil), normalized[key]...)
 		sort.Strings(values)
 		builder.WriteString(key)
 		builder.WriteByte('=')
@@ -517,7 +658,8 @@ func wsHeaderSignature(headers http.Header) string {
 		}
 		builder.WriteByte('\n')
 	}
-	return builder.String()
+	digest := sha256.Sum256([]byte(builder.String()))
+	return fmt.Sprintf("%x", digest[:])
 }
 
 func cloneHTTPClientForWSDial(httpClient *http.Client) *http.Client {
@@ -660,7 +802,11 @@ func (p *wsPool) cleanup() {
 			if pc == nil {
 				continue
 			}
-			shouldClose := now.Sub(pc.createdAt) > wsConnMaxAge
+			expired := now.Sub(pc.createdAt) > wsConnMaxAge
+			if expired && pc.busy {
+				pc.retire = true
+			}
+			shouldClose := expired && !pc.busy
 			if !shouldClose && !pc.busy && now.Sub(pc.lastUsed) > wsConnIdleTimeout {
 				shouldClose = true
 			}
@@ -682,7 +828,9 @@ func (p *wsPool) cleanup() {
 	p.mu.Unlock()
 
 	for _, pc := range toClose {
-		_ = pc.conn.Close(websocket.StatusGoingAway, "cleanup")
+		if pc.conn != nil {
+			_ = pc.conn.Close(websocket.StatusGoingAway, "cleanup")
+		}
 	}
 
 	// Clean up old unsupported entries
@@ -752,13 +900,20 @@ func TryUpstreamWSWithPreference(ctx context.Context, channel *dbmodel.Channel, 
 
 	deadline := time.Now().Add(wsAcquireTimeout)
 	for {
+		waitingForPreferred := false
 		if !redial {
 			if pc := wsUpstreamPool.GetPreferred(poolKey, preferredConnID); pc != nil {
 				return pc
 			}
+			if preferredConnID != "" {
+				if !wsUpstreamPool.hasConnection(poolKey, preferredConnID) {
+					return nil
+				}
+				waitingForPreferred = true
+			}
 		}
 		redial = false
-		if wsUpstreamPool.reserveDial(poolKey) {
+		if !waitingForPreferred && wsUpstreamPool.reserveDial(poolKey) {
 			pc, unsupported, err := wsUpstreamPool.Dial(ctx, poolKey, channel, baseUrl, headers)
 			if err != nil {
 				if unsupported {
@@ -766,7 +921,7 @@ func TryUpstreamWSWithPreference(ctx context.Context, channel *dbmodel.Channel, 
 					wsUpstreamPool.MarkUnsupported(channel.ID)
 				} else {
 					log.Debugf("upstream WS dial failed for channel %d: %v", channel.ID, err)
-					wsUpstreamPool.RecordWSFailure(channel.ID)
+					wsUpstreamPool.recordWSFailureForRequest(ctx, channel.ID, err)
 				}
 				return nil
 			}

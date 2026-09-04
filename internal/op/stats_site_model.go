@@ -3,6 +3,7 @@ package op
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -37,6 +38,31 @@ type siteModelHourlyKey struct {
 
 var siteModelHourlyCache = make(map[siteModelHourlyKey]*model.StatsSiteModelHourly)
 var siteModelHourlyCacheLock sync.Mutex
+
+// siteModelHourlyPersistingBatch 是一次刷盘事务尚未结束期间暂存的内存快照。
+// 快照在锁下从 siteModelHourlyCache 摘除时登记，事务结束（提交成功注销或
+// 失败 restore）后移除；读取路径据此在"已出内存、事务未提交"的窗口里
+// 仍能合并这部分数据，避免瞬时少计。
+type siteModelHourlyPersistingBatch struct {
+	rows []model.StatsSiteModelHourly
+}
+
+var (
+	siteModelHourlyPersisting []*siteModelHourlyPersistingBatch
+	// siteModelHourlyPersistingVersion 在任一批次离开 persisting 列表时递增。
+	// 读取端用它检测 DB 查询期间是否有刷盘事务结束：若查询恰好跨越提交
+	// 时刻，DB 结果既不含该批次、快照也已注销，会造成少计；命中时重读。
+	siteModelHourlyPersistingVersion int
+)
+
+// siteModelHourlySavePauseHook 仅测试使用：在快照已登记、刷盘事务尚未开始时
+// 调用，用于确定性复现"读取落在刷盘窗口"的竞态。生产代码保持 nil。
+var siteModelHourlySavePauseHook func()
+
+// siteModelHourlyReadRetryLimit 限制读取端因刷盘结束事件重读 DB 的次数，
+// 防御刷盘被改成高频循环时的读取端活锁；超限后接受亚毫秒级残余窗口，
+// 该窗口只影响单次读取的展示值，不会持久化。
+const siteModelHourlyReadRetryLimit = 4
 
 // StatsSiteModelHourlyUpdate 记录一次站点渠道请求到对应小时桶。
 // 非站点渠道（无绑定）会被静默忽略。
@@ -110,6 +136,8 @@ func StatsSiteModelHourlyRecordAttempts(attempts []model.ChannelAttempt, fallbac
 	}
 }
 
+const statsSiteModelHourlyPersistBatchSize = 200
+
 // StatsSiteModelHourlySaveDB 把内存桶批量 upsert 入库。
 // 由 stats 后台任务调用。
 func StatsSiteModelHourlySaveDB(ctx context.Context) error {
@@ -123,25 +151,104 @@ func StatsSiteModelHourlySaveDB(ctx context.Context) error {
 		rows = append(rows, *entry)
 	}
 	siteModelHourlyCache = make(map[siteModelHourlyKey]*model.StatsSiteModelHourly)
+	// 登记为 persisting：事务结束前读取路径仍能合并这份快照，
+	// 请求路径与新样本继续写入上面换出的新 map，互不阻塞。
+	batch := &siteModelHourlyPersistingBatch{rows: rows}
+	siteModelHourlyPersisting = append(siteModelHourlyPersisting, batch)
 	siteModelHourlyCacheLock.Unlock()
 
+	if siteModelHourlySavePauseHook != nil {
+		siteModelHourlySavePauseHook()
+	}
+
 	dbConn := db.GetDB().WithContext(ctx)
-	return dbConn.Clauses(clause.OnConflict{
-		Columns: []clause.Column{
-			{Name: "hour"}, {Name: "site_account_id"}, {Name: "group_key"}, {Name: "model_name"},
-		},
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"date":            clause.Column{Name: "date"},
-			"input_token":     gorm.Expr("stats_site_model_hourlies.input_token + EXCLUDED.input_token"),
-			"output_token":    gorm.Expr("stats_site_model_hourlies.output_token + EXCLUDED.output_token"),
-			"input_cost":      gorm.Expr("stats_site_model_hourlies.input_cost + EXCLUDED.input_cost"),
-			"output_cost":     gorm.Expr("stats_site_model_hourlies.output_cost + EXCLUDED.output_cost"),
-			"wait_time":       gorm.Expr("stats_site_model_hourlies.wait_time + EXCLUDED.wait_time"),
-			"request_success": gorm.Expr("stats_site_model_hourlies.request_success + EXCLUDED.request_success"),
-			"request_failed":  gorm.Expr("stats_site_model_hourlies.request_failed + EXCLUDED.request_failed"),
-			"last_request_at": gorm.Expr("MAX(stats_site_model_hourlies.last_request_at, EXCLUDED.last_request_at)"),
-		}),
-	}).Create(&rows).Error
+	assignments := statsSiteModelHourlyUpsertAssignments(dbConn.Dialector.Name())
+	err := dbConn.Transaction(func(tx *gorm.DB) error {
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{
+				{Name: "hour"}, {Name: "site_account_id"}, {Name: "group_key"}, {Name: "model_name"},
+			},
+			DoUpdates: clause.Assignments(assignments),
+		}).CreateInBatches(&rows, statsSiteModelHourlyPersistBatchSize).Error
+	})
+
+	siteModelHourlyCacheLock.Lock()
+	removeSiteModelHourlyPersistingLocked(batch)
+	if err != nil {
+		// The snapshot was removed before the write to keep request updates fast.
+		// Restore it on failure, including samples recorded during the write.
+		restoreSiteModelHourlyCacheLocked(rows)
+	}
+	// 版本递增必须与批次移除在同一个锁段内，读取端才能据此判断
+	// DB 查询基线是否已过期。
+	siteModelHourlyPersistingVersion++
+	siteModelHourlyCacheLock.Unlock()
+	return err
+}
+
+// statsSiteModelHourlyUpsertAssignments returns dialect-correct references to
+// the incoming row. SQLite and PostgreSQL expose excluded.*, while MySQL uses
+// VALUES(column) in the supported ON DUPLICATE KEY UPDATE syntax.
+func statsSiteModelHourlyUpsertAssignments(dialect string) map[string]interface{} {
+	incoming := func(column string) string {
+		if dialect == "mysql" {
+			return "VALUES(" + column + ")"
+		}
+		return "excluded." + column
+	}
+	maxFunction := "MAX"
+	if dialect == "mysql" || dialect == "postgres" {
+		maxFunction = "GREATEST"
+	}
+	const table = "stats_site_model_hourlies"
+	add := func(column string) interface{} {
+		return gorm.Expr(fmt.Sprintf("%s.%s + %s", table, column, incoming(column)))
+	}
+	return map[string]interface{}{
+		"date":            gorm.Expr(incoming("date")),
+		"input_token":     add("input_token"),
+		"output_token":    add("output_token"),
+		"input_cost":      add("input_cost"),
+		"output_cost":     add("output_cost"),
+		"wait_time":       add("wait_time"),
+		"request_success": add("request_success"),
+		"request_failed":  add("request_failed"),
+		"last_request_at": gorm.Expr(fmt.Sprintf("%s(%s.last_request_at, %s)", maxFunction, table, incoming("last_request_at"))),
+	}
+}
+
+func restoreSiteModelHourlyCache(rows []model.StatsSiteModelHourly) {
+	siteModelHourlyCacheLock.Lock()
+	defer siteModelHourlyCacheLock.Unlock()
+	restoreSiteModelHourlyCacheLocked(rows)
+}
+
+// restoreSiteModelHourlyCacheLocked 把刷盘失败的快照合并回内存桶，
+// 调用方必须持有 siteModelHourlyCacheLock。
+func restoreSiteModelHourlyCacheLocked(rows []model.StatsSiteModelHourly) {
+	if len(rows) == 0 {
+		return
+	}
+	for _, row := range rows {
+		key := siteModelHourlyKey{
+			Hour:          row.Hour,
+			SiteAccountID: row.SiteAccountID,
+			GroupKey:      row.GroupKey,
+			ModelName:     row.ModelName,
+		}
+		if existing, ok := siteModelHourlyCache[key]; ok {
+			existing.StatsMetrics.Add(row.StatsMetrics)
+			if row.LastRequestAt > existing.LastRequestAt {
+				existing.LastRequestAt = row.LastRequestAt
+			}
+			if row.Date > existing.Date {
+				existing.Date = row.Date
+			}
+			continue
+		}
+		copyRow := row
+		siteModelHourlyCache[key] = &copyRow
+	}
 }
 
 const siteChannelModelHistoryWindow = 90 * 24 * time.Hour
@@ -182,23 +289,32 @@ func SiteChannelModelHourlyForAccounts(ctx context.Context, siteAccountIDs []int
 
 	minHour := int(time.Now().Add(-siteChannelModelHistoryWindow).Unix() / 3600)
 	var rows []model.StatsSiteModelHourly
-	if err := db.GetDB().WithContext(ctx).
-		Where("site_account_id IN ? AND hour >= ?", ids, minHour).
-		Order("site_account_id ASC").
-		Order("hour ASC").
-		Find(&rows).Error; err != nil {
-		return nil, err
-	}
+	var pending []model.StatsSiteModelHourly
+	for retry := 0; ; retry++ {
+		siteModelHourlyCacheLock.Lock()
+		versionBefore := siteModelHourlyPersistingVersion
+		siteModelHourlyCacheLock.Unlock()
 
-	// 合并尚未刷盘的内存桶。
-	siteModelHourlyCacheLock.Lock()
-	pending := make([]model.StatsSiteModelHourly, 0, len(siteModelHourlyCache))
-	for k, entry := range siteModelHourlyCache {
-		if _, ok := accountSet[k.SiteAccountID]; ok && k.Hour >= minHour {
-			pending = append(pending, *entry)
+		rows = nil
+		if err := db.GetDB().WithContext(ctx).
+			Where("site_account_id IN ? AND hour >= ?", ids, minHour).
+			Order("site_account_id ASC").
+			Order("hour ASC").
+			Find(&rows).Error; err != nil {
+			return nil, err
 		}
+
+		// 合并尚未刷盘的内存桶与刷盘事务尚未结束的快照。
+		siteModelHourlyCacheLock.Lock()
+		pending = collectSiteModelHourlyPendingLocked(accountSet, minHour)
+		stable := siteModelHourlyPersistingVersion == versionBefore
+		siteModelHourlyCacheLock.Unlock()
+		if stable || retry >= siteModelHourlyReadRetryLimit {
+			break
+		}
+		// DB 查询期间有刷盘事务结束（提交成功或失败 restore）：上面的查询
+		// 可能恰好跨越提交时刻，重读一次以对齐内存基线，避免少计或重复。
 	}
-	siteModelHourlyCacheLock.Unlock()
 
 	type compositeKey struct {
 		SiteAccountID int
@@ -265,6 +381,27 @@ func SiteChannelModelHourlyForAccounts(ctx context.Context, siteAccountIDs []int
 		}
 	}
 	return result, nil
+}
+
+// collectSiteModelHourlyPendingLocked 返回尚未落库的行：siteModelHourlyCache
+// 中的内存桶，以及刷盘事务尚未结束的 persisting 快照。提交成功或失败 restore
+// 后批次会被移除，因此不会与 DB 已提交数据重复合并。
+// 调用方必须持有 siteModelHourlyCacheLock。
+func collectSiteModelHourlyPendingLocked(accountSet map[int]struct{}, minHour int) []model.StatsSiteModelHourly {
+	pending := make([]model.StatsSiteModelHourly, 0, len(siteModelHourlyCache)+len(siteModelHourlyPersisting))
+	for k, entry := range siteModelHourlyCache {
+		if _, ok := accountSet[k.SiteAccountID]; ok && k.Hour >= minHour {
+			pending = append(pending, *entry)
+		}
+	}
+	for _, batch := range siteModelHourlyPersisting {
+		for _, row := range batch.rows {
+			if _, ok := accountSet[row.SiteAccountID]; ok && row.Hour >= minHour {
+				pending = append(pending, row)
+			}
+		}
+	}
+	return pending
 }
 
 // buildSiteModelSummary 把按时间排序的小时记录聚合为 SiteModelHistorySummary，
@@ -340,6 +477,17 @@ func chooseBucketSpan(spanSeconds int64) int {
 	}
 }
 
+// removeSiteModelHourlyPersistingLocked 按指针注销一个刷盘批次，
+// 调用方必须持有 siteModelHourlyCacheLock。
+func removeSiteModelHourlyPersistingLocked(batch *siteModelHourlyPersistingBatch) {
+	for i, b := range siteModelHourlyPersisting {
+		if b == batch {
+			siteModelHourlyPersisting = append(siteModelHourlyPersisting[:i], siteModelHourlyPersisting[i+1:]...)
+			return
+		}
+	}
+}
+
 // lookupChannelSiteBinding 查询并缓存 channelID → 站点绑定信息。
 func lookupChannelSiteBinding(channelID int) (channelSiteBinding, error) {
 	if cached, ok := siteBindingByChannelCache.Get(channelID); ok {
@@ -386,4 +534,10 @@ func deleteSiteModelHourlyCacheForAccounts(accountIDs []int) {
 // invalidateSiteBindingCache 在站点账号变更时清理映射缓存。
 func invalidateSiteBindingCache() {
 	siteBindingByChannelCache.Clear()
+}
+
+// SiteChannelBindingCacheInvalidate clears the channel-to-site binding cache
+// after an external projection component commits a binding change.
+func SiteChannelBindingCacheInvalidate() {
+	invalidateSiteBindingCache()
 }

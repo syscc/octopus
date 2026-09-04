@@ -18,15 +18,17 @@ import (
 	"github.com/samber/lo"
 
 	"github.com/bestruirui/octopus/internal/transformer/model"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 )
 
 // ResponseOutbound implements the Outbound interface for OpenAI Responses API.
 type ResponseOutbound struct {
 	// Stream state tracking
-	streamID    string
-	streamModel string
-	initialized bool
-	outputItems map[int]ResponsesItem
+	streamID      string
+	streamModel   string
+	streamCreated int64
+	initialized   bool
+	outputItems   map[int]ResponsesItem
 	// toolCallIndexes maps a Responses output_index to a dense 0-based
 	// tool_calls index: output_index counts all output items (reasoning,
 	// message, function_call), so function calls may start above 0, while
@@ -130,17 +132,181 @@ func (o *ResponseOutbound) TransformRequestRaw(ctx context.Context, rawBody []by
 	return req, nil
 }
 
+// rewriteRawResponsesRequestModel replaces only top-level model string values while
+// preserving every other byte in the original JSON document. Requests reaching this
+// path have already passed the inbound validator, but the scanner still rejects
+// malformed JSON and non-string top-level model values instead of silently reshaping
+// the payload through map[string]any.
 func rewriteRawResponsesRequestModel(rawBody []byte, modelName string) ([]byte, error) {
-	var payload map[string]any
-	if err := json.Unmarshal(rawBody, &payload); err != nil {
-		return nil, fmt.Errorf("failed to decode raw responses request: %w", err)
-	}
-	payload["model"] = strings.TrimSpace(modelName)
-	rewrittenBody, err := json.Marshal(payload)
+	modelName = strings.TrimSpace(modelName)
+	encoded, err := json.Marshal(modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to encode raw responses request: %w", err)
+		return nil, fmt.Errorf("failed to encode model value: %w", err)
 	}
-	return rewrittenBody, nil
+
+	spans, objectEnd, objectEmpty, err := findTopLevelStringFieldSpans(rawBody, "model")
+	if err != nil {
+		return nil, err
+	}
+	if len(spans) == 0 {
+		if objectEmpty {
+			return insertRawJSON(rawBody, objectEnd, encoded), nil
+		}
+		withField := make([]byte, 0, len(rawBody)+len(encoded)+len(`,"model":`))
+		withField = append(withField, rawBody[:objectEnd]...)
+		withField = append(withField, `,"model":`...)
+		withField = append(withField, encoded...)
+		withField = append(withField, rawBody[objectEnd:]...)
+		return withField, nil
+	}
+
+	// Replace from right to left so all duplicate top-level model keys resolve to
+	// the selected upstream model without changing offsets for earlier spans.
+	rewritten := append([]byte(nil), rawBody...)
+	for index := len(spans) - 1; index >= 0; index-- {
+		span := spans[index]
+		rewritten = replaceRawJSON(rewritten, span.start, span.end, encoded)
+	}
+	return rewritten, nil
+}
+
+type rawJSONSpan struct {
+	start int
+	end   int
+}
+
+// findTopLevelStringFieldSpans scans one JSON object and returns the value spans
+// for every top-level field with the requested name. Nested objects/arrays and
+// escaped strings are skipped without decoding or re-encoding their contents.
+func findTopLevelStringFieldSpans(raw []byte, field string) ([]rawJSONSpan, int, bool, error) {
+	index := skipJSONWhitespace(raw, 0)
+	if index >= len(raw) || raw[index] != '{' {
+		return nil, 0, false, fmt.Errorf("failed to decode raw responses request: top-level JSON value must be an object")
+	}
+	index++
+	objectEmpty := true
+	var spans []rawJSONSpan
+
+	for {
+		index = skipJSONWhitespace(raw, index)
+		if index >= len(raw) {
+			return nil, 0, false, fmt.Errorf("failed to decode raw responses request: unterminated object")
+		}
+		if raw[index] == '}' {
+			if trailing := skipJSONWhitespace(raw, index+1); trailing != len(raw) {
+				return nil, 0, false, fmt.Errorf("failed to decode raw responses request: trailing JSON data")
+			}
+			return spans, index, objectEmpty, nil
+		}
+		objectEmpty = false
+
+		keyStart := index
+		keyEnd, err := scanJSONString(raw, keyStart)
+		if err != nil {
+			return nil, 0, false, fmt.Errorf("failed to decode raw responses request: invalid object key: %w", err)
+		}
+		var key string
+		if err := json.Unmarshal(raw[keyStart:keyEnd], &key); err != nil {
+			return nil, 0, false, fmt.Errorf("failed to decode raw responses request: invalid object key: %w", err)
+		}
+
+		index = skipJSONWhitespace(raw, keyEnd)
+		if index >= len(raw) || raw[index] != ':' {
+			return nil, 0, false, fmt.Errorf("failed to decode raw responses request: object key is missing a colon")
+		}
+		valueStart := skipJSONWhitespace(raw, index+1)
+		valueEnd, err := scanJSONValue(raw, valueStart)
+		if err != nil {
+			return nil, 0, false, fmt.Errorf("failed to decode raw responses request: invalid value for %q: %w", key, err)
+		}
+		if key == field {
+			if raw[valueStart] != '"' {
+				return nil, 0, false, fmt.Errorf("responses model must be a string")
+			}
+			spans = append(spans, rawJSONSpan{start: valueStart, end: valueEnd})
+		}
+
+		index = skipJSONWhitespace(raw, valueEnd)
+		if index >= len(raw) {
+			return nil, 0, false, fmt.Errorf("failed to decode raw responses request: unterminated object")
+		}
+		switch raw[index] {
+		case ',':
+			index = skipJSONWhitespace(raw, index+1)
+			if index >= len(raw) || raw[index] == '}' {
+				return nil, 0, false, fmt.Errorf("failed to decode raw responses request: trailing comma")
+			}
+		case '}':
+			if trailing := skipJSONWhitespace(raw, index+1); trailing != len(raw) {
+				return nil, 0, false, fmt.Errorf("failed to decode raw responses request: trailing JSON data")
+			}
+			return spans, index, objectEmpty, nil
+		default:
+			return nil, 0, false, fmt.Errorf("failed to decode raw responses request: expected comma or closing brace")
+		}
+	}
+}
+
+func skipJSONWhitespace(raw []byte, index int) int {
+	for index < len(raw) {
+		switch raw[index] {
+		case ' ', '\t', '\r', '\n':
+			index++
+		default:
+			return index
+		}
+	}
+	return index
+}
+
+func scanJSONString(raw []byte, start int) (int, error) {
+	if start >= len(raw) || raw[start] != '"' {
+		return 0, fmt.Errorf("expected string")
+	}
+	for index := start + 1; index < len(raw); index++ {
+		switch raw[index] {
+		case '\\':
+			index++
+			if index >= len(raw) {
+				return 0, fmt.Errorf("unterminated escape")
+			}
+		case '"':
+			return index + 1, nil
+		case '\n', '\r':
+			return 0, fmt.Errorf("unescaped line break")
+		}
+	}
+	return 0, fmt.Errorf("unterminated string")
+}
+
+func scanJSONValue(raw []byte, start int) (int, error) {
+	if start >= len(raw) {
+		return 0, fmt.Errorf("missing value")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw[start:]))
+	decoder.UseNumber()
+	var value json.RawMessage
+	if err := decoder.Decode(&value); err != nil {
+		return 0, err
+	}
+	return start + int(decoder.InputOffset()), nil
+}
+
+func replaceRawJSON(raw []byte, start, end int, replacement []byte) []byte {
+	result := make([]byte, 0, len(raw)-(end-start)+len(replacement))
+	result = append(result, raw[:start]...)
+	result = append(result, replacement...)
+	result = append(result, raw[end:]...)
+	return result
+}
+
+func insertRawJSON(raw []byte, index int, value []byte) []byte {
+	result := make([]byte, 0, len(raw)+len(value))
+	result = append(result, raw[:index]...)
+	result = append(result, `"model":`...)
+	result = append(result, value...)
+	result = append(result, raw[index:]...)
+	return result
 }
 
 func (o *ResponseOutbound) TransformResponse(ctx context.Context, response *http.Response) (*model.InternalLLMResponse, error) {
@@ -148,35 +314,40 @@ func (o *ResponseOutbound) TransformResponse(ctx context.Context, response *http
 		return nil, fmt.Errorf("response is nil")
 	}
 
-	body, err := io.ReadAll(response.Body)
+	body, err := httpbody.ReadResponse(response)
 	if err != nil {
+		if httpbody.IsErrorStatus(response.StatusCode) {
+			return nil, &model.ResponseError{StatusCode: response.StatusCode}
+		}
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	if len(body) == 0 {
-		return nil, fmt.Errorf("response body is empty")
-	}
-
-	// Check for error response
-	if response.StatusCode >= 400 {
+	if httpbody.IsErrorStatus(response.StatusCode) {
 		var errResp struct {
 			Error model.ErrorDetail `json:"error"`
 		}
 		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error.Message != "" {
-			return nil, &model.ResponseError{
-				StatusCode: response.StatusCode,
-				Detail:     errResp.Error,
-			}
+			return nil, &model.ResponseError{StatusCode: response.StatusCode, Detail: errResp.Error}
 		}
-		return nil, fmt.Errorf("HTTP error %d: %s", response.StatusCode, string(body))
+		return nil, &model.ResponseError{StatusCode: response.StatusCode}
+	}
+	if len(body) == 0 {
+		return nil, fmt.Errorf("response body is empty")
 	}
 
 	var resp ResponsesResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal responses api response: %w", err)
 	}
+	if resp.Status != nil && strings.EqualFold(strings.TrimSpace(*resp.Status), "failed") {
+		detail := model.ErrorDetail{Type: "upstream_error"}
+		if resp.Error != nil {
+			detail.Code = string(resp.Error.Code)
+			detail.Message = resp.Error.Message
+		}
+		return nil, &model.ResponseError{StatusCode: http.StatusBadGateway, Detail: detail}
+	}
 
-	// Convert to internal response
 	return convertToLLMResponseFromResponses(&resp), nil
 }
 
@@ -206,10 +377,13 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 		if streamEvent.Response.Model != "" {
 			o.streamModel = streamEvent.Response.Model
 		}
+		if streamEvent.Response.CreatedAt != 0 {
+			o.streamCreated = streamEvent.Response.CreatedAt
+		}
 	}
 
 	var events []model.StreamEvent
-	base := model.StreamEvent{ID: o.streamID, Model: o.streamModel, Index: 0}
+	base := model.StreamEvent{ID: o.streamID, Model: o.streamModel, Created: o.streamCreated, Index: 0}
 
 	switch streamEvent.Type {
 	case "response.created", "response.in_progress":
@@ -275,8 +449,10 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 			}
 			finishReason, respErr := normalizeResponsesFinishReason(streamEvent.Response.Status, streamEvent.Response.Error)
 			if respErr != nil {
+				events = append(events, model.StreamEvent{Kind: model.StreamEventKindMessageStop, ID: base.ID, Model: base.Model, Index: base.Index, StopReason: model.FinishReasonStop, ProviderExtensions: base.ProviderExtensions})
 				events = append(events, model.StreamEvent{Kind: model.StreamEventKindError, ID: base.ID, Model: base.Model, Error: respErr})
-				return events, nil
+				events = append(events, model.StreamEvent{Kind: model.StreamEventKindDone})
+				return o.attachStreamCreated(events), nil
 			}
 			if finishReason != nil && *finishReason == "stop" && o.responseCarriesFunctionCall(streamEvent.Response) {
 				finishReason = lo.ToPtr("tool_calls")
@@ -288,6 +464,7 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 				usageEvent := model.StreamEvent{Kind: model.StreamEventKindUsageDelta, ID: base.ID, Model: base.Model, Usage: usage, ProviderExtensions: base.ProviderExtensions}
 				events = append(events, usageEvent)
 			}
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindDone})
 		}
 
 	case "response.failed", "response.incomplete", "error":
@@ -302,28 +479,38 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 		if streamEvent.Response != nil && streamEvent.Response.Error != nil {
 			respErr = &model.ResponseError{
 				Detail: model.ErrorDetail{
-					Code:    fmt.Sprintf("%d", streamEvent.Response.Error.Code),
+					Code:    string(streamEvent.Response.Error.Code),
 					Message: streamEvent.Response.Error.Message,
 				},
 			}
 		} else if streamEvent.Code != "" || streamEvent.Message != "" {
 			respErr = &model.ResponseError{
 				Detail: model.ErrorDetail{
-					Code:    streamEvent.Code,
+					Code:    string(streamEvent.Code),
 					Message: streamEvent.Message,
 				},
 			}
 		}
+		events = append(events, model.StreamEvent{Kind: model.StreamEventKindMessageStop, ID: base.ID, Model: base.Model, Index: base.Index, StopReason: model.ParseFinishReason(lo.FromPtr(reason))})
 		if respErr != nil {
 			events = append(events, model.StreamEvent{Kind: model.StreamEventKindError, ID: base.ID, Model: base.Model, Error: respErr})
 		}
-		events = append(events, model.StreamEvent{Kind: model.StreamEventKindMessageStop, ID: base.ID, Model: base.Model, Index: base.Index, StopReason: model.ParseFinishReason(lo.FromPtr(reason))})
+		events = append(events, model.StreamEvent{Kind: model.StreamEventKindDone})
 
 	default:
 		return nil, nil
 	}
 
-	return events, nil
+	return o.attachStreamCreated(events), nil
+}
+
+func (o *ResponseOutbound) attachStreamCreated(events []model.StreamEvent) []model.StreamEvent {
+	for index := range events {
+		if events[index].Created == 0 {
+			events[index].Created = o.streamCreated
+		}
+	}
+	return events
 }
 
 func (o *ResponseOutbound) TransformStream(ctx context.Context, eventData []byte) (*model.InternalLLMResponse, error) {
@@ -331,7 +518,26 @@ func (o *ResponseOutbound) TransformStream(ctx context.Context, eventData []byte
 	if err != nil {
 		return nil, err
 	}
-	return model.InternalResponseFromStreamEvents(events), nil
+	if len(events) == 0 {
+		return nil, nil
+	}
+
+	projected := make([]model.StreamEvent, 0, len(events))
+	hasDone := false
+	for _, event := range events {
+		if event.Kind == model.StreamEventKindDone {
+			hasDone = true
+			continue
+		}
+		projected = append(projected, event)
+	}
+	if response := model.InternalResponseFromStreamEvents(projected); response != nil {
+		return response, nil
+	}
+	if hasDone {
+		return &model.InternalLLMResponse{Object: "[DONE]"}, nil
+	}
+	return nil, nil
 }
 
 // ResponsesRequest represents the OpenAI Responses API request format.
@@ -534,9 +740,40 @@ type ResponsesUsage struct {
 	TotalTokens int64 `json:"total_tokens"`
 }
 
+// ResponsesErrorCode accepts both the numeric codes emitted by some
+// OpenAI-compatible upstreams and the string codes used by the Responses API.
+// The internal representation is always the original textual code.
+type ResponsesErrorCode string
+
+func (c *ResponsesErrorCode) UnmarshalJSON(data []byte) error {
+	if c == nil {
+		return fmt.Errorf("cannot unmarshal Responses error code into nil receiver")
+	}
+	trimmed := bytes.TrimSpace(data)
+	if bytes.Equal(trimmed, []byte("null")) {
+		*c = ""
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(trimmed, &text); err == nil {
+		*c = ResponsesErrorCode(text)
+		return nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(trimmed, &number); err == nil {
+		*c = ResponsesErrorCode(number.String())
+		return nil
+	}
+	return fmt.Errorf("Responses error code must be a string or number")
+}
+
+func (c ResponsesErrorCode) MarshalJSON() ([]byte, error) {
+	return json.Marshal(string(c))
+}
+
 type ResponsesError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    ResponsesErrorCode `json:"code,omitempty"`
+	Message string             `json:"message"`
 }
 
 type ResponsesStreamEvent struct {
@@ -553,7 +790,7 @@ type ResponsesStreamEvent struct {
 	CallID         string             `json:"call_id,omitempty"`
 	Arguments      string             `json:"arguments,omitempty"`
 	SummaryIndex   *int               `json:"summary_index,omitempty"`
-	Code           string             `json:"code,omitempty"`
+	Code           ResponsesErrorCode `json:"code,omitempty"`
 	Message        string             `json:"message,omitempty"`
 }
 
@@ -1847,10 +2084,10 @@ func firstNonEmpty(values ...string) string {
 // with O-M1.
 func normalizeResponsesFinishReason(status *string, errDetail *ResponsesError) (*string, *model.ResponseError) {
 	var respErr *model.ResponseError
-	if errDetail != nil && (errDetail.Message != "" || errDetail.Code != 0) {
+	if errDetail != nil && (errDetail.Message != "" || errDetail.Code != "") {
 		respErr = &model.ResponseError{
 			Detail: model.ErrorDetail{
-				Code:    fmt.Sprintf("%d", errDetail.Code),
+				Code:    string(errDetail.Code),
 				Message: errDetail.Message,
 			},
 		}
@@ -1943,6 +2180,17 @@ func (o *ResponseOutbound) PassthroughConfig() model.PassthroughConfig {
 			"response.failed":     {},
 			"response.incomplete": {},
 			"error":               {},
+		},
+		FailureEvents: map[string]struct{}{
+			"response.failed": {},
+			"error":           {},
+		},
+		IncompleteEvents: map[string]struct{}{
+			"response.incomplete": {},
+		},
+		CancelledEvents: map[string]struct{}{
+			"response.cancelled": {},
+			"response.canceled":  {},
 		},
 		CollectMetrics: false, // OpenAI Responses uses different metrics semantics
 	}

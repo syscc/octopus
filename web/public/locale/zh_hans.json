@@ -832,7 +832,8 @@
                 "tokens": "Token 使用",
                 "costs": "成本详情",
                 "baseUrls": "Base URLs",
-                "keys": "密钥"
+                "keys": "密钥",
+                "protocol": "OpenAI 协议"
             },
             "noBaseUrls": "暂无 Base URL",
             "noKeys": "暂无密钥",
@@ -853,6 +854,7 @@
                 "cancel": "取消",
                 "save": "保存",
                 "saving": "保存中...",
+                "saveFailed": "保存失败",
                 "delete": "删除",
                 "confirmDelete": "确认删除",
                 "deleting": "删除中..."
@@ -861,7 +863,8 @@
         "create": {
             "dialogTitle": "创建新渠道",
             "submit": "创建渠道",
-            "submitting": "创建中..."
+            "submitting": "创建中...",
+            "submitFailed": "创建失败"
         },
         "form": {
             "add": "添加",
@@ -912,6 +915,24 @@
             "wsModeOff": "关闭",
             "matchRegex": "匹配正则",
             "matchRegexPlaceholder": "可选：用于匹配请求模型名称的正则表达式",
+            "protocolMode": "OpenAI 协议模式",
+            "protocolModeAuto": "自动探测",
+            "protocolModeChatOnly": "仅 Chat Completions",
+            "protocolModeResponsesOnly": "仅 Responses",
+            "protocolModeBoth": "两者均支持",
+            "protocolModeManualHint": "当前选择将作为手动模式保存；切回自动探测后，后续探测结果才会生效。",
+            "protocolAtLeastOne": "至少选择一种 OpenAI 协议。",
+            "capabilityUnknown": "待探测",
+            "capabilitySupported": "已支持",
+            "capabilityUnsupported": "不支持",
+            "protocolReprobe": "重新探测",
+            "protocolProbing": "探测中...",
+            "protocolProbeSuccess": "协议探测完成",
+            "protocolProbeSkipped": "协议探测已跳过",
+            "protocolProbePartialFailed": "协议探测部分失败",
+            "protocolProbeFailed": "协议探测失败",
+            "protocolProbeEndpointFailed": "探测失败",
+            "protocolAutoHint": "服务端探测结果用于初始化选择；修改勾选项后将切换为持久化的手动模式。",
             "remark": "备注"
         }
     },

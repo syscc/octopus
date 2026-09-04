@@ -92,6 +92,7 @@ const PLATFORM_LABELS: Record<SitePlatform, string> = {
     [SitePlatform.OneHub]: 'One Hub',
     [SitePlatform.DoneHub]: 'Done Hub',
     [SitePlatform.Sub2API]: 'Sub2API',
+    [SitePlatform.Cloudflare]: 'Cloudflare Workers AI',
 };
 
 function createEmptySiteForm(): SiteFormState {
@@ -114,6 +115,7 @@ function createEmptySiteForm(): SiteFormState {
 }
 
 function createSiteForm(site: SiteRecord): SiteFormState {
+    const isCloudflare = site.platform === SitePlatform.Cloudflare;
     return {
         name: site.name,
         platform: site.platform,
@@ -121,16 +123,36 @@ function createSiteForm(site: SiteRecord): SiteFormState {
         enabled: site.enabled,
         proxy_mode: site.proxy_mode ?? 'direct',
         proxy_config_id: site.proxy_config_id ?? null,
-        external_checkin_url: site.external_checkin_url ?? '',
+        external_checkin_url: isCloudflare ? '' : (site.external_checkin_url ?? ''),
         is_pinned: site.is_pinned,
         sort_order: site.sort_order,
         global_weight: site.global_weight,
         custom_header: site.custom_header.length > 0
             ? site.custom_header.map((item) => ({ ...item }))
             : [{ header_key: '', header_value: '' }],
-        route_base_urls: (site.route_base_urls ?? []).map((item) => ({ ...item })),
+        route_base_urls: isCloudflare
+            ? []
+            : (site.route_base_urls ?? []).map((item) => ({ ...item })),
         tags: [...(site.tags ?? [])],
-        default_route_type: site.default_route_type || 'openai_chat',
+        default_route_type: isCloudflare
+            ? 'openai_chat'
+            : (site.default_route_type || 'openai_chat'),
+    };
+}
+
+function applySitePlatform(
+    form: SiteFormState,
+    platform: SitePlatform | '',
+): SiteFormState {
+    const next = { ...form, platform };
+    if (platform !== SitePlatform.Cloudflare) {
+        return next;
+    }
+    return {
+        ...next,
+        external_checkin_url: '',
+        route_base_urls: [],
+        default_route_type: 'openai_chat',
     };
 }
 
@@ -239,14 +261,21 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                     const detected = await detectPlatform.mutateAsync(
                         siteForm.base_url.trim(),
                     );
-                    platform = detected.platform as SitePlatform;
+                    const detectedPlatform = detected.platform as SitePlatform;
+                    platform = detectedPlatform;
                     if (detected.default_route_type) {
                         defaultRouteType = detected.default_route_type;
-                        setSiteForm((current) => ({
-                            ...current,
-                            default_route_type: detected.default_route_type!,
-                        }));
                     }
+                    setSiteForm((current) =>
+                        applySitePlatform(
+                            {
+                                ...current,
+                                default_route_type:
+                                    detected.default_route_type ?? current.default_route_type,
+                            },
+                            detectedPlatform,
+                        ),
+                    );
                     toast.success(
                         `自动检测到平台：${PLATFORM_LABELS[platform] ?? platform}`,
                     );
@@ -269,7 +298,10 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                 return;
             }
 
-            const routeBaseURLs = trimRouteBaseURLs(siteForm.route_base_urls);
+            const isCloudflare = platform === SitePlatform.Cloudflare;
+            const routeBaseURLs = isCloudflare
+                ? []
+                : trimRouteBaseURLs(siteForm.route_base_urls);
             const invalidRouteBaseURL = routeBaseURLs.find(
                 (item) => !item.route_type || !item.base_url,
             );
@@ -301,7 +333,8 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                 proxy_mode: siteForm.proxy_mode,
                 proxy_config_id:
                     siteForm.proxy_mode === 'pool' ? siteForm.proxy_config_id : null,
-                external_checkin_url: siteForm.external_checkin_url.trim() || null,
+                external_checkin_url:
+                    isCloudflare ? null : (siteForm.external_checkin_url.trim() || null),
                 is_pinned: siteForm.is_pinned,
                 sort_order: siteForm.sort_order,
                 global_weight: siteForm.global_weight,
@@ -309,7 +342,11 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                 route_base_urls: routeBaseURLs,
                 tags: siteForm.tags,
                 default_route_type:
-                    platform === SitePlatform.API ? defaultRouteType : undefined,
+                    platform === SitePlatform.Cloudflare
+                        ? 'openai_chat'
+                        : platform === SitePlatform.API
+                            ? defaultRouteType
+                            : undefined,
             };
 
             try {
@@ -391,15 +428,14 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                                 <span className="font-medium">平台类型</span>
                                 <Select
                                     value={siteForm.platform || AUTO_DETECT_VALUE}
-                                    onValueChange={(value) =>
-                                        setSiteForm((current) => ({
-                                            ...current,
-                                            platform:
-                                                value === AUTO_DETECT_VALUE
-                                                    ? ''
-                                                    : (value as SitePlatform),
-                                        }))
-                                    }
+                                    onValueChange={(value) => {
+                                        const platform = value === AUTO_DETECT_VALUE
+                                            ? ''
+                                            : (value as SitePlatform);
+                                        setSiteForm((current) =>
+                                            applySitePlatform(current, platform),
+                                        );
+                                    }}
                                 >
                                     <SelectTrigger className="w-full rounded-xl">
                                         <SelectValue placeholder="自动检测" />
@@ -428,9 +464,16 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                                         base_url: event.target.value,
                                     }))
                                 }
-                                placeholder="https://example.com"
+                                placeholder={siteForm.platform === SitePlatform.Cloudflare
+                                    ? 'https://api.cloudflare.com/client/v4/accounts/{account_id}/ai'
+                                    : 'https://example.com'}
                                 className="rounded-xl"
                             />
+                            {siteForm.platform === SitePlatform.Cloudflare && (
+                                <span className="text-xs text-muted-foreground">
+                                    Cloudflare Workers AI 使用 OpenAI Chat 兼容路由；站点地址需包含 Account ID。
+                                </span>
+                            )}
                         </label>
 
                         {siteForm.platform === SitePlatform.API && (
@@ -481,23 +524,25 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                             </div>
                         )}
 
-                        <label className="grid gap-2 text-sm">
-                            <span className="font-medium">手动签到 URL</span>
-                            <Input
-                                value={siteForm.external_checkin_url}
-                                onChange={(event) =>
-                                    setSiteForm((current) => ({
-                                        ...current,
-                                        external_checkin_url: event.target.value,
-                                    }))
-                                }
-                                placeholder="可选：例如 https://example.com/signin"
-                                className="rounded-xl"
-                            />
-                            <span className="text-xs text-muted-foreground">
-                                配置后可在站点总览中一键打开此页面进行手动签到。
-                            </span>
-                        </label>
+                        {siteForm.platform !== SitePlatform.Cloudflare ? (
+                            <label className="grid gap-2 text-sm">
+                                <span className="font-medium">手动签到 URL</span>
+                                <Input
+                                    value={siteForm.external_checkin_url}
+                                    onChange={(event) =>
+                                        setSiteForm((current) => ({
+                                            ...current,
+                                            external_checkin_url: event.target.value,
+                                        }))
+                                    }
+                                    placeholder="可选：例如 https://example.com/signin"
+                                    className="rounded-xl"
+                                />
+                                <span className="text-xs text-muted-foreground">
+                                    配置后可在站点总览中一键打开此页面进行手动签到。
+                                </span>
+                            </label>
+                        ) : null}
 
                         <label className="grid gap-2 text-sm">
                             <span className="font-medium">标签</span>
@@ -627,98 +672,100 @@ export function SiteEditDialog({ open, onOpenChange, site, onCreated, allTags }:
                                             ))}
                                         </div>
                                     </div>
-                                    <div className="space-y-2">
-                                        <div className="flex items-center justify-between">
-                                            <label className="text-sm font-medium text-card-foreground">
-                                                协议路径覆盖 {siteForm.route_base_urls.length > 0 ? `(${siteForm.route_base_urls.length})` : ''}
-                                            </label>
-                                            <Button
-                                                type="button"
-                                                variant="ghost"
-                                                size="sm"
-                                                onClick={() =>
-                                                    setSiteForm((current) => ({
-                                                        ...current,
-                                                        route_base_urls: [
-                                                            ...current.route_base_urls,
-                                                            { route_type: '', base_url: '' },
-                                                        ],
-                                                    }))
-                                                }
-                                                className="h-6 px-2 text-xs text-muted-foreground/70 hover:bg-transparent hover:text-muted-foreground"
-                                            >
-                                                <Plus className="mr-1 h-3 w-3" />
-                                                添加
-                                            </Button>
-                                        </div>
-                                        <p className="text-xs text-muted-foreground/70">
-                                            按协议覆盖请求地址，例如 Anthropic 填 https://example.com/anthropic/v1，留空则用站点地址默认推断。
-                                        </p>
+                                    {siteForm.platform !== SitePlatform.Cloudflare && (
                                         <div className="space-y-2">
-                                            {siteForm.route_base_urls.map((item, index) => (
-                                                <div key={`site-route-${index}`} className="flex items-center gap-2">
-                                                    <Select
-                                                        value={item.route_type}
-                                                        onValueChange={(value) =>
-                                                            setSiteForm((current) => ({
-                                                                ...current,
-                                                                route_base_urls: current.route_base_urls.map(
-                                                                    (route, routeIndex) =>
-                                                                        routeIndex === index
-                                                                            ? { ...route, route_type: value }
-                                                                            : route,
-                                                                ),
-                                                            }))
-                                                        }
-                                                    >
-                                                        <SelectTrigger className="w-40 rounded-xl">
-                                                            <SelectValue placeholder="协议类型" />
-                                                        </SelectTrigger>
-                                                        <SelectContent>
-                                                            {ROUTE_BASE_URL_OPTIONS.map((option) => (
-                                                                <SelectItem key={option.value} value={option.value}>
-                                                                    {option.label}
-                                                                </SelectItem>
-                                                            ))}
-                                                        </SelectContent>
-                                                    </Select>
-                                                    <Input
-                                                        value={item.base_url}
-                                                        onChange={(event) =>
-                                                            setSiteForm((current) => ({
-                                                                ...current,
-                                                                route_base_urls: current.route_base_urls.map(
-                                                                    (route, routeIndex) =>
-                                                                        routeIndex === index
-                                                                            ? { ...route, base_url: event.target.value }
-                                                                            : route,
-                                                                ),
-                                                            }))
-                                                        }
-                                                        placeholder="https://example.com/anthropic/v1"
-                                                        className="flex-1 rounded-xl"
-                                                    />
-                                                    <Button
-                                                        type="button"
-                                                        variant="ghost"
-                                                        size="sm"
-                                                        onClick={() =>
-                                                            setSiteForm((current) => ({
-                                                                ...current,
-                                                                route_base_urls: current.route_base_urls.filter(
-                                                                    (_, routeIndex) => routeIndex !== index,
-                                                                ),
-                                                            }))
-                                                        }
-                                                        className="h-8 w-8 rounded-xl p-0 text-muted-foreground hover:bg-transparent hover:text-destructive disabled:opacity-40"
-                                                        title="Remove"
-                                                    >
-                                                        <X className="h-4 w-4" />
-                                                    </Button>
-                                                </div>
-                                            ))}
+                                            <div className="flex items-center justify-between">
+                                                <label className="text-sm font-medium text-card-foreground">
+                                                    协议路径覆盖 {siteForm.route_base_urls.length > 0 ? `(${siteForm.route_base_urls.length})` : ''}
+                                                </label>
+                                                <Button
+                                                    type="button"
+                                                    variant="ghost"
+                                                    size="sm"
+                                                    onClick={() =>
+                                                        setSiteForm((current) => ({
+                                                            ...current,
+                                                            route_base_urls: [
+                                                                ...current.route_base_urls,
+                                                                { route_type: '', base_url: '' },
+                                                            ],
+                                                        }))
+                                                    }
+                                                    className="h-6 px-2 text-xs text-muted-foreground/70 hover:bg-transparent hover:text-muted-foreground"
+                                                >
+                                                    <Plus className="mr-1 h-3 w-3" />
+                                                    添加
+                                                </Button>
+                                            </div>
+                                            <p className="text-xs text-muted-foreground/70">
+                                                按协议覆盖请求地址，例如 Anthropic 填 https://example.com/anthropic/v1，留空则用站点地址默认推断。
+                                            </p>
+                                            <div className="space-y-2">
+                                                {siteForm.route_base_urls.map((item, index) => (
+                                                    <div key={`site-route-${index}`} className="flex items-center gap-2">
+                                                        <Select
+                                                            value={item.route_type}
+                                                            onValueChange={(value) =>
+                                                                setSiteForm((current) => ({
+                                                                    ...current,
+                                                                    route_base_urls: current.route_base_urls.map(
+                                                                        (route, routeIndex) =>
+                                                                            routeIndex === index
+                                                                                ? { ...route, route_type: value }
+                                                                                : route,
+                                                                    ),
+                                                                }))
+                                                            }
+                                                        >
+                                                            <SelectTrigger className="w-40 rounded-xl">
+                                                                <SelectValue placeholder="协议类型" />
+                                                            </SelectTrigger>
+                                                            <SelectContent>
+                                                                {ROUTE_BASE_URL_OPTIONS.map((option) => (
+                                                                    <SelectItem key={option.value} value={option.value}>
+                                                                        {option.label}
+                                                                    </SelectItem>
+                                                                ))}
+                                                            </SelectContent>
+                                                        </Select>
+                                                        <Input
+                                                            value={item.base_url}
+                                                            onChange={(event) =>
+                                                                setSiteForm((current) => ({
+                                                                    ...current,
+                                                                    route_base_urls: current.route_base_urls.map(
+                                                                        (route, routeIndex) =>
+                                                                            routeIndex === index
+                                                                                ? { ...route, base_url: event.target.value }
+                                                                                : route,
+                                                                    ),
+                                                                }))
+                                                            }
+                                                            placeholder="https://example.com/anthropic/v1"
+                                                            className="flex-1 rounded-xl"
+                                                        />
+                                                        <Button
+                                                            type="button"
+                                                            variant="ghost"
+                                                            size="sm"
+                                                            onClick={() =>
+                                                                setSiteForm((current) => ({
+                                                                    ...current,
+                                                                    route_base_urls: current.route_base_urls.filter(
+                                                                        (_, routeIndex) => routeIndex !== index,
+                                                                    ),
+                                                                }))
+                                                            }
+                                                            className="h-8 w-8 rounded-xl p-0 text-muted-foreground hover:bg-transparent hover:text-destructive disabled:opacity-40"
+                                                            title="Remove"
+                                                        >
+                                                            <X className="h-4 w-4" />
+                                                        </Button>
+                                                    </div>
+                                                ))}
+                                            </div>
                                         </div>
-                                    </div>
+                                    )}
                                 </AccordionContent>
                             </AccordionItem>
                         </Accordion>

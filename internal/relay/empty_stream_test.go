@@ -104,6 +104,54 @@ func TestHandleStreamResponseWithPayloadSucceeds(t *testing.T) {
 	}
 }
 
+func TestHandleChatTransformCleanEOFIsIncomplete(t *testing.T) {
+	ra, recorder := newEmptyStreamTestAttempt(t, inbound.InboundTypeOpenAIChat, transformerModel.APIFormatOpenAIChatCompletion, outbound.OutboundTypeOpenAIChat)
+	body := strings.Join([]string{
+		`data: {"id":"chat_partial","object":"chat.completion.chunk","model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"}}]}`,
+		"",
+	}, "\n")
+
+	err := ra.handleStreamResponseV2(context.Background(), sseTestResponse(body))
+	if !errors.Is(err, transformerModel.ErrIncompleteUpstreamStream) {
+		t.Fatalf("clean EOF error = %v, want ErrIncompleteUpstreamStream", err)
+	}
+	output := recorder.Body.String()
+	if !strings.Contains(output, "partial") || strings.Count(output, "data: [DONE]") != 1 {
+		t.Fatalf("expected visible prefix and one Chat terminator, got %q", output)
+	}
+	if ra.passthroughOutcome != transformerModel.PassthroughTerminalOutcomeIncomplete {
+		t.Fatalf("terminal outcome = %q, want incomplete", ra.passthroughOutcome)
+	}
+}
+
+func TestHandleAnthropicTransformCleanEOFIsIncomplete(t *testing.T) {
+	ra, recorder := newEmptyStreamTestAttempt(t, inbound.InboundTypeAnthropic, transformerModel.APIFormatAnthropicMessage, outbound.OutboundTypeOpenAIChat)
+	body := strings.Join([]string{
+		`data: {"id":"chat_partial","object":"chat.completion.chunk","model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"}}]}`,
+		"",
+	}, "\n")
+
+	err := ra.handleStreamResponseV2(context.Background(), sseTestResponse(body))
+	if !errors.Is(err, transformerModel.ErrIncompleteUpstreamStream) {
+		t.Fatalf("clean EOF error = %v, want ErrIncompleteUpstreamStream", err)
+	}
+	output := recorder.Body.String()
+	if !strings.Contains(output, "partial") || strings.Count(output, "event:message_stop") != 1 {
+		t.Fatalf("expected visible prefix and one Anthropic terminator, got %q", output)
+	}
+	terminalStart := strings.Index(output, "event:message_delta")
+	if terminalStart < 0 {
+		t.Fatalf("missing Anthropic terminal delta: %q", output)
+	}
+	terminal := output[terminalStart:]
+	if strings.Contains(terminal, `"stop_reason"`) || strings.Contains(terminal, `"usage"`) {
+		t.Fatalf("incomplete terminal fabricated stop reason or usage: %q", terminal)
+	}
+	if ra.passthroughOutcome != transformerModel.PassthroughTerminalOutcomeIncomplete {
+		t.Fatalf("terminal outcome = %q, want incomplete", ra.passthroughOutcome)
+	}
+}
+
 func TestPassthroughOpenAIResponsesEmptyStreamFails(t *testing.T) {
 	ra, _ := newEmptyStreamTestAttempt(t, inbound.InboundTypeOpenAIResponse, transformerModel.APIFormatOpenAIResponse, outbound.OutboundTypeOpenAIResponse)
 

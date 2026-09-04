@@ -158,6 +158,10 @@ func (h *earlyHeartbeat) HeaderWritten() bool {
 	return h.headerSet.Load()
 }
 
+func (h *earlyHeartbeat) NeedsRestart() bool {
+	return h != nil && h.handed.Load() && !h.stopped.Load()
+}
+
 func (h *earlyHeartbeat) WriteSSEError(statusCode int, message string) {
 	if h == nil || h.c == nil {
 		return
@@ -175,9 +179,34 @@ func (h *earlyHeartbeat) WriteSSEError(statusCode int, message string) {
 }
 
 func (h *earlyHeartbeat) FlushOrError(c *gin.Context, statusCode int, message string) {
-	if h != nil && h.HeaderWritten() {
-		h.WriteSSEError(statusCode, message)
+	// Freeze the early-heartbeat goroutine before inspecting Gin's writer.
+	// responseWriter.Written is not safe to read while another goroutine is
+	// flushing headers, and the decision between JSON and SSE must be atomic.
+	if h != nil {
+		h.Hand()
+	}
+	committed := h != nil && h.HeaderWritten()
+	if c != nil && c.Writer != nil && c.Writer.Written() {
+		committed = true
+	}
+	if committed {
+		if h != nil {
+			h.WriteSSEError(statusCode, message)
+			return
+		}
+		writeSSEError(c, statusCode, message)
 		return
 	}
 	resp.Error(c, statusCode, message)
+}
+
+func writeSSEError(c *gin.Context, statusCode int, message string) {
+	if c == nil || c.Writer == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{"code": statusCode, "message": message})
+	_, _ = c.Writer.Write([]byte("event: error\ndata: "))
+	_, _ = c.Writer.Write(payload)
+	_, _ = c.Writer.Write([]byte("\n\n"))
+	c.Writer.Flush()
 }

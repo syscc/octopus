@@ -28,6 +28,144 @@ export enum AutoGroupType {
 
 export type ChannelWSMode = 'inherit' | 'off' | 'passthrough' | 'transform';
 
+/**
+ * OpenAI 协议能力手动覆盖模式（与后端 model.OpenAIProtocolMode 对齐）
+ */
+export type OpenAIProtocolMode = 'auto' | 'chat_only' | 'responses_only' | 'both';
+
+/**
+ * OpenAI 协议自动探测状态（与后端 model.OpenAIProtocolCapability 对齐）
+ */
+export type OpenAIProtocolCapability = 'unknown' | 'supported' | 'unsupported';
+
+/**
+ * 是否为 OpenAI 协议渠道（Chat / Responses）
+ */
+export function isOpenAIChannelType(type: ChannelType) {
+    return type === ChannelType.OpenAIChat || type === ChannelType.OpenAIResponse;
+}
+
+/**
+ * 计算渠道当前生效的 Chat/Responses 协议能力。
+ * auto 模式返回后端探测结果（unknown 表示尚未探测）；
+ * 手动覆盖模式返回该模式下的有效结果，而非可能过期的自动探测字段。
+ */
+export function effectiveOpenAIProtocolCapabilities(
+    channel: Pick<Channel, 'type' | 'openai_protocol_mode' | 'openai_chat_capability' | 'openai_responses_capability'>,
+): { chat: OpenAIProtocolCapability; responses: OpenAIProtocolCapability } {
+    if (!isOpenAIChannelType(channel.type)) {
+        return { chat: 'unsupported', responses: 'unsupported' };
+    }
+    switch (channel.openai_protocol_mode ?? 'auto') {
+        case 'chat_only':
+            return { chat: 'supported', responses: 'unsupported' };
+        case 'responses_only':
+            return { chat: 'unsupported', responses: 'supported' };
+        case 'both':
+            return { chat: 'supported', responses: 'supported' };
+        case 'auto':
+        default:
+            return {
+                chat: channel.openai_chat_capability ?? 'unknown',
+                responses: channel.openai_responses_capability ?? 'unknown',
+            };
+    }
+}
+
+/**
+ * 主动协议探测请求：仅携带已保存渠道 ID，探测使用服务端权威配置（密钥不出服务端）。
+ */
+export type ProbeOpenAIProtocolRequest = {
+    id: number;
+};
+
+export type OpenAIProtocolProbeEndpoint = 'chat' | 'responses';
+
+export type OpenAIProtocolProbeOutcome = 'probed' | 'skipped' | 'failed';
+
+/**
+ * 单个端点（chat / responses）的安全摘要结果；UI 只展示本地化 outcome，
+ * status/message 仅作信息保留，不透出到界面，避免泄露上游原始错误。
+ */
+export type OpenAIProtocolProbeEndpointResult = {
+    endpoint: OpenAIProtocolProbeEndpoint;
+    /** 探测前已记录的能力 */
+    current: OpenAIProtocolCapability;
+    /** 本次探测观测到的能力 */
+    observed: OpenAIProtocolCapability;
+    /** 探测后记录/生效的能力 */
+    capability: OpenAIProtocolCapability;
+    outcome: OpenAIProtocolProbeOutcome;
+    status: number | null;
+    message: string | null;
+};
+
+export type OpenAIProtocolProbeResult = {
+    channel_id: number;
+    mode: OpenAIProtocolMode;
+    chat: OpenAIProtocolCapability;
+    responses: OpenAIProtocolCapability;
+    skipped: boolean;
+    endpoints: OpenAIProtocolProbeEndpointResult[];
+};
+
+// 后端 probe 响应结构仍在演进：字段全部按可选处理并做安全默认。
+type OpenAIProtocolProbeServer = Partial<Omit<OpenAIProtocolProbeResult, 'endpoints'>> & {
+    endpoints?: Array<Partial<OpenAIProtocolProbeEndpointResult> & { endpoint?: string | null }> | null;
+};
+
+function normalizeProbeCapability(value: unknown): OpenAIProtocolCapability {
+    return value === 'supported' || value === 'unsupported' ? value : 'unknown';
+}
+
+function normalizeProbeOutcome(value: unknown): OpenAIProtocolProbeOutcome {
+    // 未知/非法 outcome 保守归一为 failed，绝不静默当作成功。
+    return value === 'probed' || value === 'skipped' || value === 'failed' ? value : 'failed';
+}
+
+function normalizeProbeMode(value: unknown): OpenAIProtocolMode {
+    return value === 'auto' || value === 'chat_only' || value === 'responses_only' || value === 'both'
+        ? value
+        : 'auto';
+}
+
+function normalizeOpenAIProtocolProbeResult(
+    data: OpenAIProtocolProbeServer | null | undefined,
+    channelId: number,
+): OpenAIProtocolProbeResult {
+    const endpoints: OpenAIProtocolProbeEndpointResult[] = [];
+    for (const raw of data?.endpoints ?? []) {
+        const endpointName = raw?.endpoint;
+        if (endpointName !== 'chat' && endpointName !== 'responses') continue;
+        const observed = normalizeProbeCapability(raw.observed);
+        endpoints.push({
+            endpoint: endpointName,
+            current: normalizeProbeCapability(raw.current),
+            observed,
+            capability: normalizeProbeCapability(raw.capability ?? observed),
+            outcome: normalizeProbeOutcome(raw.outcome),
+            status: typeof raw.status === 'number' ? raw.status : null,
+            message: typeof raw.message === 'string' ? raw.message : null,
+        });
+    }
+    const capabilityByEndpoint = (name: OpenAIProtocolProbeEndpoint) =>
+        endpoints.find((item) => item.endpoint === name)?.capability;
+    // skipped 只在后端明确给出 boolean，或后端未给出且所有 endpoint 均明确
+    // skipped 时为 true；空/缺失 endpoints 不能由此推导出 skipped。
+    const skipped =
+        typeof data?.skipped === 'boolean'
+            ? data.skipped
+            : endpoints.length > 0 && endpoints.every((endpoint) => endpoint.outcome === 'skipped');
+    return {
+        channel_id: typeof data?.channel_id === 'number' ? data.channel_id : channelId,
+        mode: normalizeProbeMode(data?.mode),
+        chat: normalizeProbeCapability(data?.chat ?? capabilityByEndpoint('chat')),
+        responses: normalizeProbeCapability(data?.responses ?? capabilityByEndpoint('responses')),
+        skipped,
+        endpoints,
+    };
+}
+
 export type BaseUrl = {
     url: string;
     delay: number;
@@ -74,6 +212,9 @@ export type Channel = {
     auto_group: AutoGroupType;
     custom_header: CustomHeader[];
     ws_mode: ChannelWSMode;
+    openai_protocol_mode: OpenAIProtocolMode;
+    openai_chat_capability: OpenAIProtocolCapability;
+    openai_responses_capability: OpenAIProtocolCapability;
     param_override?: string | null;
     match_regex?: string | null;
     managed: boolean;
@@ -82,10 +223,13 @@ export type Channel = {
 };
 
 // Internal type: backend may return null for slice fields; normalize to [] in select()
-type ChannelServer = Omit<Channel, 'base_urls' | 'custom_header' | 'keys'> & {
+type ChannelServer = Omit<Channel, 'base_urls' | 'custom_header' | 'keys' | 'openai_protocol_mode' | 'openai_chat_capability' | 'openai_responses_capability'> & {
     base_urls: BaseUrl[] | null;
     custom_header: CustomHeader[] | null;
     keys: ChannelKey[] | null;
+    openai_protocol_mode?: OpenAIProtocolMode | null;
+    openai_chat_capability?: OpenAIProtocolCapability | null;
+    openai_responses_capability?: OpenAIProtocolCapability | null;
 };
 
 /**
@@ -105,6 +249,7 @@ export type CreateChannelRequest = {
     auto_group?: AutoGroupType;
     custom_header?: CustomHeader[];
     ws_mode?: ChannelWSMode;
+    openai_protocol_mode?: OpenAIProtocolMode;
     param_override?: string | null;
     match_regex?: string | null;
 };
@@ -126,6 +271,7 @@ export type UpdateChannelRequest = {
     auto_group?: AutoGroupType;
     custom_header?: CustomHeader[];
     ws_mode?: ChannelWSMode;
+    openai_protocol_mode?: OpenAIProtocolMode;
     param_override?: string | null;
     match_regex?: string | null;
     // keys diff
@@ -169,6 +315,9 @@ export function useChannelList() {
                 base_urls: item.base_urls ?? [],
                 custom_header: item.custom_header ?? [],
                 ws_mode: item.ws_mode ?? 'inherit',
+                openai_protocol_mode: item.openai_protocol_mode ?? 'auto',
+                openai_chat_capability: item.openai_chat_capability ?? 'unknown',
+                openai_responses_capability: item.openai_responses_capability ?? 'unknown',
                 keys: item.keys ?? [],
                 proxy_mode: item.proxy_mode ?? 'direct',
                 proxy_config_id: item.proxy_config_id ?? null,
@@ -218,6 +367,10 @@ export function useCreateChannel() {
             queryClient.invalidateQueries({ queryKey: ['models', 'channel'] });
             queryClient.invalidateQueries({ queryKey: ['proxy-pool'] });
             queryClient.invalidateQueries({ queryKey: ['groups', 'list'] });
+            // 后端在创建后自动探测 OpenAI 协议能力；延迟补一次刷新兜底异步探测结果。
+            setTimeout(() => {
+                queryClient.invalidateQueries({ queryKey: ['channels', 'list'] });
+            }, 2000);
         },
         onError: (error) => {
             logger.error('渠道创建失败:', error);
@@ -255,6 +408,10 @@ export function useUpdateChannel() {
             queryClient.invalidateQueries({ queryKey: ['models', 'channel'] });
             queryClient.invalidateQueries({ queryKey: ['proxy-pool'] });
             queryClient.invalidateQueries({ queryKey: ['groups', 'list'] });
+            // 后端在更新后自动探测 OpenAI 协议能力；延迟补一次刷新兜底异步探测结果。
+            setTimeout(() => {
+                queryClient.invalidateQueries({ queryKey: ['channels', 'list'] });
+            }, 2000);
         },
         onError: (error) => {
             logger.error('渠道更新失败:', error);
@@ -344,6 +501,37 @@ export function useFetchModel() {
         },
         onError: (error) => {
             logger.error('模型列表获取失败:', error);
+        },
+    });
+}
+
+/**
+ * 主动探测已保存渠道的 OpenAI 协议能力 Hook。
+ *
+ * 请求仅携带渠道 ID（服务端用权威配置探测，密钥不回传）；
+ * 成功后刷新渠道列表，让详情/表单读到最新探测结果。
+ *
+ * @example
+ * const probe = useProbeOpenAIProtocol();
+ * probe.mutate(1);
+ */
+export function useProbeOpenAIProtocol() {
+    const queryClient = useQueryClient();
+
+    return useMutation({
+        mutationFn: async (id: number) => {
+            const data = await apiClient.post<OpenAIProtocolProbeServer | null>(
+                '/api/v1/channel/probe-openai-protocol',
+                { id },
+            );
+            return normalizeOpenAIProtocolProbeResult(data, id);
+        },
+        onSuccess: (data) => {
+            logger.log('OpenAI 协议探测成功:', data.channel_id);
+            queryClient.invalidateQueries({ queryKey: ['channels', 'list'] });
+        },
+        onError: (error) => {
+            logger.error('OpenAI 协议探测失败:', error);
         },
     });
 }

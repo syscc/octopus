@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/bestruirui/octopus/internal/transformer/model"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 )
 
 type EmbeddingOutbound struct{}
@@ -86,11 +86,22 @@ func (o *EmbeddingOutbound) TransformRequest(ctx context.Context, request *model
 }
 
 func (o *EmbeddingOutbound) TransformResponse(ctx context.Context, response *http.Response) (*model.InternalLLMResponse, error) {
-	body, err := io.ReadAll(response.Body)
+	body, err := httpbody.ReadResponse(response)
 	if err != nil {
+		if response != nil && httpbody.IsErrorStatus(response.StatusCode) {
+			return nil, &model.ResponseError{StatusCode: response.StatusCode}
+		}
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
-
+	if httpbody.IsErrorStatus(response.StatusCode) {
+		var errResp struct {
+			Error model.ErrorDetail `json:"error"`
+		}
+		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error.Message != "" {
+			return nil, &model.ResponseError{StatusCode: response.StatusCode, Detail: errResp.Error}
+		}
+		return nil, &model.ResponseError{StatusCode: response.StatusCode}
+	}
 	if len(body) == 0 {
 		return nil, fmt.Errorf("response body is empty")
 	}

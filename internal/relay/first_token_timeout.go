@@ -97,6 +97,12 @@ func (ra *relayAttempt) firstTokenTimeoutError() error {
 }
 
 func (ra *relayAttempt) firstTokenTimeoutIfNeeded(ctx context.Context, err error) error {
+	// A client write failure is authoritative even if the first-token budget
+	// expired while that write was blocked. Reclassifying it as an upstream
+	// timeout would re-enable retry/failover and penalize the selected channel.
+	if isDownstreamWriteError(err) {
+		return nil
+	}
 	budgetCtx := context.Context(nil)
 	if ra != nil && ra.firstTokenBudget != nil {
 		budgetCtx = ra.firstTokenBudget.ctx

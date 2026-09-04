@@ -13,6 +13,7 @@ import (
 	"github.com/bestruirui/octopus/internal/client"
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 )
 
 func siteHTTPClient(ctx context.Context, siteRecord *model.Site, accounts ...*model.SiteAccount) (*http.Client, error) {
@@ -89,7 +90,7 @@ func requestJSON(ctx context.Context, siteRecord *model.Site, method string, req
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := httpbody.ReadResponse(resp)
 	if err != nil {
 		return nil, err
 	}
@@ -126,13 +127,16 @@ func applyDefaultSiteRequestHeaders(req *http.Request, hasJSONBody bool) {
 }
 
 func formatSiteHTTPError(statusCode int, header http.Header, bodyBytes []byte) error {
+	// Detect challenge pages before extracting a JSON message. A challenge may
+	// be served with an application/json content type or a JSON-looking wrapper,
+	// but must never be persisted as an ordinary provider error.
+	if IsCloudflareProtectionResponse(statusCode, header, bodyBytes) {
+		return wrapCloudflareProtectionError(newCloudflareProtectionError(statusCode, header))
+	}
 	if payload, ok := parseSiteJSONMap(bodyBytes); ok {
 		if message := extractSiteResponseMessage(payload); message != "" {
 			return newSiteHTTPError(statusCode, message)
 		}
-	}
-	if IsCloudflareProtectionResponse(statusCode, header, bodyBytes) {
-		return wrapCloudflareProtectionError(newCloudflareProtectionError(statusCode, header))
 	}
 	if summary := extractSiteHTMLResponseSummary(header.Get("Content-Type"), bodyBytes); summary != "" {
 		return newSiteHTTPError(statusCode, summary)
@@ -142,20 +146,81 @@ func formatSiteHTTPError(statusCode int, header http.Header, bodyBytes []byte) e
 
 // IsCloudflareProtectionResponse 判断一次上游响应是否为 Cloudflare 防护拦截（403 + CF 指纹）。
 // 供 sitesync 内部与被动离群退役（POR）门3 复用。
+//
+// 分类顺序（自上而下短路）：
+//  1. 命中挑战页/防火墙特征标记 -> 挑战页；
+//  2. 响应体承载结构化 JSON -> 普通上游接口错误（Cloudflare 挑战页不会返回 JSON）；
+//  3. 非 JSON 响应体里出现 cloudflare 字样 -> 挑战页；
+//  4. 回落到 CF-Ray / Server 响应头指纹。
+//
+// 因此 api.cloudflare.com 之类以 JSON 返回的 403（鉴权失败、路由不存在等）不再被误判为挑战页，
+// 而把 Content-Type 伪装成 application/json 的挑战页仍会在第 1/3 步按响应体内容识别出来。
 func IsCloudflareProtectionResponse(statusCode int, header http.Header, bodyBytes []byte) bool {
 	if statusCode != http.StatusForbidden {
 		return false
 	}
 	body := strings.ToLower(string(bodyBytes))
-	if strings.Contains(body, "attention required") ||
-		strings.Contains(body, "just a moment") ||
-		strings.Contains(body, "cf-error-code") ||
-		strings.Contains(body, "cloudflare ray id") ||
-		strings.Contains(body, "cloudflare") {
+	if containsCloudflareChallengeMarker(body) {
+		return true
+	}
+	if looksLikeSiteJSONBody(bodyBytes) {
+		return false
+	}
+	if strings.Contains(body, "cloudflare") {
 		return true
 	}
 	server := strings.ToLower(header.Get("Server"))
 	return header.Get("CF-Ray") != "" || strings.Contains(server, "cloudflare")
+}
+
+// cloudflareChallengeBodyMarkers 是挑战页与防火墙拦截页（含 1020 之类纯文本错误码）的强特征，
+// 命中即判定为防护拦截，优先级高于 JSON 判定。
+var cloudflareChallengeBodyMarkers = []string{
+	"attention required",
+	"just a moment",
+	"cf-error-code",
+	"cf-error-details",
+	"cloudflare ray id",
+	"cf_chl_opt",
+	"challenge-platform",
+	"enable javascript and cookies to continue",
+	"error code: 1020",
+	"error code 1020",
+}
+
+func containsCloudflareChallengeMarker(loweredBody string) bool {
+	return slices.ContainsFunc(cloudflareChallengeBodyMarkers, func(marker string) bool {
+		return strings.Contains(loweredBody, marker)
+	})
+}
+
+// looksLikeSiteJSONBody 判断响应体是否承载 JSON 对象/数组，允许上游在外层包一段文本前缀
+// （例如 POR 门3 记录的 `upstream error: 403: {...}`）。
+// 明显是 HTML 的响应体直接排除，避免挑战页内嵌 JSON 片段绕过检测。
+func looksLikeSiteJSONBody(bodyBytes []byte) bool {
+	body := strings.TrimSpace(string(bodyBytes))
+	if body == "" {
+		return false
+	}
+	lowered := strings.ToLower(body)
+	if strings.HasPrefix(body, "<") || strings.Contains(lowered, "<html") || strings.Contains(lowered, "<!doctype html") {
+		return false
+	}
+	start := strings.IndexAny(body, "{[")
+	end := strings.LastIndexAny(body, "}]")
+	if start < 0 || end <= start {
+		return false
+	}
+	var payload any
+	if err := json.Unmarshal([]byte(body[start:end+1]), &payload); err != nil {
+		return false
+	}
+	switch payload.(type) {
+	case map[string]any, []any:
+		return true
+	default:
+		return false
+	}
 }
 
 func formatSiteDecodeError(contentType string, bodyBytes []byte, err error) error {
@@ -180,11 +245,25 @@ func extractSiteResponseMessage(payload map[string]any) string {
 	if payload == nil {
 		return ""
 	}
-	return firstNonEmptyString(
+	if message := firstNonEmptyString(
 		jsonString(payload["message"]),
 		jsonString(nestedValue(payload, "error", "message")),
 		jsonString(payload["msg"]),
-	)
+	); message != "" {
+		return message
+	}
+	for _, item := range normalizeItemSlice(payload["errors"]) {
+		if message := firstNonEmptyString(jsonString(item["message"]), jsonString(item["error"])); message != "" {
+			return message
+		}
+		// Cloudflare V4 的部分错误只在 errors[].error_chain[].message 里带描述。
+		for _, chained := range normalizeItemSlice(item["error_chain"]) {
+			if message := firstNonEmptyString(jsonString(chained["message"]), jsonString(chained["error"])); message != "" {
+				return message
+			}
+		}
+	}
+	return ""
 }
 
 func extractSiteHTMLResponseSummary(contentType string, bodyBytes []byte) string {

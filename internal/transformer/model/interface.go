@@ -43,6 +43,46 @@ type InboundStreamEventTransformer interface {
 	TransformStreamEvents(ctx context.Context, events []StreamEvent) ([]byte, error)
 }
 
+// InboundStreamFinalizer optionally emits protocol terminal data when an
+// upstream stream ends without an explicit wire-level done event.
+type InboundStreamFinalizer interface {
+	FinalizeStream(ctx context.Context) ([]byte, error)
+}
+
+// InboundInterruptedFinalizer emits a protocol incomplete terminal when an
+// upstream transport fails after response payload has already been projected.
+// It is distinct from InboundStreamFinalizer: normal EOF may legitimately
+// complete a response after a finish signal, while an interrupted stream must
+// never be upgraded to response.completed.
+type InboundInterruptedFinalizer interface {
+	FinalizeInterruptedStream(ctx context.Context) ([]byte, error)
+}
+
+// InboundResponseInitializer optionally prepares a fresh inbound adapter for
+// a new relay attempt. Implementations must copy request-bound settings only
+// (defensively, to avoid aliasing) and must not carry mutable per-response
+// stream state across attempts.
+type InboundResponseInitializer interface {
+	InitializeResponse(request *InternalLLMRequest)
+}
+
+// InboundIncompleteFinalizer synthesizes protocol terminal bytes for a raw
+// passthrough upstream stream that reached EOF without any terminal event.
+// The returned bytes, when non-empty, are appended to the client stream; the
+// relay then treats the attempt as failed with ErrIncompleteUpstreamStream so
+// it is neither persisted for replay nor failed over to another channel.
+type InboundIncompleteFinalizer interface {
+	FinalizeIncompleteStream(ctx context.Context, rawStream []byte) ([]byte, error)
+}
+
+// InboundStreamTerminalObserver reports a terminal that the inbound adapter
+// has projected into the downstream protocol. The processor samples this only
+// after the corresponding bytes were written successfully, so generated data
+// is never confused with client-visible data.
+type InboundStreamTerminalObserver interface {
+	StreamTerminalOutcome() (PassthroughTerminalOutcome, error)
+}
+
 /*
 请求流程
 非流式
@@ -85,12 +125,41 @@ type PassthroughCapable interface {
 	PassthroughConfig() PassthroughConfig
 }
 
+// PassthroughTerminalOutcome describes the protocol result of a raw terminal event.
+// It is deliberately separate from transport completion: a stream may stop on a
+// terminal event and still represent an upstream failure or an incomplete turn.
+type PassthroughTerminalOutcome string
+
+const (
+	PassthroughTerminalOutcomeNone       PassthroughTerminalOutcome = ""
+	PassthroughTerminalOutcomeCompleted  PassthroughTerminalOutcome = "completed"
+	PassthroughTerminalOutcomeFailed     PassthroughTerminalOutcome = "failed"
+	PassthroughTerminalOutcomeIncomplete PassthroughTerminalOutcome = "incomplete"
+	PassthroughTerminalOutcomeCancelled  PassthroughTerminalOutcome = "cancelled"
+)
+
 // PassthroughConfig provides protocol-specific settings for passthrough operation.
 type PassthroughConfig struct {
 	// TerminalEvents defines protocol-specific terminal event types for early completion detection.
 	// When a stream contains a terminal event (e.g., "message_stop" for Anthropic, "response.completed"
 	// for OpenAI Responses), the relay can treat client disconnection as success rather than failure.
 	TerminalEvents map[string]struct{}
+
+	// FailureEvents are terminal events that prove the upstream request failed.
+	// They are not successful merely because they stop the wire stream. When a
+	// failure is observed before any payload is committed, the relay suppresses
+	// the raw event so normal retry/failover can produce the public error.
+	FailureEvents map[string]struct{}
+
+	// IncompleteEvents are legal protocol terminals whose result is incomplete,
+	// but not an upstream transport failure (for example Responses' status
+	// "incomplete"). They must not be confused with ErrIncompleteUpstreamStream.
+	IncompleteEvents map[string]struct{}
+
+	// CancelledEvents are legal provider terminals that stop a request without
+	// completing it. They are kept distinct from both a completed response and
+	// a transport-level incomplete stream.
+	CancelledEvents map[string]struct{}
 
 	// CollectMetrics defines whether to call collectResponse() after passthrough stream ends.
 	// Set to true for protocols that require full response aggregation for cost/token tracking

@@ -115,6 +115,8 @@ function defaultCredentialType(): SiteCredentialType {
 
 function credentialOptions(platform: SitePlatform) {
     switch (platform) {
+        case SitePlatform.Cloudflare:
+            return [SiteCredentialType.AccessToken, SiteCredentialType.APIKey];
         case SitePlatform.Sub2API:
             return [SiteCredentialType.AccessToken, SiteCredentialType.APIKey];
         case SitePlatform.API:
@@ -144,34 +146,49 @@ function createEmptyAccountForm(site: SiteRecord): SiteAccountFormState {
         proxy_config_id: null,
         enabled: true,
         auto_sync: true,
-        auto_checkin: true,
+        auto_checkin: site.platform !== SitePlatform.Cloudflare,
         random_checkin: false,
         checkin_interval_hours: 24,
         checkin_random_window_minutes: 120,
     };
 }
 
-function createAccountForm(account: SiteAccount): SiteAccountFormState {
+function createAccountForm(
+    account: SiteAccount,
+    platform: SitePlatform,
+): SiteAccountFormState {
+    const supportedTypes = credentialOptions(platform);
+    const credentialType = supportedTypes.includes(account.credential_type)
+        ? account.credential_type
+        : defaultCredentialType();
+    const isUsernamePassword = credentialType === SiteCredentialType.UsernamePassword;
+    const isAccessToken = credentialType === SiteCredentialType.AccessToken;
+    const isAPIKey = credentialType === SiteCredentialType.APIKey;
+    const supportsCheckin = platform !== SitePlatform.Cloudflare;
+
     return {
         site_id: account.site_id,
         name: account.name,
-        credential_type: account.credential_type,
-        username: account.username,
-        password: account.password,
-        access_token: account.access_token,
-        api_key: account.api_key,
-        refresh_token: account.refresh_token ?? '',
+        credential_type: credentialType,
+        username: isUsernamePassword ? account.username : '',
+        password: isUsernamePassword ? account.password : '',
+        access_token: isAccessToken ? account.access_token : '',
+        api_key: isAPIKey ? account.api_key : '',
+        refresh_token: isAccessToken ? (account.refresh_token ?? '') : '',
         token_expires_at:
-            account.token_expires_at > 0 ? String(account.token_expires_at) : '',
-        platform_user_id: account.platform_user_id
-            ? String(account.platform_user_id)
-            : '',
+            isAccessToken && account.token_expires_at > 0
+                ? String(account.token_expires_at)
+                : '',
+        platform_user_id:
+            isAccessToken && platform === SitePlatform.NewAPI && account.platform_user_id
+                ? String(account.platform_user_id)
+                : '',
         proxy_mode: account.proxy_mode ?? 'inherit',
         proxy_config_id: account.proxy_config_id ?? null,
         enabled: account.enabled,
         auto_sync: account.auto_sync,
-        auto_checkin: account.auto_checkin,
-        random_checkin: account.random_checkin,
+        auto_checkin: supportsCheckin && account.auto_checkin,
+        random_checkin: supportsCheckin && account.random_checkin,
         checkin_interval_hours: account.checkin_interval_hours,
         checkin_random_window_minutes: account.checkin_random_window_minutes,
     };
@@ -224,7 +241,12 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
     const createSiteAccount = useCreateSiteAccount();
     const updateSiteAccount = useUpdateSiteAccount();
     const [accountForm, setAccountForm] = useState<SiteAccountFormState | null>(() => {
-        if (account) return createAccountForm(account);
+        if (account) {
+            return createAccountForm(
+                account,
+                site?.platform ?? SitePlatform.NewAPI,
+            );
+        }
         if (site) return createEmptyAccountForm(site);
         return null;
     });
@@ -244,6 +266,10 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
             }
             if (!accountForm.name.trim()) {
                 toast.error('请输入账号名称');
+                return;
+            }
+            if (!currentCredentialOptions.includes(accountForm.credential_type)) {
+                toast.error('当前平台不支持该凭据类型，请重新选择');
                 return;
             }
 
@@ -351,8 +377,10 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
                     accountForm.proxy_mode === 'pool' ? accountForm.proxy_config_id : null,
                 enabled: accountForm.enabled,
                 auto_sync: accountForm.auto_sync,
-                auto_checkin: accountForm.auto_checkin,
-                random_checkin: accountForm.random_checkin,
+                auto_checkin:
+                    currentPlatform === SitePlatform.Cloudflare ? false : accountForm.auto_checkin,
+                random_checkin:
+                    currentPlatform === SitePlatform.Cloudflare ? false : accountForm.random_checkin,
                 checkin_interval_hours: Math.max(
                     1,
                     Math.trunc(accountForm.checkin_interval_hours || 24),
@@ -381,6 +409,7 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
             account,
             accountForm,
             currentPlatform,
+            currentCredentialOptions,
             tProxy,
             updateSiteAccount,
             createSiteAccount,
@@ -540,7 +569,11 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
                                     >
                                         <div className="grid gap-4">
                                             <label className="grid gap-2 text-sm">
-                                                <span className="font-medium">Access Token</span>
+                                                <span className="font-medium">
+                                                    {currentPlatform === SitePlatform.Cloudflare
+                                                        ? 'Cloudflare API Token'
+                                                        : 'Access Token'}
+                                                </span>
                                                 <Input
                                                     value={accountForm.access_token}
                                                     onChange={(event) =>
@@ -550,7 +583,9 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
                                                                 : current,
                                                         )
                                                     }
-                                                    placeholder="请输入 Access Token"
+                                                    placeholder={currentPlatform === SitePlatform.Cloudflare
+                                                        ? '请输入 Workers AI API Token'
+                                                        : '请输入 Access Token'}
                                                     className="rounded-xl"
                                                 />
                                             </label>
@@ -689,42 +724,47 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
                                         }
                                     />
                                 </label>
-                                <label className="flex cursor-pointer items-center justify-between gap-3">
-                                    <span className="flex items-center gap-2 text-sm text-card-foreground">
-                                        <CalendarCheck2 className="size-4 text-muted-foreground" />
-                                        自动签到
-                                    </span>
-                                    <Switch
-                                        checked={accountForm.auto_checkin}
-                                        onCheckedChange={(checked) =>
-                                            setAccountForm((current) =>
-                                                current
-                                                    ? { ...current, auto_checkin: checked }
-                                                    : current,
-                                            )
-                                        }
-                                    />
-                                </label>
-                                <label className="flex cursor-pointer items-center justify-between gap-3">
-                                    <span className="flex items-center gap-2 text-sm text-card-foreground">
-                                        <CalendarCheck2 className="size-4 text-muted-foreground" />
-                                        随机签到
-                                    </span>
-                                    <Switch
-                                        checked={accountForm.random_checkin}
-                                        onCheckedChange={(checked) =>
-                                            setAccountForm((current) =>
-                                                current
-                                                    ? { ...current, random_checkin: checked }
-                                                    : current,
-                                            )
-                                        }
-                                    />
-                                </label>
+                                {currentPlatform !== SitePlatform.Cloudflare ? (
+                                    <>
+                                        <label className="flex cursor-pointer items-center justify-between gap-3">
+                                            <span className="flex items-center gap-2 text-sm text-card-foreground">
+                                                <CalendarCheck2 className="size-4 text-muted-foreground" />
+                                                自动签到
+                                            </span>
+                                            <Switch
+                                                checked={accountForm.auto_checkin}
+                                                onCheckedChange={(checked) =>
+                                                    setAccountForm((current) =>
+                                                        current
+                                                            ? { ...current, auto_checkin: checked }
+                                                            : current,
+                                                    )
+                                                }
+                                            />
+                                        </label>
+                                        <label className="flex cursor-pointer items-center justify-between gap-3">
+                                            <span className="flex items-center gap-2 text-sm text-card-foreground">
+                                                <CalendarCheck2 className="size-4 text-muted-foreground" />
+                                                随机签到
+                                            </span>
+                                            <Switch
+                                                checked={accountForm.random_checkin}
+                                                onCheckedChange={(checked) =>
+                                                    setAccountForm((current) =>
+                                                        current
+                                                            ? { ...current, random_checkin: checked }
+                                                            : current,
+                                                    )
+                                                }
+                                            />
+                                        </label>
+                                    </>
+                                ) : null}
                             </div>
 
                             <AnimatePresence initial={false}>
-                                {accountForm.auto_checkin && accountForm.random_checkin ? (
+                                {currentPlatform !== SitePlatform.Cloudflare &&
+                                accountForm.auto_checkin && accountForm.random_checkin ? (
                                     <motion.div
                                         key="random-checkin-options"
                                         initial={{ height: 0, opacity: 0 }}

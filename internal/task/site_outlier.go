@@ -9,7 +9,6 @@ import (
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
 	"github.com/bestruirui/octopus/internal/outlierwindow"
-	"github.com/bestruirui/octopus/internal/sitesync"
 	"github.com/bestruirui/octopus/internal/utils/log"
 )
 
@@ -170,7 +169,7 @@ func retireViaProbe(ctx context.Context, prober channelProber, channelID, siteAc
 		return
 	}
 
-	isCF := sitesync.IsCloudflareProtectionResponse(res.HTTPStatus, res.Header, []byte(res.ErrorMessage))
+	isCF := res.CloudflareBlocked
 	reason := "passive outlier: window + probe failed"
 	if isCF {
 		reason = "passive outlier: cloudflare protection on probe"
@@ -237,7 +236,7 @@ func handleSiteOutage(ctx context.Context, prober channelProber, accountID int, 
 	}
 
 	// 确认整站故障 → 禁用该账号下所有 enabled 投影渠道
-	isCF := sitesync.IsCloudflareProtectionResponse(probe.HTTPStatus, probe.Header, []byte(probe.ErrorMessage))
+	isCF := probe.CloudflareBlocked
 	reason := "passive outlier: site-level outage (all channels failing + probe failed)"
 	if isCF {
 		reason = "passive outlier: site-level outage (cloudflare protection on probe)"

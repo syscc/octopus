@@ -13,6 +13,8 @@ import (
 
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
+	"github.com/bestruirui/octopus/internal/outlierwindow"
+	"github.com/bestruirui/octopus/internal/relay/balancer"
 	"github.com/bestruirui/octopus/internal/transformer/inbound"
 	"github.com/bestruirui/octopus/internal/transformer/outbound"
 	"github.com/gin-gonic/gin"
@@ -169,6 +171,59 @@ func TestChatAndResponsesProtocolPreferenceOverridesGroupPriority(t *testing.T) 
 	}
 }
 
+func TestPersistedProtocolCapabilityOverridesGroupPriority(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+
+	convertedUpstream := newMockChannelServer(t, "/v1/chat/completions", http.StatusOK, `{"id":"converted","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"converted"}}]}`)
+	directUpstream := newMockChannelServer(t, "/v1/responses", http.StatusOK, `{"id":"direct","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"direct"}]}]}`)
+	convertedChannel := createChannel("capability-priority-converted", outbound.OutboundTypeOpenAIChat, convertedUpstream.url)
+	directChannel := createChannel("capability-priority-direct", outbound.OutboundTypeOpenAIChat, directUpstream.url)
+	if err := op.ChannelCreate(convertedChannel, ctx); err != nil {
+		t.Fatalf("create converted channel: %v", err)
+	}
+	if err := op.ChannelCreate(directChannel, ctx); err != nil {
+		t.Fatalf("create direct channel: %v", err)
+	}
+	for _, observation := range []struct {
+		channelID int
+		protocol  outbound.OutboundType
+		state     model.OpenAIProtocolCapability
+	}{
+		{convertedChannel.ID, outbound.OutboundTypeOpenAIChat, model.OpenAIProtocolCapabilitySupported},
+		{convertedChannel.ID, outbound.OutboundTypeOpenAIResponse, model.OpenAIProtocolCapabilityUnsupported},
+		{directChannel.ID, outbound.OutboundTypeOpenAIResponse, model.OpenAIProtocolCapabilitySupported},
+	} {
+		if err := op.ChannelRecordOpenAIProtocolCapability(observation.channelID, observation.protocol, observation.state, ctx); err != nil {
+			t.Fatalf("record protocol capability: %v", err)
+		}
+	}
+
+	group := &model.Group{Name: "capability-priority-group", Mode: model.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: convertedChannel.ID, ModelName: "fb-model", Priority: 1}, ctx); err != nil {
+		t.Fatalf("add converted channel: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: directChannel.ID, ModelName: "fb-model", Priority: 2}, ctx); err != nil {
+		t.Fatalf("add direct channel: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	requestContext, _ := gin.CreateTestContext(recorder)
+	requestContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"capability-priority-group","input":"hello"}`))
+	requestContext.Request.Header.Set("Content-Type", "application/json")
+	Handler(inbound.InboundTypeOpenAIResponse, requestContext)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected direct Responses channel success, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if directUpstream.hits.Load() != 1 || convertedUpstream.hits.Load() != 0 {
+		t.Fatalf("expected persisted direct capability to win, direct=%d converted=%d", directUpstream.hits.Load(), convertedUpstream.hits.Load())
+	}
+}
+
 func TestChatPrefersChatOverResponses(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := setupRelayTestDB(t)
@@ -268,6 +323,43 @@ func TestChatFallsBackToResponsesWhenChatFails(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), `"object":"chat.completion"`) || !strings.Contains(recorder.Body.String(), `"content":"fallback-ok"`) {
 		t.Fatalf("expected chat.completion client body from responses upstream, got %s", recorder.Body.String())
+	}
+}
+
+func TestChatFallsBackToResponsesOnSameChannel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+
+	upstream := newMockChannelServer(t, "/v1/responses", http.StatusOK, `{"id":"r1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"same-channel-responses-ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	channel := createChannel("chat-to-responses-same-channel", outbound.OutboundTypeOpenAIResponse, upstream.url)
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	group := &model.Group{Name: "chat-to-responses-same-channel-group", Mode: model.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "fb-model"}, ctx); err != nil {
+		t.Fatalf("add group item: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"chat-to-responses-same-channel-group","messages":[{"role":"user","content":"hello"}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	Handler(inbound.InboundTypeOpenAIChat, c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 via same-channel Responses fallback, got %d body %s", recorder.Code, recorder.Body.String())
+	}
+	if upstream.hits.Load() != 2 {
+		t.Fatalf("expected exactly two requests on one channel, got %d", upstream.hits.Load())
+	}
+	if paths := upstream.requestedPaths(); len(paths) != 2 || paths[0] != "/v1/chat/completions" || paths[1] != "/v1/responses" {
+		t.Fatalf("expected Chat first then Responses on the same channel, got %v", paths)
+	}
+	if !strings.Contains(recorder.Body.String(), `"object":"chat.completion"`) || !strings.Contains(recorder.Body.String(), `"same-channel-responses-ok"`) {
+		t.Fatalf("expected a Chat body converted from Responses, got %s", recorder.Body.String())
 	}
 }
 
@@ -377,12 +469,201 @@ func TestResponsesFallsBackToChatWhenResponsesFails(t *testing.T) {
 	}
 }
 
+func TestResponsesModelNotSupportedFallsBackToChatOnSameChannel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+
+	upstream := &mockChannelServer{hits: &atomic.Int32{}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstream.hits.Add(1)
+		upstream.mu.Lock()
+		upstream.paths = append(upstream.paths, r.URL.Path)
+		upstream.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/responses":
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"current model does not support Responses API","type":"invalid_request_error","param":null,"code":"RESPONSES_MODEL_NOT_SUPPORTED"}}`)
+		case "/v1/chat/completions":
+			_, _ = fmt.Fprint(w, `{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"same-channel-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	upstream.url = server.URL + "/v1"
+
+	channel := createChannel("responses-model-unsupported", outbound.OutboundTypeOpenAIChat, upstream.url)
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	group := &model.Group{Name: "responses-model-unsupported-group", Mode: model.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "fb-model"}, ctx); err != nil {
+		t.Fatalf("add group item: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"responses-model-unsupported-group","input":"hello"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	Handler(inbound.InboundTypeOpenAIResponse, c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 via same-channel Chat fallback, got %d body %s", recorder.Code, recorder.Body.String())
+	}
+	if upstream.hits.Load() != 2 {
+		t.Fatalf("expected exactly two requests on one channel, got %d", upstream.hits.Load())
+	}
+	if paths := upstream.requestedPaths(); len(paths) != 2 || paths[0] != "/v1/responses" || paths[1] != "/v1/chat/completions" {
+		t.Fatalf("expected Responses first then Chat on the same channel, got %v", paths)
+	}
+	if !strings.Contains(recorder.Body.String(), `"object":"response"`) || !strings.Contains(recorder.Body.String(), `"same-channel-ok"`) {
+		t.Fatalf("expected a Responses body converted from Chat, got %s", recorder.Body.String())
+	}
+
+	// The provider code is model-scoped, so the channel-wide Responses state
+	// must remain unknown and a later request must probe Responses again.
+	learnedChannel, err := op.ChannelGet(channel.ID, ctx)
+	if err != nil {
+		t.Fatalf("reload channel capability: %v", err)
+	}
+	if learnedChannel.OpenAIResponsesCapability != model.OpenAIProtocolCapabilityUnknown ||
+		learnedChannel.OpenAIChatCapability != model.OpenAIProtocolCapabilitySupported {
+		t.Fatalf("unexpected channel-wide learning from model-scoped error: chat=%q responses=%q", learnedChannel.OpenAIChatCapability, learnedChannel.OpenAIResponsesCapability)
+	}
+	secondRecorder := httptest.NewRecorder()
+	secondContext, _ := gin.CreateTestContext(secondRecorder)
+	secondContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"responses-model-unsupported-group","input":"again"}`))
+	secondContext.Request.Header.Set("Content-Type", "application/json")
+	Handler(inbound.InboundTypeOpenAIResponse, secondContext)
+	if secondRecorder.Code != http.StatusOK || upstream.hits.Load() != 4 {
+		t.Fatalf("expected model-scoped fallback to probe again, status=%d hits=%d body=%s", secondRecorder.Code, upstream.hits.Load(), secondRecorder.Body.String())
+	}
+}
+
+func TestSameChannelRetryUsesLearnedAlternateProtocol(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+
+	upstream := &mockChannelServer{hits: &atomic.Int32{}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstream.hits.Add(1)
+		upstream.mu.Lock()
+		upstream.paths = append(upstream.paths, r.URL.Path)
+		upstream.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/responses":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"Invalid URL (POST /v1/responses)","type":"invalid_request_error"}}`)
+		case "/v1/chat/completions":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"temporarily unavailable","type":"server_error"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	upstream.url = server.URL + "/v1"
+
+	channel := createChannel("same-channel-retry-learned-protocol", outbound.OutboundTypeOpenAIResponse, upstream.url)
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	group := &model.Group{
+		Name:         "same-channel-retry-learned-protocol-group",
+		Mode:         model.GroupModeFailover,
+		RetryEnabled: true,
+		MaxRetries:   2,
+	}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "fb-model"}, ctx); err != nil {
+		t.Fatalf("add group item: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	requestContext, _ := gin.CreateTestContext(recorder)
+	requestContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"same-channel-retry-learned-protocol-group","input":"hello"}`))
+	requestContext.Request.Header.Set("Content-Type", "application/json")
+	Handler(inbound.InboundTypeOpenAIResponse, requestContext)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected final Chat retry status 503, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	paths := upstream.requestedPaths()
+	want := []string{"/v1/responses", "/v1/chat/completions", "/v1/chat/completions"}
+	if len(paths) != len(want) {
+		t.Fatalf("expected one Responses probe and two Chat attempts, got %v", paths)
+	}
+	for i := range want {
+		if paths[i] != want[i] {
+			t.Fatalf("retry re-probed a learned unsupported endpoint: got %v want %v", paths, want)
+		}
+	}
+	learned, err := op.ChannelGet(channel.ID, ctx)
+	if err != nil {
+		t.Fatalf("reload learned channel: %v", err)
+	}
+	if learned.OpenAIResponsesCapability != model.OpenAIProtocolCapabilityUnsupported {
+		t.Fatalf("expected Responses unsupported to persist before retry, got %q", learned.OpenAIResponsesCapability)
+	}
+}
+
+func TestManualChatOnlyStartsWithChatAndSkipsNativeResponses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+
+	upstream := newMockChannelServer(t, "/v1/chat/completions", http.StatusOK, `{"id":"manual-chat","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"manual-chat-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	channel := createChannel("manual-chat-only", outbound.OutboundTypeOpenAIResponse, upstream.url)
+	channel.OpenAIProtocolMode = model.OpenAIProtocolModeChatOnly
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("create manual Chat-only channel: %v", err)
+	}
+	group := &model.Group{Name: "manual-chat-only-group", Mode: model.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "fb-model"}, ctx); err != nil {
+		t.Fatalf("add group item: %v", err)
+	}
+
+	call := func(body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		requestContext, _ := gin.CreateTestContext(recorder)
+		requestContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+		requestContext.Request.Header.Set("Content-Type", "application/json")
+		Handler(inbound.InboundTypeOpenAIResponse, requestContext)
+		return recorder
+	}
+
+	converted := call(`{"model":"manual-chat-only-group","input":"hello"}`)
+	if converted.Code != http.StatusOK || upstream.hits.Load() != 1 {
+		t.Fatalf("expected direct Chat conversion, status=%d hits=%d body=%s", converted.Code, upstream.hits.Load(), converted.Body.String())
+	}
+	if paths := upstream.requestedPaths(); len(paths) != 1 || paths[0] != "/v1/chat/completions" {
+		t.Fatalf("manual Chat-only mode must not probe Responses, got %v", paths)
+	}
+
+	native := call(`{"model":"manual-chat-only-group","input":"hello","background":true}`)
+	if native.Code != http.StatusBadRequest {
+		t.Fatalf("expected native Responses request to reject Chat-only channel, got %d body=%s", native.Code, native.Body.String())
+	}
+	if upstream.hits.Load() != 1 {
+		t.Fatalf("incompatible native request must not reach upstream, hits=%d", upstream.hits.Load())
+	}
+}
+
 func TestChatStreamConvertsResponsesUpstream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := setupRelayTestDB(t)
 
 	upstream := newStreamingMockChannelServer(t, "/v1/responses", strings.Join([]string{
-		`data: {"type":"response.created","response":{"id":"resp_stream","model":"fb-model","status":"in_progress","output":[]}}`,
+		`data: {"type":"response.created","response":{"id":"resp_stream","model":"fb-model","created_at":11,"status":"in_progress","output":[]}}`,
 		"",
 		`data: {"type":"response.output_text.delta","delta":"hello"}`,
 		"",
@@ -415,6 +696,12 @@ func TestChatStreamConvertsResponsesUpstream(t *testing.T) {
 	body := recorder.Body.String()
 	if !strings.Contains(body, `"object":"chat.completion.chunk"`) || !strings.Contains(body, `"content":"hello"`) {
 		t.Fatalf("expected Chat SSE converted from Responses upstream, got %s", body)
+	}
+	if !strings.Contains(body, `"created":11`) {
+		t.Fatalf("expected Responses creation time to survive Chat conversion, got %s", body)
+	}
+	if count := strings.Count(body, "data: [DONE]"); count != 1 {
+		t.Fatalf("expected exactly one Chat [DONE] marker, got %d in %s", count, body)
 	}
 	if paths := upstream.requestedPaths(); len(paths) != 2 || paths[0] != "/v1/chat/completions" || paths[1] != "/v1/responses" {
 		t.Fatalf("expected Chat endpoint probe then Responses fallback, got %v", paths)
@@ -462,8 +749,113 @@ func TestResponsesStreamConvertsChatUpstream(t *testing.T) {
 			t.Fatalf("expected %s in Responses SSE converted from Chat upstream, got %s", eventType, body)
 		}
 	}
+	if !strings.Contains(body, `"total_tokens":2`) {
+		t.Fatalf("expected independent usage chunk to be included in response.completed, got %s", body)
+	}
+	if strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("Responses stream must not expose a Chat [DONE] marker, got %s", body)
+	}
 	if paths := upstream.requestedPaths(); len(paths) != 2 || paths[0] != "/v1/responses" || paths[1] != "/v1/chat/completions" {
 		t.Fatalf("expected Responses endpoint probe then Chat fallback, got %v", paths)
+	}
+}
+
+func TestStreamDoesNotFallbackAfterPayloadWritten(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+
+	var mu sync.Mutex
+	paths := make([]string, 0, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch r.URL.Path {
+		case "/v1/responses":
+			_, _ = fmt.Fprint(w, strings.Join([]string{
+				`data: {"type":"response.created","response":{"id":"partial","model":"fb-model","created_at":1,"status":"in_progress","output":[]}}`,
+				"",
+				`data: {not-json}`,
+				"",
+			}, "\n"))
+		case "/v1/chat/completions":
+			_, _ = fmt.Fprint(w, `data: {"id":"unexpected","object":"chat.completion.chunk","choices":[]}`+"\n\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	channel := createChannel("stream-no-post-write-fallback", outbound.OutboundTypeOpenAIChat, server.URL+"/v1")
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	group := &model.Group{Name: "stream-no-post-write-fallback-group", Mode: model.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "fb-model"}, ctx); err != nil {
+		t.Fatalf("add group item: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"stream-no-post-write-fallback-group","input":"hello","stream":true}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	Handler(inbound.InboundTypeOpenAIResponse, c)
+
+	mu.Lock()
+	gotPaths := append([]string(nil), paths...)
+	mu.Unlock()
+	if len(gotPaths) != 1 || gotPaths[0] != "/v1/responses" {
+		t.Fatalf("expected no fallback after a downstream event was written, got %v", gotPaths)
+	}
+	if !strings.Contains(recorder.Body.String(), `"type":"response.created"`) {
+		t.Fatalf("expected the first Responses event to reach the client, got %s", recorder.Body.String())
+	}
+}
+
+func TestResponsesStreamFinalizesAtChatEOFWithoutUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+
+	upstream := newStreamingMockChannelServer(t, "/v1/chat/completions", strings.Join([]string{
+		`data: {"id":"chat_eof","object":"chat.completion.chunk","created":7,"model":"fb-model","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"}}]}`,
+		"",
+		`data: {"id":"chat_eof","object":"chat.completion.chunk","created":7,"model":"fb-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		"",
+	}, "\n"))
+	channel := createChannel("stream-responses-chat-eof", outbound.OutboundTypeOpenAIChat, upstream.url)
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	group := &model.Group{Name: "stream-responses-chat-eof-group", Mode: model.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "fb-model"}, ctx); err != nil {
+		t.Fatalf("add group item: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"stream-responses-chat-eof-group","input":"hello","stream":true}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	Handler(inbound.InboundTypeOpenAIResponse, c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if count := strings.Count(body, `"type":"response.completed"`); count != 1 {
+		t.Fatalf("expected exactly one EOF terminal event, got %d in %s", count, body)
+	}
+	if strings.Contains(body, `"usage":`) {
+		t.Fatalf("expected no fabricated usage at EOF, got %s", body)
+	}
+	if !strings.Contains(body, `"created_at":7`) {
+		t.Fatalf("expected Chat creation time to survive conversion, got %s", body)
 	}
 }
 
@@ -519,6 +911,15 @@ func TestNativeResponsesControlFieldRequiresResponsesChannel(t *testing.T) {
 	if err := op.ChannelCreate(chatChannel, ctx); err != nil {
 		t.Fatalf("create chat channel: %v", err)
 	}
+	if err := op.SettingSetInt(model.SettingKeyCircuitBreakerThreshold, 1); err != nil {
+		t.Fatalf("set circuit threshold: %v", err)
+	}
+	balancer.ResetStateByChannel(chatChannel.ID)
+	outlierwindow.Clear(chatChannel.ID)
+	t.Cleanup(func() {
+		balancer.ResetStateByChannel(chatChannel.ID)
+		outlierwindow.Clear(chatChannel.ID)
+	})
 	group := &model.Group{Name: "ctl-group", Mode: model.GroupModeFailover}
 	if err := op.GroupCreate(group, ctx); err != nil {
 		t.Fatalf("create group: %v", err)
@@ -547,6 +948,13 @@ func TestNativeResponsesControlFieldRequiresResponsesChannel(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "仅支持 OpenAI Responses 通道直通") {
 		t.Fatalf("expected clear passthrough-only error, got %s", recorder.Body.String())
+	}
+	stats := outlierwindow.Evaluate(chatChannel.ID, time.Now())
+	if stats.Samples != 1 || stats.Failures != 1 {
+		t.Fatalf("protocol capability failure must count in outlier health, got %+v", stats)
+	}
+	if tripped, _ := balancer.IsTripped(chatChannel.ID, chatChannel.Keys[0].ID, "fb-model"); !tripped {
+		t.Fatalf("protocol capability failure must count in circuit health")
 	}
 }
 
@@ -656,6 +1064,165 @@ func TestResponsesToChatFallbackPreservesExistingReplayStates(t *testing.T) {
 		if state := loadResponsesReplayState(88, group.ID, group.Name, responseID); state == nil {
 			t.Fatalf("expected unrelated replay state %s to remain", responseID)
 		}
+	}
+}
+
+func TestResponsesChatFallbackContinuesWithLocalTranscript(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupRelayTestDB(t)
+	resetResponsesReplayStore()
+	defer resetResponsesReplayStore()
+
+	var mu sync.Mutex
+	var responsePayloads []map[string]any
+	var chatPayloads []map[string]any
+	var chatTurn atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		switch r.URL.Path {
+		case "/v1/responses":
+			responsePayloads = append(responsePayloads, payload)
+		case "/v1/chat/completions":
+			chatPayloads = append(chatPayloads, payload)
+		}
+		mu.Unlock()
+
+		if r.URL.Path != "/v1/chat/completions" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"Invalid URL (POST /v1/responses)","type":"invalid_request_error"}}`)
+			return
+		}
+		turn := chatTurn.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      fmt.Sprintf("chat_resp_%d", turn),
+			"object":  "chat.completion",
+			"created": turn,
+			"model":   "fb-model",
+			"choices": []any{map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": fmt.Sprintf("answer %d", turn),
+				},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+		})
+	}))
+	defer server.Close()
+
+	channel := createChannel("chat-continuation", outbound.OutboundTypeOpenAIChat, server.URL+"/v1")
+	if err := op.ChannelCreate(channel, ctx); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	group := &model.Group{Name: "chat-continuation-group", Mode: model.GroupModeFailover}
+	if err := op.GroupCreate(group, ctx); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := op.GroupItemAdd(&model.GroupItem{GroupID: group.ID, ChannelID: channel.ID, ModelName: "fb-model"}, ctx); err != nil {
+		t.Fatalf("add group item: %v", err)
+	}
+
+	call := func(body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("api_key_id", 89)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+		c.Request.Header.Set("Content-Type", "application/json")
+		Handler(inbound.InboundTypeOpenAIResponse, c)
+		return recorder
+	}
+
+	first := call(`{"model":"chat-continuation-group","input":"first question"}`)
+	if first.Code != http.StatusOK {
+		t.Fatalf("expected first Chat fallback to succeed, got %d body %s", first.Code, first.Body.String())
+	}
+	var firstResponse struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &firstResponse); err != nil || firstResponse.ID == "" {
+		t.Fatalf("expected first Responses body with id, got id=%q err=%v body=%s", firstResponse.ID, err, first.Body.String())
+	}
+	firstState := loadResponsesReplayState(89, group.ID, group.Name, firstResponse.ID)
+	if firstState == nil || !firstState.LastOutboundTypeSet || firstState.LastOutboundType != outbound.OutboundTypeOpenAIChat {
+		t.Fatalf("expected first fallback to save Chat replay state, got %+v", firstState)
+	}
+	if !strings.Contains(string(firstState.ReplayWindowItems), "answer 1") {
+		t.Fatalf("expected replay window to include first assistant turn, got %s", firstState.ReplayWindowItems)
+	}
+
+	second := call(fmt.Sprintf(`{"model":"chat-continuation-group","previous_response_id":%q,"input":"second question"}`, firstResponse.ID))
+	if second.Code != http.StatusOK {
+		t.Fatalf("expected local Chat continuation to succeed, got %d body %s", second.Code, second.Body.String())
+	}
+	var secondResponse struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondResponse); err != nil || secondResponse.ID == "" {
+		t.Fatalf("expected second Responses body with id, got id=%q err=%v body=%s", secondResponse.ID, err, second.Body.String())
+	}
+
+	mu.Lock()
+	responsesSeen := append([]map[string]any(nil), responsePayloads...)
+	chatsSeen := append([]map[string]any(nil), chatPayloads...)
+	mu.Unlock()
+	// Turn 1 learns that Responses is unavailable and falls back to Chat. Turn 2
+	// reuses the persisted capability and starts directly with Chat replay.
+	if len(responsesSeen) != 1 || len(chatsSeen) != 2 {
+		t.Fatalf("expected one Responses probe followed by reusable Chat capability, got responses=%d chat=%d", len(responsesSeen), len(chatsSeen))
+	}
+	learnedChannel, err := op.ChannelGet(channel.ID, ctx)
+	if err != nil {
+		t.Fatalf("reload learned channel: %v", err)
+	}
+	if learnedChannel.OpenAIResponsesCapability != model.OpenAIProtocolCapabilityUnsupported ||
+		learnedChannel.OpenAIChatCapability != model.OpenAIProtocolCapabilitySupported {
+		t.Fatalf("expected persisted Chat-only automatic capability, got chat=%q responses=%q", learnedChannel.OpenAIChatCapability, learnedChannel.OpenAIResponsesCapability)
+	}
+	secondChatPayload, err := json.Marshal(chatsSeen[1])
+	if err != nil {
+		t.Fatalf("marshal second Chat payload: %v", err)
+	}
+	if strings.Contains(string(secondChatPayload), firstResponse.ID) {
+		t.Fatalf("local previous_response_id must not be forwarded upstream: %s", secondChatPayload)
+	}
+	secondChatJSON, err := json.Marshal(chatsSeen[1]["messages"])
+	if err != nil {
+		t.Fatalf("marshal second Chat messages: %v", err)
+	}
+	for _, expected := range []string{"first question", "answer 1", "second question"} {
+		if !strings.Contains(string(secondChatJSON), expected) {
+			t.Fatalf("expected second Chat transcript to contain %q, got %s", expected, secondChatJSON)
+		}
+	}
+
+	secondState := loadResponsesReplayState(89, group.ID, group.Name, secondResponse.ID)
+	if secondState == nil || len(secondState.Transcript) != 4 {
+		t.Fatalf("expected two complete turns without duplicated history, got %+v", secondState)
+	}
+	for _, expected := range []string{"first question", "answer 1", "second question", "answer 2"} {
+		if !strings.Contains(string(secondState.ReplayWindowItems), expected) {
+			t.Fatalf("expected updated replay window to contain %q, got %s", expected, secondState.ReplayWindowItems)
+		}
+	}
+
+	blocked := call(fmt.Sprintf(`{"model":"chat-continuation-group","previous_response_id":%q,"input":"third question","background":true}`, secondResponse.ID))
+	if blocked.Code != http.StatusConflict || !strings.Contains(blocked.Body.String(), CodeRelayContinuationReplayFailed) {
+		t.Fatalf("expected unsafe local replay to return stable 409, got %d body %s", blocked.Code, blocked.Body.String())
+	}
+	mu.Lock()
+	responsesAfterBlocked := len(responsePayloads)
+	chatsAfterBlocked := len(chatPayloads)
+	mu.Unlock()
+	if responsesAfterBlocked != 1 || chatsAfterBlocked != 2 {
+		t.Fatalf("unsafe replay must not reach upstream, got responses=%d chat=%d", responsesAfterBlocked, chatsAfterBlocked)
 	}
 }
 

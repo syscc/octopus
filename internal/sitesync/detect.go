@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -46,19 +47,25 @@ func DetectPlatform(ctx context.Context, rawURL string) (model.SitePlatform, mod
 	}
 	loweredURL := strings.ToLower(normalizedURL)
 
+	if parsed, err := url.Parse(normalizedURL); err == nil && model.IsCloudflareWorkersAIHost(parsed.Hostname()) {
+		// api.cloudflare.com only serves Workers AI here, so an unsupported path
+		// is a hard error instead of falling through to remote probing.
+		if validateErr := model.ValidateCloudflareWorkersAIBaseURL(parsed); validateErr != nil {
+			return "", "", validateErr
+		}
+		return model.SitePlatformCloudflare, model.SiteModelRouteTypeOpenAIChat, nil
+	}
 	for _, hint := range urlPlatformHints {
 		if strings.Contains(loweredURL, hint.pattern) {
 			return hint.platform, hint.defaultRouteType, nil
 		}
 	}
 
-	// Try fetching the page title
 	platform, err := detectByPageTitle(ctx, normalizedURL)
 	if err == nil && platform != "" {
 		return platform, "", nil
 	}
 
-	// Try /api/status endpoint
 	platform, err = detectByStatusEndpoint(ctx, normalizedURL)
 	if err == nil && platform != "" {
 		return platform, "", nil

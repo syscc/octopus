@@ -5,7 +5,7 @@ import {
     MorphingDialogDescription,
     useMorphingDialog,
 } from '@/components/ui/morphing-dialog';
-import { useCreateChannel, ChannelType, AutoGroupType } from '@/api/endpoints/channel';
+import { useCreateChannel, ChannelType, AutoGroupType, isOpenAIChannelType } from '@/api/endpoints/channel';
 import { useTranslations } from 'next-intl';
 import { toast } from '@/components/common/Toast';
 import { ChannelForm, type ChannelFormData } from './Form';
@@ -29,6 +29,9 @@ export function CreateDialogContent() {
         auto_group: AutoGroupType.None,
         enabled: true,
         match_regex: '',
+        openai_protocol_mode: 'auto',
+        openai_chat_capability: 'unknown',
+        openai_responses_capability: 'unknown',
     });
     const t = useTranslations('channel.create');
     const tProxy = useTranslations('proxyPool');
@@ -66,6 +69,10 @@ export function CreateDialogContent() {
                 auto_group: formData.auto_group,
                 custom_header: normalizedHeaders,
                 ws_mode: formData.ws_mode,
+                // Protocol mode only applies to OpenAI Chat/Responses channels.
+                ...(isOpenAIChannelType(formData.type)
+                    ? { openai_protocol_mode: formData.openai_protocol_mode }
+                    : {}),
                 param_override: paramOverride,
                 match_regex: formData.match_regex.trim(),
             },
@@ -87,8 +94,15 @@ export function CreateDialogContent() {
                         auto_group: AutoGroupType.None,
                         enabled: true,
                         match_regex: '',
+                        openai_protocol_mode: 'auto',
+                        openai_chat_capability: 'unknown',
+                        openai_responses_capability: 'unknown',
                     });
                     setIsOpen(false);
+                },
+                onError: (error) => {
+                    const errorMessage = error instanceof Error ? error.message : String(error);
+                    toast.error(t('submitFailed'), { description: errorMessage });
                 }
             });
     };

@@ -83,6 +83,7 @@ import {
     type SiteModelDisableUpdateRequest,
     type SiteModelRouteType,
     type SiteModelRouteUpdateRequest,
+    type OpenAIProtocolCapability,
     useCreateSiteChannelKey,
     useAddSiteManualModels,
     useDeleteSiteManualModel,
@@ -103,7 +104,6 @@ import {
     getRouteSourceTone,
     getRouteTypeTone,
     isSupportedRouteType,
-    MANUAL_MODEL_ROUTE_TYPES,
 } from './constants';
 import { translateSiteMessage } from '../site/site-message';
 import {
@@ -891,24 +891,129 @@ function SelectionCheckbox({
     );
 }
 
+// 只有这两个 route type 走 OpenAI 文本协议，才存在 Chat/Responses 的取舍。
+const isOpenAIRouteType = (routeType: SiteModelRouteType): boolean =>
+    routeType === 'openai_chat' || routeType === 'openai_response';
+
+// 协议勾选框。必须支持 disabled：勾选即保存，mutation 飞行期间再点会被
+// applyRouteChange 的 pendingModelKeys 过滤丢弃，但本地 protocolOverride
+// 已经更新，界面和服务端就此不一致，要等关掉弹层重开才纠正。
+function SimpleCheckbox({
+    checked,
+    onToggle,
+    disabled,
+}: {
+    checked: boolean;
+    onToggle: (checked: boolean) => void;
+    disabled?: boolean;
+}) {
+    return (
+        <button
+            type="button"
+            disabled={disabled}
+            aria-checked={checked}
+            role="checkbox"
+            onClick={(e) => {
+                e.stopPropagation();
+                onToggle(!checked);
+            }}
+            className={cn(
+                'flex size-4 items-center justify-center rounded border border-border bg-background transition',
+                disabled ? 'cursor-not-allowed opacity-50' : 'hover:border-foreground/60',
+            )}
+        >
+            {checked && <Check className="size-3 text-foreground" />}
+        </button>
+    );
+}
+
+// 勾选初值必须反映真实状态，而不是无条件两个都勾：手动锁定时只勾被允许的
+// 那一个；自动模式下两个协议都允许，但被运行时证伪（unsupported）的不勾，
+// 这样界面上的勾就是"网关实测支持"的意思。两个都被证伪时兜底保留主协议，
+// 避免出现无法提交的空选择。
+function initialProtocolSelection(model: SiteModelView): Set<'chat' | 'responses'> {
+    const primary: 'chat' | 'responses' = model.route_type === 'openai_response' ? 'responses' : 'chat';
+    if (model.disable_protocol_fallback) {
+        return new Set([primary]);
+    }
+    const next = new Set<'chat' | 'responses'>();
+    if (model.openai_chat_capability !== 'unsupported') next.add('chat');
+    if (model.openai_responses_capability !== 'unsupported') next.add('responses');
+    if (next.size === 0) next.add(primary);
+    return next;
+}
+
+// 协议能力的一行说明，让操作者知道这个勾是实测结论还是尚未探测。
+function protocolCapabilityHint(capability: OpenAIProtocolCapability | undefined): string {
+    switch (capability) {
+        case 'supported':
+            return '已实测支持';
+        case 'unsupported':
+            return '已实测不支持';
+        default:
+            return '未探测';
+    }
+}
+
 function MoveRoutePopover({
-    currentRouteType,
+    model,
+    routeTypes,
     disabled,
     buttonClassName,
     onMove,
 }: {
-    currentRouteType: SiteModelRouteType;
+    model: SiteModelView;
+    routeTypes: ReadonlyArray<SiteModelRouteType>;
     disabled?: boolean;
     buttonClassName?: string;
-    onMove: (routeType: SiteModelRouteType) => void;
+    onMove: (routeType: SiteModelRouteType, disableFallback?: boolean) => void;
 }) {
     const [open, setOpen] = useState(false);
-    // Legacy 'openai_response' rows map onto the single merged OpenAI entry so the
-    // menu never shows two OpenAI options and marks the right one as current.
-    const currentTarget = canonicalRouteTarget(currentRouteType);
+    const [protocolOverride, setProtocolOverride] = useState<Set<'chat' | 'responses'> | null>(null);
+    const currentTarget = canonicalRouteTarget(model.route_type);
+    // 未编辑时始终按当前模型状态推导勾选：运行时探测可能已经改写了能力列，
+    // 弹层里的勾必须跟着最新结论走，而不是停留在上次打开时的快照。编辑过
+    // 一次后以本地选择为准，直到弹层关闭时清空。
+    const selectedProtocols = protocolOverride ?? initialProtocolSelection(model);
+
+    const handleOpenChange = (next: boolean) => {
+        setOpen(next);
+        if (!next) {
+            setProtocolOverride(null);
+        }
+    };
+
+    // 按给定的协议集合提交一次切换。只勾一个时锁定到那个协议本身；两个都勾
+    // 时保留现有主协议（历史 openai_response 行不被改写成 openai_chat）。
+    // disabled 期间直接早退，与复选框的 disabled 属性形成双保险，避免上一次
+    // 提交还在飞就写入新的本地状态。
+    const submitProtocols = (protocols: Set<'chat' | 'responses'>) => {
+        if (disabled || protocols.size === 0) return;
+        const disableFallback = protocols.size === 1;
+        const nextRouteType: SiteModelRouteType = disableFallback
+            ? (protocols.has('responses') ? 'openai_response' : 'openai_chat')
+            : (isOpenAIRouteType(model.route_type) ? model.route_type : 'openai_chat');
+        onMove(nextRouteType, disableFallback);
+    };
+
+    // 勾选即保存：没有确认按钮，每次切换直接提交一次协议选择。
+    // 至少要留一个协议，全取消没有意义，静默忽略这次点击（勾看起来点不掉，
+    // 正好传达"不能都不选"）。
+    const commitProtocolSelection = (protocol: 'chat' | 'responses', checked: boolean) => {
+        if (disabled) return;
+        const next = new Set(selectedProtocols);
+        if (checked) {
+            next.add(protocol);
+        } else {
+            next.delete(protocol);
+        }
+        if (next.size === 0) return;
+        setProtocolOverride(next);
+        submitProtocols(next);
+    };
 
     return (
-        <Popover open={open} onOpenChange={setOpen}>
+        <Popover open={open} onOpenChange={handleOpenChange}>
             <PopoverTrigger asChild>
                 <button
                     type="button"
@@ -925,26 +1030,64 @@ function MoveRoutePopover({
                 <div className="space-y-2">
                     <div className="px-2 pt-1 text-xs font-medium text-muted-foreground">移动至...</div>
                     <div className="grid gap-1">
-                        {SITE_ROUTE_TARGET_ORDER.map((routeType) => (
-                            <button
-                                key={routeType}
-                                type="button"
-                                disabled={disabled || routeType === currentTarget}
-                                onClick={() => {
-                                    onMove(routeType);
-                                    setOpen(false);
-                                }}
-                                className={cn(
-                                    'flex items-center justify-between rounded-xl px-2 py-2 text-left text-sm transition',
-                                    routeType === currentTarget
-                                        ? 'bg-muted/60 text-muted-foreground'
-                                        : 'hover:bg-muted',
-                                )}
-                            >
-                                <span>{routeTypeLabel(routeType)}</span>
-                                {routeType === currentTarget ? <Check className="size-4" /> : null}
-                            </button>
-                        ))}
+                        {routeTypes.map((routeType) => {
+                            const isOpenAI = routeType === 'openai_chat';
+                            const isCurrent = routeType === currentTarget;
+
+                            return (
+                                <div key={routeType} className="space-y-1">
+                                    <button
+                                        type="button"
+                                        disabled={disabled || isCurrent}
+                                        onClick={() => {
+                                            // 点 OpenAI 主项就按当前勾选状态切过去，
+                                            // 不该要求用户必须去点下面的复选框。
+                                            if (isOpenAI) {
+                                                submitProtocols(selectedProtocols);
+                                            } else {
+                                                onMove(routeType);
+                                            }
+                                            handleOpenChange(false);
+                                        }}
+                                        className={cn(
+                                            'flex w-full items-center justify-between rounded-xl px-2 py-2 text-left text-sm transition',
+                                            'hover:bg-muted/80 disabled:cursor-not-allowed disabled:opacity-50',
+                                            isCurrent && 'bg-muted/50',
+                                        )}
+                                    >
+                                        <span className="font-medium">{routeTypeLabel(routeType)}</span>
+                                        {isCurrent && <Check className="size-4 text-primary" />}
+                                    </button>
+
+                                    {isOpenAI && (
+                                        <div className="ml-4 space-y-1 rounded-lg bg-muted/30 p-2">
+                                            <label className={cn('flex items-center gap-2', disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer')}>
+                                                <SimpleCheckbox
+                                                    checked={selectedProtocols.has('chat')}
+                                                    disabled={disabled}
+                                                    onToggle={(checked) => commitProtocolSelection('chat', checked)}
+                                                />
+                                                <span className="text-xs">OpenAI Chat</span>
+                                                <span className="ml-auto text-[10px] text-muted-foreground">
+                                                    {protocolCapabilityHint(model.openai_chat_capability)}
+                                                </span>
+                                            </label>
+                                            <label className={cn('flex items-center gap-2', disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer')}>
+                                                <SimpleCheckbox
+                                                    checked={selectedProtocols.has('responses')}
+                                                    disabled={disabled}
+                                                    onToggle={(checked) => commitProtocolSelection('responses', checked)}
+                                                />
+                                                <span className="text-xs">OpenAI Responses</span>
+                                                <span className="ml-auto text-[10px] text-muted-foreground">
+                                                    {protocolCapabilityHint(model.openai_responses_capability)}
+                                                </span>
+                                            </label>
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
                     </div>
                 </div>
             </PopoverContent>
@@ -971,6 +1114,7 @@ const SiteChannelTableView = forwardRef<
     SiteChannelTableHandle,
     {
         models: SiteModelView[];
+        routeTypes: ReadonlyArray<SiteModelRouteType>;
         resetKey: string;
         allVisibleSelected: boolean;
         pendingModelKeys: Set<string>;
@@ -981,13 +1125,14 @@ const SiteChannelTableView = forwardRef<
         onToggleModelSelection: (modelKey: string, checked: boolean) => void;
         onToggleAllVisible: (checked: boolean) => void;
         onSortChange: (field: SiteChannelTableSortField) => void;
-        onMoveModel: (model: SiteModelView, routeType: SiteModelRouteType) => void;
+        onMoveModel: (model: SiteModelView, routeType: SiteModelRouteType, disableFallback?: boolean) => void;
         onToggleDisabled: (model: SiteModelView) => void;
         onDeleteManualModel: (model: SiteModelView) => void;
         onNavigateToChannel: (channelId: number) => void;
     }
 >(function SiteChannelTableView({
     models,
+    routeTypes,
     resetKey,
     allVisibleSelected,
     pendingModelKeys,
@@ -1215,11 +1360,14 @@ const SiteChannelTableView = forwardRef<
                                 </div>
                                 <div role="cell" className="min-w-0">
                                     <div className="flex justify-end gap-1">
-                                        <MoveRoutePopover
-                                            currentRouteType={model.route_type}
-                                            disabled={isPending || model.disabled}
-                                            onMove={(routeType) => onMoveModel(model, routeType)}
-                                        />
+                                        {routeTypes.length > 1 ? (
+                                            <MoveRoutePopover
+                                                model={model}
+                                                routeTypes={routeTypes}
+                                                disabled={isPending || model.disabled}
+                                                onMove={(routeType, disableFallback) => onMoveModel(model, routeType, disableFallback)}
+                                            />
+                                        ) : null}
                                         <HoverCard>
                                             <HoverCardTrigger asChild>
                                                 <button
@@ -1276,6 +1424,7 @@ const SiteChannelTableView = forwardRef<
 
 function SiteAccountPanel({
     siteId,
+    platform,
     account,
     accounts,
     activeAccountId,
@@ -1287,6 +1436,7 @@ function SiteAccountPanel({
     onNavigateToChannel,
 }: {
     siteId: number;
+    platform: SiteChannelCard['platform'];
     account: SiteChannelAccount;
     accounts: SiteChannelAccount[];
     activeAccountId: number | null;
@@ -1299,6 +1449,8 @@ function SiteAccountPanel({
 }) {
     const t = useTranslations();
     const locale = useSettingStore((state) => state.locale);
+    const routeTargets: ReadonlyArray<SiteModelRouteType> =
+        platform === 'cloudflare' ? ['openai_chat'] : SITE_ROUTE_TARGET_ORDER;
     const [activeFilter, setActiveFilter] = useState<SiteChannelGroupFilter>(SITE_GROUP_FILTER_ALL);
     const [pendingRouteOverrides, setPendingRouteOverrides] = useState<Record<string, SiteModelRouteType>>({});
     const [pendingDisabledOverrides, setPendingDisabledOverrides] = useState<Record<string, boolean>>({});
@@ -1486,12 +1638,18 @@ function SiteAccountPanel({
         [visibleModels, selectedModelKeys],
     );
 
-    const applyRouteChange = useCallback((models: SiteModelView[], nextRouteType: SiteModelRouteType) => {
+    const applyRouteChange = useCallback((models: SiteModelView[], nextRouteType: SiteModelRouteType, disableFallback?: boolean) => {
         const eligibleModels = models.filter((model) => {
             const modelKey = makeModelKey(model.group_key, model.model_name);
+            if (pendingModelKeys.has(modelKey) || model.disabled) return false;
+            // 只改协议勾选时 route_type 可能不变，这种请求不能按"目标一致"丢掉，
+            // 否则勾选永远提交不上去；此时改用勾选本身是否有变化来判断。
+            if (disableFallback !== undefined && disableFallback !== model.disable_protocol_fallback) {
+                return true;
+            }
             // Compare on the merged target so "move to OpenAI" never rewrites a legacy
             // 'openai_response' row into 'openai_chat' and silently change its endpoint.
-            return !pendingModelKeys.has(modelKey) && !model.disabled && canonicalRouteTarget(model.route_type) !== nextRouteType;
+            return canonicalRouteTarget(model.route_type) !== nextRouteType;
         });
 
         if (eligibleModels.length === 0) return;
@@ -1501,6 +1659,7 @@ function SiteAccountPanel({
             group_key: model.group_key,
             model_name: model.model_name,
             route_type: nextRouteType,
+            disable_protocol_fallback: disableFallback,
         }));
 
         setPendingRouteOverrides((current) => {
@@ -2284,7 +2443,7 @@ function SiteAccountPanel({
                                         <SelectValue placeholder="目标端点" />
                                     </SelectTrigger>
                                     <SelectContent className="rounded-xl">
-                                        {SITE_ROUTE_TARGET_ORDER.map((routeType) => (
+                                        {routeTargets.map((routeType) => (
                                             <SelectItem key={routeType} value={routeType}>
                                                 {routeTypeLabel(routeType)}
                                             </SelectItem>
@@ -2461,7 +2620,7 @@ function SiteAccountPanel({
                             <Select value={manualModelRouteType} onValueChange={(value) => setManualModelRouteType(value as SiteModelRouteType)}>
                                 <SelectTrigger className="h-10 rounded-xl bg-background"><SelectValue /></SelectTrigger>
                                 <SelectContent className="rounded-xl">
-                                    {MANUAL_MODEL_ROUTE_TYPES.map((routeType) => (
+                                    {routeTargets.map((routeType) => (
                                         <SelectItem key={routeType} value={routeType}>{routeTypeLabel(routeType)}</SelectItem>
                                     ))}
                                 </SelectContent>
@@ -2621,6 +2780,7 @@ function SiteAccountPanel({
                     <SiteChannelTableView
                         ref={tableHandleRef}
                         models={visibleModels}
+                        routeTypes={routeTargets}
                         resetKey={modelsScopeKey}
                         allVisibleSelected={allVisibleSelected}
                         pendingModelKeys={pendingModelKeys}
@@ -2631,7 +2791,7 @@ function SiteAccountPanel({
                         onToggleModelSelection={handleToggleModelSelection}
                         onToggleAllVisible={handleToggleAllVisible}
                         onSortChange={handleSortChange}
-                        onMoveModel={(model, nextRouteType) => applyRouteChange([model], nextRouteType)}
+                        onMoveModel={(model, nextRouteType, disableFallback) => applyRouteChange([model], nextRouteType, disableFallback)}
                         onToggleDisabled={handleToggleDisabled}
                         onDeleteManualModel={handleDeleteManualModel}
                         onNavigateToChannel={onNavigateToChannel}
@@ -2841,6 +3001,7 @@ function SiteChannelDialog({
                         <SiteAccountPanel
                             key={resolvedAccount.account_id}
                             siteId={card.site_id}
+                            platform={card.platform}
                             account={resolvedAccount}
                             accounts={card.accounts}
                             activeAccountId={activeAccountId}

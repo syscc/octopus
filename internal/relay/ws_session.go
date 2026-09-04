@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
+	"github.com/bestruirui/octopus/internal/transformer/outbound"
 	openaiOutbound "github.com/bestruirui/octopus/internal/transformer/outbound/openai"
 )
 
@@ -20,6 +21,8 @@ type wsConversationState struct {
 	Transcript          []transformerModel.Message
 	ReplayAliases       []string
 	ReplayPending       bool
+	LastOutboundType    outbound.OutboundType
+	LastOutboundTypeSet bool
 }
 
 func (s *wsConversationState) MatchesRequestModel(requestModel string) bool {
@@ -96,6 +99,9 @@ func (s *wsConversationState) ShouldRewritePreviousResponseID(responseID string)
 
 func (s *wsConversationState) ShouldUseNativeContinuation(req *transformerModel.InternalLLMRequest) bool {
 	if s == nil || req == nil {
+		return false
+	}
+	if s.LastOutboundTypeSet && s.LastOutboundType == outbound.OutboundTypeOpenAIChat {
 		return false
 	}
 	if strings.TrimSpace(req.OpenAIPreviousResponseID()) == "" {
@@ -192,16 +198,55 @@ func (s *wsConversationState) BuildReplayRequest(req *transformerModel.InternalL
 	return replayed
 }
 
+// BuildChatReplayRequest turns a local Responses continuation into a complete
+// Chat transcript. It is used only when the response ID was produced by a Chat
+// fallback; native Responses-only controls remain ineligible for this replay.
+func (s *wsConversationState) BuildChatReplayRequest(req *transformerModel.InternalLLMRequest) *transformerModel.InternalLLMRequest {
+	if s == nil || req == nil || len(s.Transcript) == 0 {
+		return nil
+	}
+	replayed := cloneInternalRequest(req)
+	responsesOptions := replayed.GetOpenAIResponsesOptions()
+	responsesOptions.PreviousResponseID = nil
+	replayed.SetOpenAIResponsesOptions(responsesOptions)
+	if requiresNativeResponsesUpstream(replayed) {
+		return nil
+	}
+
+	responsesOptions.RawInputItems = nil
+	replayed.SetOpenAIResponsesOptions(responsesOptions)
+	replayed.Messages = retainInstructionMessages(req.Messages)
+	replayed.Messages = append(replayed.Messages, retainNonInstructionMessages(s.Transcript)...)
+	replayed.Messages = append(replayed.Messages, retainNonInstructionMessages(req.Messages)...)
+	if len(replayed.Messages) == 0 {
+		return nil
+	}
+	return replayed
+}
+
 func (s *wsConversationState) ApplySuccessfulTurn(req *transformerModel.InternalLLMRequest, resp *transformerModel.InternalLLMResponse) {
 	if s == nil || req == nil || resp == nil {
 		return
 	}
 	s.RequestModel = strings.TrimSpace(req.Model)
-	if replayWindowItems, ok := buildNextReplayWindow(s.ReplayWindowItems, req, resp); ok {
+	if s.LastOutboundTypeSet && s.LastOutboundType == outbound.OutboundTypeOpenAIChat {
+		s.Transcript = append(s.Transcript, retainNonInstructionMessages(req.Messages)...)
+	} else {
+		s.Transcript = append(s.Transcript, cloneMessages(req.Messages)...)
+	}
+	s.Transcript = append(s.Transcript, assistantMessagesFromResponse(resp)...)
+	useTranscriptWindow := (s.LastOutboundTypeSet && s.LastOutboundType == outbound.OutboundTypeOpenAIChat) ||
+		(!s.LastOutboundTypeSet && len(resp.RawResponsesOutputItems) == 0)
+	if useTranscriptWindow {
+		// Chat fallbacks do not carry native Responses output items. Rebuild the
+		// replay window from the complete transcript so later exact replay cannot
+		// omit the assistant turn.
+		if transcriptItems, err := openaiOutbound.MarshalResponsesInputItems(s.Transcript); err == nil && len(transcriptItems) > 0 {
+			s.ReplayWindowItems = transcriptItems
+		}
+	} else if replayWindowItems, ok := buildNextReplayWindow(s.ReplayWindowItems, req, resp); ok {
 		s.ReplayWindowItems = replayWindowItems
 	}
-	s.Transcript = append(s.Transcript, cloneMessages(req.Messages)...)
-	s.Transcript = append(s.Transcript, assistantMessagesFromResponse(resp)...)
 	if respID := strings.TrimSpace(resp.ID); respID != "" {
 		s.LastResponseID = respID
 	}
@@ -221,6 +266,8 @@ func cloneWSConversationState(state *wsConversationState) *wsConversationState {
 		Transcript:          cloneMessages(state.Transcript),
 		ReplayAliases:       append([]string(nil), state.ReplayAliases...),
 		ReplayPending:       state.ReplayPending,
+		LastOutboundType:    state.LastOutboundType,
+		LastOutboundTypeSet: state.LastOutboundTypeSet,
 	}
 }
 
@@ -366,6 +413,20 @@ func retainInstructionMessages(messages []transformerModel.Message) []transforme
 		if msg.Role == "system" || msg.Role == "developer" {
 			kept = append(kept, cloneMessage(msg))
 		}
+	}
+	return kept
+}
+
+func retainNonInstructionMessages(messages []transformerModel.Message) []transformerModel.Message {
+	if len(messages) == 0 {
+		return nil
+	}
+	kept := make([]transformerModel.Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Role == "system" || msg.Role == "developer" {
+			continue
+		}
+		kept = append(kept, cloneMessage(msg))
 	}
 	return kept
 }

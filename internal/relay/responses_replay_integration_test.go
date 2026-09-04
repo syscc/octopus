@@ -1,12 +1,16 @@
 package relay
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
+	openaiInbound "github.com/bestruirui/octopus/internal/transformer/inbound/openai"
 	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
+	"github.com/bestruirui/octopus/internal/transformer/outbound"
+	openaiOutbound "github.com/bestruirui/octopus/internal/transformer/outbound/openai"
 )
 
 // TestHTTPReplayIntegration tests the complete HTTP replay flow:
@@ -467,6 +471,49 @@ func TestHTTPReplayFailedMergeKeepsOriginalRequest(t *testing.T) {
 		t.Fatal("expected BuildReplayRequest to return nil on merge failure, but got non-nil")
 	}
 
-	// The caller (relay.go) should detect nil and keep the original request
-	// This ensures previous_response_id is preserved and can fall back to native continuation
+	// Handler must reject this local continuation instead of forwarding its
+	// process-local previous_response_id to an upstream provider.
+}
+
+func TestStreamingResponsesReplayPreservesRawReasoningItems(t *testing.T) {
+	ctx := context.Background()
+	outAdapter := &openaiOutbound.ResponseOutbound{}
+	inAdapter := &openaiInbound.ResponseInbound{}
+	payloads := []string{
+		`{"type":"response.created","response":{"id":"resp_reasoning","model":"gpt-test","created_at":42,"status":"in_progress","output":[]}}`,
+		`{"type":"response.completed","response":{"id":"resp_reasoning","model":"gpt-test","created_at":42,"status":"completed","output":[{"id":"rs_1","type":"reasoning","encrypted_content":"enc_sig","summary":[{"type":"summary_text","text":"thinking"}]},{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"answer"}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`,
+	}
+	for _, payload := range payloads {
+		events, err := outAdapter.TransformStreamEvent(ctx, []byte(payload))
+		if err != nil {
+			t.Fatalf("TransformStreamEvent failed: %v", err)
+		}
+		if _, err := inAdapter.TransformStreamEvents(ctx, events); err != nil {
+			t.Fatalf("TransformStreamEvents failed: %v", err)
+		}
+	}
+	internalResponse, err := inAdapter.GetInternalResponse(ctx)
+	if err != nil || internalResponse == nil {
+		t.Fatalf("expected aggregated internal response, got resp=%+v err=%v", internalResponse, err)
+	}
+	if !strings.Contains(string(internalResponse.RawResponsesOutputItems), `"encrypted_content":"enc_sig"`) {
+		t.Fatalf("expected raw reasoning item after stream aggregation, got %s", internalResponse.RawResponsesOutputItems)
+	}
+
+	request := &transformerModel.InternalLLMRequest{
+		Model:         "gpt-test",
+		RawAPIFormat:  transformerModel.APIFormatOpenAIResponse,
+		RawInputItems: json.RawMessage(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]`),
+	}
+	state := &wsConversationState{
+		LastOutboundType:    outbound.OutboundTypeOpenAIResponse,
+		LastOutboundTypeSet: true,
+	}
+	state.ApplySuccessfulTurn(request, internalResponse)
+	window := string(state.ReplayWindowItems)
+	for _, expected := range []string{`"id":"rs_1"`, `"encrypted_content":"enc_sig"`, `"id":"msg_1"`} {
+		if !strings.Contains(window, expected) {
+			t.Fatalf("expected replay window to contain %s, got %s", expected, window)
+		}
+	}
 }

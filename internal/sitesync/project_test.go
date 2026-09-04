@@ -49,6 +49,16 @@ func TestBuildProjectedChannelBaseURL(t *testing.T) {
 			expected: "https://gemini.example.com/v1",
 		},
 		{
+			name:     "cloudflare account path appends ai v1",
+			site:     &model.Site{Platform: model.SitePlatformCloudflare, BaseURL: "https://api.cloudflare.com/client/v4/accounts/account-id"},
+			expected: "https://api.cloudflare.com/client/v4/accounts/account-id/ai/v1",
+		},
+		{
+			name:     "cloudflare documented base preserves ai v1",
+			site:     &model.Site{Platform: model.SitePlatformCloudflare, BaseURL: "https://api.cloudflare.com/client/v4/accounts/account-id/ai/v1"},
+			expected: "https://api.cloudflare.com/client/v4/accounts/account-id/ai/v1",
+		},
+		{
 			name:     "nil site returns empty",
 			site:     nil,
 			expected: "",
@@ -1152,5 +1162,52 @@ func assertProjectedChannel(t *testing.T, channelsByGroup map[string]model.Chann
 	}
 	if expectedName, ok := expectedNames[groupKey]; ok && channel.Name != expectedName {
 		t.Fatalf("expected channel %q name %q, got %q", groupKey, expectedName, channel.Name)
+	}
+}
+
+// TestHasUsableTokenRequiresEnabledToken locks in the projection-activation
+// contract: a group whose tokens are all disabled has no usable token and
+// must not project an enabled channel. Masked tokens stay unusable too.
+func TestHasUsableTokenRequiresEnabledToken(t *testing.T) {
+	allDisabled := []model.SiteToken{
+		{Token: "key-disabled", GroupKey: "default", GroupName: "default", Enabled: false, ValueStatus: model.SiteTokenValueStatusReady},
+	}
+	if hasUsableToken(allDisabled) {
+		t.Fatalf("expected group with only disabled tokens to have no usable token")
+	}
+
+	mixed := append([]model.SiteToken{}, allDisabled...)
+	mixed = append(mixed, model.SiteToken{Token: "key-enabled", GroupKey: "default", GroupName: "default", Enabled: true, ValueStatus: model.SiteTokenValueStatusReady})
+	if !hasUsableToken(mixed) {
+		t.Fatalf("expected an enabled ready token to count as usable")
+	}
+
+	maskedOnly := []model.SiteToken{
+		{Token: "yzFy**********OTkb", GroupKey: "default", GroupName: "default", Enabled: true, ValueStatus: model.SiteTokenValueStatusMaskedPending},
+	}
+	if hasUsableToken(maskedOnly) {
+		t.Fatalf("expected masked tokens to be unusable even when enabled")
+	}
+}
+
+// TestBuildChannelKeysKeepsDisabledTokenRows verifies that buildChannelKeys
+// still emits key rows for disabled tokens (with Enabled=false) so the
+// management view and key diffing keep working; only hasUsableToken gates
+// projection activation on the enabled flag.
+func TestBuildChannelKeysKeepsDisabledTokenRows(t *testing.T) {
+	tokens := []model.SiteToken{
+		{Token: "key-disabled", GroupKey: "default", GroupName: "default", Enabled: false, ValueStatus: model.SiteTokenValueStatusReady},
+		{Token: "key-enabled", GroupKey: "default", GroupName: "default", Enabled: true, ValueStatus: model.SiteTokenValueStatusReady},
+	}
+
+	keys := buildChannelKeys(tokens, model.SitePlatformNewAPI)
+	if len(keys) != 2 {
+		t.Fatalf("expected disabled token to keep a projected key row, got %d keys", len(keys))
+	}
+	if keys[0].ChannelKey != "sk-key-disabled" || keys[0].Enabled {
+		t.Fatalf("expected disabled key row preserved with enabled=false, got %+v", keys[0])
+	}
+	if keys[1].ChannelKey != "sk-key-enabled" || !keys[1].Enabled {
+		t.Fatalf("expected enabled key row preserved with enabled=true, got %+v", keys[1])
 	}
 }

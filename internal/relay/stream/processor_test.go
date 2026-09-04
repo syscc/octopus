@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bestruirui/octopus/internal/transformer/model"
 )
 
 // mockStreamWriter implements StreamWriter for testing.
@@ -131,6 +133,229 @@ func TestStreamProcessor_WithTransform(t *testing.T) {
 	expected := "data: chunk1\n\ndata: chunk2\n\n"
 	if output != expected {
 		t.Errorf("unexpected output:\ngot:  %q\nwant: %q", output, expected)
+	}
+}
+
+func TestStreamProcessor_FinalizeWritesTerminalPayload(t *testing.T) {
+	source := newMockStreamSource([][]byte{[]byte(`finish`)})
+	writer := newMockStreamWriter()
+	firstTokenCalled := false
+	processor := NewStreamProcessor(StreamConfig{
+		Source:  source,
+		Writer:  writer,
+		Context: context.Background(),
+		Transform: func(context.Context, []byte) ([]byte, error) {
+			return nil, nil
+		},
+		Finalize: func(context.Context) ([]byte, error) {
+			return []byte("data: terminal\n\n"), nil
+		},
+		OnFirstToken: func() {
+			firstTokenCalled = true
+		},
+	})
+
+	if err := processor.Run(); err != nil {
+		t.Fatalf("unexpected finalize error: %v", err)
+	}
+	if got := writer.buffer.String(); got != "data: terminal\n\n" {
+		t.Fatalf("unexpected finalized output %q", got)
+	}
+	if !processor.PayloadWritten() || !firstTokenCalled {
+		t.Fatalf("expected finalized payload to count as the first token")
+	}
+}
+
+func TestStreamProcessor_FinalizeErrorStillWritesOutput(t *testing.T) {
+	source := newMockStreamSource(nil)
+	writer := newMockStreamWriter()
+	firstTokenCalled := false
+	processor := NewStreamProcessor(StreamConfig{
+		Source:  source,
+		Writer:  writer,
+		Context: context.Background(),
+		Finalize: func(context.Context) ([]byte, error) {
+			return []byte("data: {\"type\":\"response.incomplete\"}\n\n"), model.ErrIncompleteUpstreamStream
+		},
+		OnFirstToken: func() {
+			firstTokenCalled = true
+		},
+	})
+
+	err := processor.Run()
+	if err == nil {
+		t.Fatal("expected incomplete finalize error")
+	}
+	if !errors.Is(err, model.ErrIncompleteUpstreamStream) {
+		t.Fatalf("expected ErrIncompleteUpstreamStream, got %v", err)
+	}
+	if got := writer.buffer.String(); !strings.Contains(got, "response.incomplete") {
+		t.Fatalf("finalize output must be written before the error is propagated, got %q", got)
+	}
+	if !processor.PayloadWritten() || !firstTokenCalled {
+		t.Fatal("written finalize payload must count as first token")
+	}
+}
+
+func TestStreamProcessorTransformOutputAndErrorFinalizeOnce(t *testing.T) {
+	semanticErr := errors.New("semantic terminal failure")
+	source := newMockStreamSource([][]byte{[]byte("upstream")})
+	writer := newMockStreamWriter()
+	finishCalls := 0
+	interruptedCalls := 0
+	processor := NewStreamProcessor(StreamConfig{
+		Source:  source,
+		Writer:  writer,
+		Context: context.Background(),
+		Transform: func(context.Context, []byte) ([]byte, error) {
+			return []byte("data: {\"type\":\"error\"}\n\n"), semanticErr
+		},
+		TerminalObserver: func() (model.PassthroughTerminalOutcome, error) {
+			return model.PassthroughTerminalOutcomeFailed, semanticErr
+		},
+		OnInterrupted: func(context.Context, []byte) ([]byte, error) {
+			interruptedCalls++
+			return []byte("data: synthetic\n\n"), nil
+		},
+		OnFinish: func(context.Context, []byte) error {
+			finishCalls++
+			return nil
+		},
+	})
+
+	err := processor.Run()
+	if !errors.Is(err, semanticErr) {
+		t.Fatalf("expected semantic error, got %v", err)
+	}
+	if got := writer.buffer.String(); strings.Count(got, "data:") != 1 || !strings.Contains(got, `"type":"error"`) {
+		t.Fatalf("expected one delivered terminal frame, got %q", got)
+	}
+	if processor.PassthroughOutcome() != model.PassthroughTerminalOutcomeFailed {
+		t.Fatalf("outcome = %q, want failed", processor.PassthroughOutcome())
+	}
+	if finishCalls != 1 || interruptedCalls != 0 {
+		t.Fatalf("expected exactly one finish and no synthetic interruption, finish=%d interrupted=%d", finishCalls, interruptedCalls)
+	}
+}
+
+func TestStreamProcessorCommentOnlyEOFIsEmpty(t *testing.T) {
+	source := newMockStreamSource([][]byte{[]byte(": keep-alive\n\n")})
+	writer := newMockStreamWriter()
+	processor := NewStreamProcessor(StreamConfig{
+		Source:          source,
+		Writer:          writer,
+		Context:         context.Background(),
+		BufferRawStream: true,
+		TransformWithOutcome: func(_ context.Context, data []byte, _ bool) StreamTransformResult {
+			return StreamTransformResult{Output: data, NonPayload: true}
+		},
+	})
+
+	err := processor.Run()
+	if !errors.Is(err, ErrEmptyUpstreamStream) {
+		t.Fatalf("comment-only EOF error = %v, want ErrEmptyUpstreamStream", err)
+	}
+	if processor.PayloadWritten() {
+		t.Fatal("comment-only stream must not count as payload")
+	}
+	if got := writer.buffer.String(); got != ": keep-alive\n\n" {
+		t.Fatalf("comment should still be forwarded, got %q", got)
+	}
+}
+
+func TestStreamProcessor_PassthroughIncompleteTerminalAtEOF(t *testing.T) {
+	partial := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+	source := newMockStreamSource([][]byte{[]byte(partial)})
+	writer := newMockStreamWriter()
+	onFinishCalled := false
+	cleanupErr := errors.New("cleanup failed")
+	processor := NewStreamProcessor(StreamConfig{
+		Source:          source,
+		Writer:          writer,
+		Context:         context.Background(),
+		BufferRawStream: true,
+		TerminalEvents: map[string]struct{}{
+			"response.completed": {},
+		},
+		IncompleteFinalize: func(ctx context.Context, rawStream []byte) ([]byte, error) {
+			if !bytes.Contains(rawStream, []byte("response.output_text.delta")) {
+				t.Fatalf("incomplete finalizer must receive the buffered raw stream, got %q", rawStream)
+			}
+			return []byte("data: {\"type\":\"response.incomplete\"}\n\n"), model.ErrIncompleteUpstreamStream
+		},
+		OnFinish: func(context.Context, []byte) error {
+			onFinishCalled = true
+			return cleanupErr
+		},
+	})
+
+	err := processor.Run()
+	if !errors.Is(err, model.ErrIncompleteUpstreamStream) {
+		t.Fatalf("expected ErrIncompleteUpstreamStream, got %v", err)
+	}
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("expected OnFinish error to be joined without losing incomplete sentinel, got %v", err)
+	}
+	output := writer.buffer.String()
+	if !strings.Contains(output, partial) {
+		t.Fatalf("original passthrough bytes must be preserved, got %q", output)
+	}
+	if strings.Count(output, "response.incomplete") != 1 {
+		t.Fatalf("expected exactly one synthesized response.incomplete, got %q", output)
+	}
+	if strings.Contains(output, "response.completed") {
+		t.Fatalf("completed must not be synthesized, got %q", output)
+	}
+	if !processor.PayloadWritten() || !onFinishCalled {
+		t.Fatal("incomplete terminal must leave payloadWritten true and run OnFinish")
+	}
+}
+
+func TestStreamProcessor_PassthroughTerminalStreamSucceeds(t *testing.T) {
+	source := newMockStreamSource([][]byte{[]byte("data: {\"type\":\"response.output_text.delta\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")})
+	writer := newMockStreamWriter()
+	processor := NewStreamProcessor(StreamConfig{
+		Source:          source,
+		Writer:          writer,
+		Context:         context.Background(),
+		BufferRawStream: true,
+		TerminalEvents: map[string]struct{}{
+			"response.completed": {},
+		},
+		IncompleteFinalize: func(ctx context.Context, rawStream []byte) ([]byte, error) {
+			t.Fatal("incomplete finalizer must not run for a terminal stream")
+			return nil, nil
+		},
+	})
+
+	if err := processor.Run(); err != nil {
+		t.Fatalf("terminal passthrough stream must succeed, got %v", err)
+	}
+	output := writer.buffer.String()
+	if strings.Count(output, "response.completed") != 1 || strings.Contains(output, "response.incomplete") {
+		t.Fatalf("terminal stream bytes must be preserved verbatim, got %q", output)
+	}
+}
+
+func TestStreamProcessor_PassthroughIncompleteDisabledWithoutTerminalEvents(t *testing.T) {
+	source := newMockStreamSource([][]byte{[]byte("data: legacy\n\n")})
+	writer := newMockStreamWriter()
+	processor := NewStreamProcessor(StreamConfig{
+		Source:          source,
+		Writer:          writer,
+		Context:         context.Background(),
+		BufferRawStream: true,
+		IncompleteFinalize: func(ctx context.Context, rawStream []byte) ([]byte, error) {
+			t.Fatal("incomplete finalizer must not run without configured terminal events")
+			return nil, nil
+		},
+	})
+
+	if err := processor.Run(); err != nil {
+		t.Fatalf("legacy non-terminal passthrough must stay successful, got %v", err)
+	}
+	if !processor.PayloadWritten() {
+		t.Fatal("payload should be written")
 	}
 }
 

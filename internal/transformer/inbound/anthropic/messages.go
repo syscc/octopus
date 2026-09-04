@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/bestruirui/octopus/internal/transformer/compat"
@@ -15,13 +16,16 @@ import (
 )
 
 type MessagesInbound struct {
-	// Stream state tracking
+	// Stream state tracking. hasStarted means a client-visible message_start
+	// was emitted for this stream.
 	hasStarted                bool
 	hasTextContentStarted     bool
 	hasThinkingContentStarted bool
 	hasToolContentStarted     bool
 	hasFinished               bool
 	messageStopped            bool
+	terminalOutcome           model.PassthroughTerminalOutcome
+	terminalError             error
 	messageID                 string
 	modelName                 string
 	contentIndex              int64
@@ -453,6 +457,7 @@ func (i *MessagesInbound) TransformRequest(ctx context.Context, body []byte) (*m
 			log.Warnf("unknown thinking type: %s", anthropicReq.Thinking.Type)
 		}
 	}
+	chatReq.SetTransformerMetadataValue(model.TransformerMetadataAnthropicEstimatedInputTokens, strconv.FormatInt(i.inputToken, 10))
 	return chatReq, nil
 }
 
@@ -726,6 +731,9 @@ func (i *MessagesInbound) TransformResponse(ctx context.Context, response *model
 }
 
 func (i *MessagesInbound) TransformStream(ctx context.Context, stream *model.InternalLLMResponse) ([]byte, error) {
+	if stream == nil || i.messageStopped {
+		return nil, nil
+	}
 	// Handle upstream error event: forward as Anthropic SSE `event: error` and
 	// terminate the stream. Reference:
 	// https://docs.anthropic.com/en/api/messages-streaming#error-events
@@ -746,6 +754,8 @@ func (i *MessagesInbound) TransformStream(ctx context.Context, stream *model.Int
 			return nil, fmt.Errorf("failed to marshal error event: %w", err)
 		}
 		i.messageStopped = true
+		i.terminalOutcome = model.PassthroughTerminalOutcomeFailed
+		i.terminalError = stream.Error
 		return formatSSEEvent("error", data), nil
 	}
 
@@ -1212,15 +1222,22 @@ func (i *MessagesInbound) TransformStream(ctx context.Context, stream *model.Int
 }
 
 func (i *MessagesInbound) TransformStreamEvents(ctx context.Context, events []model.StreamEvent) ([]byte, error) {
-	if len(events) == 0 {
+	if len(events) == 0 || i.messageStopped {
 		return nil, nil
 	}
-	if stream := model.InternalResponseFromStreamEvents(events); stream != nil && stream.Object != "[DONE]" {
+
+	// An error wins over Done when both are delivered in one provider frame.
+	// Process only the prefix before the first wire terminal; a later real
+	// error is retained for semantic failure without allowing post-terminal
+	// payload or success finalization to leak.
+	processEvents, errorEvent, hasDone := model.SplitStreamEventsAtTerminal(events)
+	batchHasError := errorEvent != nil
+	if stream := model.InternalResponseFromStreamEvents(processEvents); stream != nil && stream.Object != "[DONE]" {
 		i.streamAggregator.Add(stream)
 	}
 
 	var firstUsage *model.Usage
-	for _, event := range events {
+	for _, event := range processEvents {
 		if event.Usage != nil {
 			firstUsage = event.Usage
 			break
@@ -1332,7 +1349,7 @@ func (i *MessagesInbound) TransformStreamEvents(ctx context.Context, events []mo
 		return nil
 	}
 
-	for _, event := range events {
+	for _, event := range processEvents {
 		if event.ID != "" {
 			i.messageID = event.ID
 		}
@@ -1483,7 +1500,7 @@ func (i *MessagesInbound) TransformStreamEvents(ctx context.Context, events []mo
 			i.stopSequence = event.StopSequence
 			i.hasFinished = true
 		case model.StreamEventKindUsageDelta:
-			if event.Usage != nil && i.hasFinished && !i.messageStopped {
+			if !batchHasError && event.Usage != nil && i.hasFinished && !i.messageStopped {
 				finalEvents, err := i.finalizeStreamMessage(event.Usage)
 				if err != nil {
 					return nil, err
@@ -1491,7 +1508,7 @@ func (i *MessagesInbound) TransformStreamEvents(ctx context.Context, events []mo
 				out = append(out, finalEvents...)
 			}
 		case model.StreamEventKindDone:
-			if i.hasFinished && !i.messageStopped {
+			if !batchHasError && i.hasFinished && !i.messageStopped {
 				finalEvents, err := i.finalizeStreamMessage(nil)
 				if err != nil {
 					return nil, err
@@ -1499,21 +1516,35 @@ func (i *MessagesInbound) TransformStreamEvents(ctx context.Context, events []mo
 				out = append(out, finalEvents...)
 			}
 		case model.StreamEventKindError:
-			if event.Error == nil {
-				continue
-			}
-			errType := event.Error.Detail.Type
-			if errType == "" {
-				errType = "api_error"
-			}
-			errPayload := StreamEvent{Type: "error", Error: &ErrorDetail{Type: errType, Message: event.Error.Detail.Message}}
-			data, err := json.Marshal(errPayload)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal error event: %w", err)
-			}
-			i.messageStopped = true
-			out = append(out, formatSSEEvent("error", data))
+			// Real errors are handled once, after the prefix, so a Done/usage
+			// event earlier in the same batch cannot emit a second terminal.
+			continue
 		}
+	}
+
+	if errorEvent == nil && hasDone && i.hasFinished && !i.messageStopped {
+		finalEvents, err := i.finalizeStreamMessage(nil)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, finalEvents...)
+	}
+
+	if errorEvent != nil {
+		event := *errorEvent
+		errType := event.Error.Detail.Type
+		if errType == "" {
+			errType = "api_error"
+		}
+		errPayload := StreamEvent{Type: "error", Error: &ErrorDetail{Type: errType, Message: event.Error.Detail.Message}}
+		data, err := json.Marshal(errPayload)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal error event: %w", err)
+		}
+		i.messageStopped = true
+		i.terminalOutcome = model.PassthroughTerminalOutcomeFailed
+		i.terminalError = event.Error
+		out = append(out, formatSSEEvent("error", data))
 	}
 
 	if len(out) == 0 {
@@ -1566,10 +1597,93 @@ func (i *MessagesInbound) finalizeStreamMessage(usage *model.Usage) ([][]byte, e
 	}
 
 	i.messageStopped = true
+	i.terminalOutcome = model.PassthroughTerminalOutcomeCompleted
 	return [][]byte{
 		formatSSEEvent("message_delta", data),
 		formatSSEEvent("message_stop", stopData),
 	}, nil
+}
+
+// finalizeIncompleteMessage closes any open content block and emits the
+// protocol's final message_delta/message_stop pair without inventing a stop
+// reason or usage. It is used only after an upstream stream was interrupted or
+// ended cleanly without the required message_stop terminal.
+func (i *MessagesInbound) finalizeIncompleteMessage() ([]byte, error) {
+	if i.messageStopped || !i.hasStarted {
+		return nil, nil
+	}
+
+	events := make([][]byte, 0, 3)
+	if i.hasOpenContentBlock() {
+		stopEvent := StreamEvent{Type: "content_block_stop", Index: &i.contentIndex}
+		stopData, err := json.Marshal(stopEvent)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal incomplete content_block_stop event: %w", err)
+		}
+		events = append(events, formatSSEEvent("content_block_stop", stopData))
+		i.resetOpenContentState()
+		i.contentIndex++
+	}
+
+	// A finish_reason chunk is not an Anthropic message_stop terminal. Do not
+	// copy its stop reason into the synthetic incomplete message_delta.
+	stopReason, stopSequence := i.stopReason, i.stopSequence
+	i.stopReason = nil
+	i.stopSequence = nil
+	finalEvents, err := i.finalizeStreamMessage(nil)
+	i.stopReason = stopReason
+	i.stopSequence = stopSequence
+	if err != nil {
+		return nil, err
+	}
+	events = append(events, finalEvents...)
+	return joinSSEEvents(events), nil
+}
+
+// FinalizeStream closes a transform-mode Anthropic stream that reached clean
+// EOF without message_stop. The visible prefix remains valid, but the turn is
+// incomplete; no stop reason or usage is synthesized.
+func (i *MessagesInbound) FinalizeStream(ctx context.Context) ([]byte, error) {
+	output, err := i.finalizeIncompleteMessage()
+	if err != nil {
+		return output, err
+	}
+	if len(output) == 0 {
+		return nil, nil
+	}
+	i.terminalOutcome = model.PassthroughTerminalOutcomeIncomplete
+	i.terminalError = model.ErrIncompleteUpstreamStream
+	return output, model.ErrIncompleteUpstreamStream
+}
+
+// FinalizeIncompleteStream synthesizes a legal Anthropic terminal for a raw
+// passthrough stream that reached EOF without message_stop. The sentinel tells
+// relay that the attempt is a hard failure even though a terminal was sent.
+func (i *MessagesInbound) FinalizeIncompleteStream(ctx context.Context, _ []byte) ([]byte, error) {
+	return i.FinalizeStream(ctx)
+}
+
+// FinalizeInterruptedStream is the transform-mode counterpart to
+// FinalizeIncompleteStream. It never upgrades a finish signal to a successful
+// completion after the transport itself failed.
+func (i *MessagesInbound) FinalizeInterruptedStream(ctx context.Context) ([]byte, error) {
+	return i.FinalizeStream(ctx)
+}
+
+// InitializeResponse restores immutable request-derived state on the fresh
+// adapter used for one network attempt. Mutable stream state remains zeroed.
+func (i *MessagesInbound) InitializeResponse(request *model.InternalLLMRequest) {
+	if request == nil {
+		return
+	}
+	inputTokens, err := strconv.ParseInt(request.TransformerMetadataValue(model.TransformerMetadataAnthropicEstimatedInputTokens), 10, 64)
+	if err == nil && inputTokens >= 0 {
+		i.inputToken = inputTokens
+	}
+}
+
+func (i *MessagesInbound) StreamTerminalOutcome() (model.PassthroughTerminalOutcome, error) {
+	return i.terminalOutcome, i.terminalError
 }
 
 func joinSSEEvents(events [][]byte) []byte {

@@ -15,12 +15,17 @@ import (
 
 	"github.com/bestruirui/octopus/internal/client"
 	"github.com/bestruirui/octopus/internal/conf"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 	"github.com/bestruirui/octopus/internal/utils/log"
 )
 
 const (
 	updateUrl    = "https://github.com/syscc/octopus/releases/latest/download"
 	updateApiUrl = "https://api.github.com/repos/syscc/octopus/releases/latest"
+
+	// Release archives are larger than JSON metadata but remain explicitly bounded
+	// to prevent an untrusted download from growing memory without limit.
+	maxUpdateArchiveBodyBytes int64 = 256 << 20
 )
 
 type LatestInfo struct {
@@ -32,17 +37,50 @@ type LatestInfo struct {
 
 var github_pat = os.Getenv(strings.ToUpper(conf.APP_NAME) + "_GITHUB_PAT")
 
-// doRequestWithFallback performs an HTTP GET request, first without proxy, then with proxy if failed.
+// doRequestWithFallback performs an HTTP GET request for binary downloads. Binary
+// update archives use their own explicit limit; JSON metadata uses
+// doJSONRequestWithFallback below so its response is bounded separately.
 func doRequestWithFallback(url string) ([]byte, error) {
-	data, err := doRequest(url, false)
+	data, err := doRequest(url, false, maxUpdateArchiveBodyBytes)
 	if err == nil {
 		return data, nil
 	}
 	log.Warnf("direct request failed, trying with proxy: %v", err)
-	return doRequest(url, true)
+	return doRequest(url, true, maxUpdateArchiveBodyBytes)
 }
 
-func doRequest(url string, useProxy bool) ([]byte, error) {
+func doJSONRequestWithFallback(url string) ([]byte, error) {
+	data, err := doJSONRequest(url, false)
+	if err == nil {
+		return data, nil
+	}
+	log.Warnf("direct request failed, trying with proxy: %v", err)
+	return doJSONRequest(url, true)
+}
+
+func doRequest(url string, useProxy bool, maxBytes int64) ([]byte, error) {
+	return doRequestWithReader(url, useProxy, func(resp *http.Response) ([]byte, error) {
+		return readUpdateArchiveResponse(resp, maxBytes)
+	})
+}
+
+func doJSONRequest(url string, useProxy bool) ([]byte, error) {
+	return doRequestWithReader(url, useProxy, readUpdateJSONResponse)
+}
+
+func readUpdateArchiveResponse(resp *http.Response, maxBytes int64) ([]byte, error) {
+	limit := maxBytes
+	if httpbody.IsErrorStatus(resp.StatusCode) && limit > httpbody.MaxErrorResponseBodyBytes {
+		limit = httpbody.MaxErrorResponseBodyBytes
+	}
+	return httpbody.ReadAll(resp.Body, limit)
+}
+
+func readUpdateJSONResponse(resp *http.Response) ([]byte, error) {
+	return httpbody.ReadResponse(resp)
+}
+
+func doRequestWithReader(url string, useProxy bool, readBody func(*http.Response) ([]byte, error)) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -68,7 +106,7 @@ func doRequest(url string, useProxy bool) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := readBody(resp)
 	if err != nil {
 		log.Debugf("read body failed: %v", err)
 		return nil, err
@@ -77,7 +115,7 @@ func doRequest(url string, useProxy bool) ([]byte, error) {
 }
 
 func GetLatestInfo() (*LatestInfo, error) {
-	body, err := doRequestWithFallback(updateApiUrl)
+	body, err := doJSONRequestWithFallback(updateApiUrl)
 	if err != nil {
 		return nil, err
 	}

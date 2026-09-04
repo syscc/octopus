@@ -14,13 +14,14 @@ import (
 type SitePlatform string
 
 const (
-	SitePlatformNewAPI    SitePlatform = "new-api"
-	SitePlatformAnyRouter SitePlatform = "anyrouter"
-	SitePlatformOneAPI    SitePlatform = "one-api"
-	SitePlatformOneHub    SitePlatform = "one-hub"
-	SitePlatformDoneHub   SitePlatform = "done-hub"
-	SitePlatformSub2API   SitePlatform = "sub2api"
-	SitePlatformAPI       SitePlatform = "api"
+	SitePlatformNewAPI     SitePlatform = "new-api"
+	SitePlatformAnyRouter  SitePlatform = "anyrouter"
+	SitePlatformOneAPI     SitePlatform = "one-api"
+	SitePlatformOneHub     SitePlatform = "one-hub"
+	SitePlatformDoneHub    SitePlatform = "done-hub"
+	SitePlatformSub2API    SitePlatform = "sub2api"
+	SitePlatformAPI        SitePlatform = "api"
+	SitePlatformCloudflare SitePlatform = "cloudflare"
 )
 
 type SiteCredentialType string
@@ -95,6 +96,9 @@ type SiteRouteBaseURL struct {
 // usable (non-empty) override exists.
 func (s *Site) ResolveRouteBaseURL(routeType SiteModelRouteType) (string, bool) {
 	if s == nil {
+		return "", false
+	}
+	if s.Platform == SitePlatformCloudflare {
 		return "", false
 	}
 	for _, item := range s.RouteBaseURLs {
@@ -182,6 +186,9 @@ type Site struct {
 }
 
 func (s *Site) UnmarshalJSON(data []byte) error {
+	// JSON callers that omit enabled inherit the model/database default. An
+	// explicit false remains distinguishable through EnabledSet below.
+	s.Enabled = true
 	type alias Site
 	aux := struct {
 		*alias
@@ -250,6 +257,11 @@ type SiteAccount struct {
 }
 
 func (a *SiteAccount) UnmarshalJSON(data []byte) error {
+	// Match database defaults for partial/legacy JSON while preserving explicit
+	// false values through the presence flags populated below.
+	a.Enabled = true
+	a.AutoSync = true
+	a.AutoCheckin = true
 	type alias SiteAccount
 	aux := struct {
 		*alias
@@ -324,6 +336,16 @@ type SiteModel struct {
 	RouteRawPayload string               `json:"route_raw_payload"`
 	RouteUpdatedAt  *time.Time           `json:"route_updated_at"`
 	Disabled        bool                 `json:"disabled" gorm:"default:false;index"`
+	// DisableProtocolFallback 关闭 OpenAI 两个文本协议之间的自动降级。
+	//
+	// 零值 false 是默认行为：不预设上游只支持哪个协议，投影渠道保持 auto
+	// 模式，由运行时探测决定 Chat/Responses 各自的真实能力，relay 按
+	// "同协议优先、必要时换协议" 排序候选。前端两个协议都打勾即此状态。
+	//
+	// 置为 true 表示操作者只允许 RouteType 对应的那一个协议：投影渠道被
+	// 锁定为 chat_only / responses_only 手动模式，relay 不再尝试另一个协议。
+	// 反向命名让 Go 零值与 gorm 默认值一致，新建站点模型无需显式赋值。
+	DisableProtocolFallback bool `json:"disable_protocol_fallback" gorm:"not null;default:false"`
 }
 
 type SiteChannelBinding struct {
@@ -552,7 +574,7 @@ func NormalizeSiteSyncTokenValue(value string) string {
 // their keys verbatim, so they must never have a prefix forced on them.
 func (p SitePlatform) usesSyncTokenSkPrefix() bool {
 	switch p {
-	case SitePlatformAPI:
+	case SitePlatformAPI, SitePlatformCloudflare:
 		return false
 	default:
 		return true
@@ -787,7 +809,7 @@ func ParseSiteChannelBindingKey(groupKey string) (string, SiteModelRouteType) {
 
 func ShouldSplitSiteChannelRoutes(platform SitePlatform) bool {
 	switch platform {
-	case SitePlatformAPI:
+	case SitePlatformAPI, SitePlatformCloudflare:
 		return false
 	default:
 		return true
@@ -828,10 +850,38 @@ func SiteModelRouteTypeFromOutboundType(t outbound.OutboundType) SiteModelRouteT
 	}
 }
 
+// ProjectedOpenAIProtocolMode maps one site model's protocol selection onto the
+// OpenAIProtocolMode its projected channel must carry.
+//
+// Allowing fallback (the default) yields auto: the channel keeps both protocol
+// columns and learns each one's real capability at runtime, which is what the
+// two-protocol selection in the UI means — "try both, let the gateway find out".
+// Disabling fallback pins the channel to the single protocol the route type
+// names, so relay never spends an attempt on the other one.
+//
+// Only the two OpenAI text route types carry a protocol mode; every other route
+// type projects a non-OpenAI channel where the mode must stay auto.
+func (m *SiteModel) ProjectedOpenAIProtocolMode() OpenAIProtocolMode {
+	if m == nil {
+		return OpenAIProtocolModeAuto
+	}
+	routeType := NormalizeSiteModelRouteType(m.RouteType)
+	if routeType != SiteModelRouteTypeOpenAIChat && routeType != SiteModelRouteTypeOpenAIResponse {
+		return OpenAIProtocolModeAuto
+	}
+	if !m.DisableProtocolFallback {
+		return OpenAIProtocolModeAuto
+	}
+	if routeType == SiteModelRouteTypeOpenAIResponse {
+		return OpenAIProtocolModeResponsesOnly
+	}
+	return OpenAIProtocolModeChatOnly
+}
+
 func (p SitePlatform) Validate() error {
 	switch p {
 	case SitePlatformNewAPI, SitePlatformAnyRouter, SitePlatformOneAPI, SitePlatformOneHub, SitePlatformDoneHub,
-		SitePlatformSub2API, SitePlatformAPI:
+		SitePlatformSub2API, SitePlatformAPI, SitePlatformCloudflare:
 		return nil
 	default:
 		return fmt.Errorf("unsupported site platform: %s", p)
@@ -850,6 +900,17 @@ func (t SiteCredentialType) Validate() error {
 func (s *Site) Normalize() {
 	s.Name = strings.TrimSpace(s.Name)
 	s.BaseURL = strings.TrimRight(strings.TrimSpace(s.BaseURL), "/")
+	if s.Platform == SitePlatformCloudflare {
+		// Persist the canonical documented base so case, host and default-port
+		// variants of the same account do not fork into duplicate sites. Strict
+		// non-base URLs are left untouched here and rejected by Validate.
+		if canonical, ok := CanonicalCloudflareWorkersAIBaseURL(s.BaseURL); ok {
+			s.BaseURL = canonical
+		}
+		s.RouteBaseURLs = nil
+		s.DefaultRouteType = SiteModelRouteTypeOpenAIChat
+		s.ExternalCheckinURL = nil
+	}
 	if s.SiteProxy != nil {
 		trimmed := strings.TrimSpace(*s.SiteProxy)
 		if trimmed == "" {
@@ -942,6 +1003,11 @@ func (s *Site) Validate() error {
 	}
 	if parsed.Host == "" {
 		return fmt.Errorf("site base url must have a host")
+	}
+	if s.Platform == SitePlatformCloudflare {
+		if err := ValidateCloudflareWorkersAIBaseURL(parsed); err != nil {
+			return err
+		}
 	}
 	if err := ValidateSiteRouteBaseURLs(s.RouteBaseURLs); err != nil {
 		return err

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/bestruirui/octopus/internal/client"
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 	"github.com/bestruirui/octopus/internal/utils/log"
 )
 
@@ -61,7 +61,7 @@ func UpdateLLMPrice(ctx context.Context) error {
 			Cost model.LLMPrice `json:"cost"`
 		} `json:"models"`
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpbody.ReadResponse(resp)
 	if err != nil {
 		return fmt.Errorf("failed to read response body: %w", err)
 	}

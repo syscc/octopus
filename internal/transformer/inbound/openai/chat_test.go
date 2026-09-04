@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/bestruirui/octopus/internal/transformer/model"
@@ -174,6 +175,34 @@ func TestChatInboundAggregatesStreamWithModelAggregator(t *testing.T) {
 	}
 	if second, err := inbound.GetInternalResponse(ctx); err != nil || second != nil {
 		t.Fatalf("expected aggregator reset, got result=%#v err=%v", second, err)
+	}
+}
+
+func TestChatInboundStreamEventsPreserveTerminalChunkBeforeDone(t *testing.T) {
+	inbound := &ChatInbound{}
+	output, err := inbound.TransformStreamEvents(context.Background(), []model.StreamEvent{
+		{Kind: model.StreamEventKindMessageStop, ID: "resp_done", Model: "gpt-test", StopReason: model.FinishReasonStop},
+		{Kind: model.StreamEventKindUsageDelta, ID: "resp_done", Model: "gpt-test", Usage: &model.Usage{PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3}},
+		{Kind: model.StreamEventKindDone},
+	})
+	if err != nil {
+		t.Fatalf("TransformStreamEvents failed: %v", err)
+	}
+	body := string(output)
+	finishIndex := strings.Index(body, `"finish_reason":"stop"`)
+	doneIndex := strings.Index(body, "data: [DONE]")
+	if finishIndex < 0 || doneIndex < 0 || finishIndex > doneIndex {
+		t.Fatalf("expected finish chunk before [DONE], got %q", body)
+	}
+	if !strings.Contains(body, `"total_tokens":3`) {
+		t.Fatalf("expected usage to survive terminal projection, got %q", body)
+	}
+	if count := strings.Count(body, "data: [DONE]"); count != 1 {
+		t.Fatalf("expected one [DONE], got %d in %q", count, body)
+	}
+	again, err := inbound.TransformStreamEvents(context.Background(), []model.StreamEvent{{Kind: model.StreamEventKindDone}})
+	if err != nil || len(again) != 0 {
+		t.Fatalf("expected duplicate Done event to be suppressed, got %q err=%v", again, err)
 	}
 }
 

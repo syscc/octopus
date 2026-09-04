@@ -832,7 +832,8 @@
                 "tokens": "Token 使用",
                 "costs": "成本詳情",
                 "baseUrls": "Base URLs",
-                "keys": "金鑰"
+                "keys": "金鑰",
+                "protocol": "OpenAI 協議"
             },
             "noBaseUrls": "暫無 Base URL",
             "noKeys": "暫無金鑰",
@@ -853,6 +854,7 @@
                 "cancel": "取消",
                 "save": "儲存",
                 "saving": "儲存中...",
+                "saveFailed": "儲存失敗",
                 "delete": "刪除",
                 "confirmDelete": "確認刪除",
                 "deleting": "刪除中..."
@@ -861,7 +863,8 @@
         "create": {
             "dialogTitle": "建立新供應源",
             "submit": "建立供應源",
-            "submitting": "建立中..."
+            "submitting": "建立中...",
+            "submitFailed": "建立失敗"
         },
         "form": {
             "add": "新增",
@@ -912,6 +915,24 @@
             "wsModeOff": "關閉",
             "matchRegex": "匹配正規",
             "matchRegexPlaceholder": "可選：用於匹配請求模型名稱的正規表示式",
+            "protocolMode": "OpenAI 協議模式",
+            "protocolModeAuto": "自動探測",
+            "protocolModeChatOnly": "僅 Chat Completions",
+            "protocolModeResponsesOnly": "僅 Responses",
+            "protocolModeBoth": "兩者均支援",
+            "protocolModeManualHint": "目前選擇將作為手動模式儲存；切回自動探測後，後續探測結果才會生效。",
+            "protocolAtLeastOne": "至少選擇一種 OpenAI 協議。",
+            "capabilityUnknown": "待探測",
+            "capabilitySupported": "已支援",
+            "capabilityUnsupported": "不支援",
+            "protocolReprobe": "重新探測",
+            "protocolProbing": "探測中...",
+            "protocolProbeSuccess": "協議探測完成",
+            "protocolProbeSkipped": "協議探測已跳過",
+            "protocolProbePartialFailed": "協議探測部分失敗",
+            "protocolProbeFailed": "協議探測失敗",
+            "protocolProbeEndpointFailed": "探測失敗",
+            "protocolAutoHint": "伺服器探測結果用於初始化選擇；修改勾選項後將切換為持久化的手動模式。",
             "remark": "備註"
         }
     },

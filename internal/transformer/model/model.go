@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"slices"
 	"strings"
@@ -33,6 +32,7 @@ const (
 	TransformerMetadataAnthropicUserID                    = "anthropic_user_id"
 	TransformerMetadataAnthropicSystemArrayFormat         = "anthropic_system_array_format"
 	TransformerMetadataAnthropicContext1M                 = "anthropic_context_1m"
+	TransformerMetadataAnthropicEstimatedInputTokens      = "octopus_anthropic_estimated_input_tokens"
 	TransformerMetadataOpenAIOrganization                 = "openai_organization"
 	TransformerMetadataOpenAIProject                      = "openai_project"
 	TransformerMetadataGeminiFilesAPIURI                  = "gemini_files_api_uri"
@@ -1676,32 +1676,13 @@ type ResponseError struct {
 }
 
 func (e ResponseError) Error() string {
-	sb := strings.Builder{}
-	if e.StatusCode != 0 {
-		sb.WriteString(fmt.Sprintf("Request failed: %s, ", http.StatusText(e.StatusCode)))
+	// Detail.Message may contain arbitrary provider-controlled text. Keep the
+	// error string safe for logs, relay logs, and generic public error paths;
+	// callers that need protocol classification must inspect Detail directly.
+	if e.StatusCode > 0 {
+		return fmt.Sprintf("upstream request failed: %d", e.StatusCode)
 	}
-
-	if e.Detail.Message != "" {
-		sb.WriteString("error: ")
-		sb.WriteString(e.Detail.Message)
-	}
-
-	if e.Detail.Code != "" {
-		sb.WriteString(", code: ")
-		sb.WriteString(e.Detail.Code)
-	}
-
-	if e.Detail.Type != "" {
-		sb.WriteString(", type: ")
-		sb.WriteString(e.Detail.Type)
-	}
-
-	if e.Detail.RequestID != "" {
-		sb.WriteString(", request_id: ")
-		sb.WriteString(e.Detail.RequestID)
-	}
-
-	return sb.String()
+	return "upstream request failed"
 }
 
 // ErrorDetail represents error details.

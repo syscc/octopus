@@ -149,6 +149,90 @@ func TestSiteCreateAndAccountCreatePersistExplicitFalseValues(t *testing.T) {
 	}
 }
 
+func TestMetAPIImportPreservesDisabledTokens(t *testing.T) {
+	ctx := setupSiteOpTestDB(t)
+	payload := map[string]any{
+		"accounts": map[string]any{
+			"sites": []any{
+				map[string]any{"id": 1, "name": "Token Preserve Site", "url": "https://token-preserve.example.com", "platform": "new-api"},
+			},
+			"accounts": []any{
+				map[string]any{"id": 101, "siteId": 1, "username": "token-user", "accessToken": "session-token", "apiToken": "api-token", "status": "active"},
+			},
+			"accountTokens": []any{
+				map[string]any{"accountId": 101, "name": "disabled", "token": "disabled-import-token", "tokenGroup": "default", "enabled": false, "valueStatus": "ready"},
+				map[string]any{"accountId": 101, "name": "enabled", "token": "enabled-import-token", "tokenGroup": "default", "enabled": true, "valueStatus": "ready"},
+			},
+			"tokenRoutes":   []any{},
+			"routeChannels": []any{},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal import payload failed: %v", err)
+	}
+
+	result, err := SiteImportMetAPI(ctx, body)
+	if err != nil {
+		t.Fatalf("SiteImportMetAPI failed: %v", err)
+	}
+	if result.ImportedTokens != 2 {
+		t.Fatalf("expected 2 imported tokens, got %d", result.ImportedTokens)
+	}
+
+	// GORM omits zero-valued (false) fields from struct INSERTs when the column
+	// has a database default (SiteToken.Enabled defaults to true), so an
+	// imported disabled token must be written back explicitly.
+	var disabled model.SiteToken
+	requireImportedRow(t, &disabled, "token = ?", "disabled-import-token")
+	if disabled.Enabled {
+		t.Fatalf("imported token persisted enabled despite source enabled=false")
+	}
+	if disabled.ValueStatus != model.SiteTokenValueStatusReady {
+		t.Fatalf("expected ready value status, got %q", disabled.ValueStatus)
+	}
+
+	var enabled model.SiteToken
+	requireImportedRow(t, &enabled, "token = ?", "enabled-import-token")
+	if !enabled.Enabled {
+		t.Fatalf("imported token persisted disabled despite source enabled=true")
+	}
+}
+
+func TestImportedAccountProxyModePreservesDisabledConfiguration(t *testing.T) {
+	setupSiteOpTestDB(t)
+	proxy := &model.ProxyConfiguration{
+		Name:    "preserved-disabled-proxy",
+		URL:     "http://127.0.0.1:18080",
+		Enabled: false,
+	}
+	if err := dbpkg.GetDB().Create(proxy).Error; err != nil {
+		t.Fatalf("create proxy configuration failed: %v", err)
+	}
+	// ProxyConfiguration.Enabled has a database default; force the imported
+	// local state after creation so this fixture represents a disabled proxy.
+	if err := dbpkg.GetDB().Model(&model.ProxyConfiguration{}).Where("id = ?", proxy.ID).UpdateColumn("enabled", false).Error; err != nil {
+		t.Fatalf("persist disabled proxy state failed: %v", err)
+	}
+
+	rawProxy := proxy.URL
+	mode, configID, err := importedAccountProxyMode(dbpkg.GetDB(), &rawProxy)
+	if err != nil {
+		t.Fatalf("importedAccountProxyMode failed: %v", err)
+	}
+	if mode != model.ProxyUsageModePool || configID == nil || *configID != proxy.ID {
+		t.Fatalf("expected existing proxy pool reference, got mode=%q id=%#v", mode, configID)
+	}
+
+	var reloaded model.ProxyConfiguration
+	if err := dbpkg.GetDB().First(&reloaded, proxy.ID).Error; err != nil {
+		t.Fatalf("reload proxy configuration failed: %v", err)
+	}
+	if reloaded.Enabled {
+		t.Fatal("import must not re-enable an existing disabled proxy")
+	}
+}
+
 func TestSiteUpdateCanClearNullableFields(t *testing.T) {
 	ctx := setupSiteOpTestDB(t)
 
@@ -1036,6 +1120,21 @@ func TestSiteModelRouteUpdateIfNotManualHonorsManualOverride(t *testing.T) {
 	}
 	if learnedRow.RouteRawPayload != "mismatch" {
 		t.Fatalf("expected learned payload to be recorded, got %q", learnedRow.RouteRawPayload)
+	}
+	firstUpdatedAt := learnedRow.RouteUpdatedAt
+	updated, err = SiteModelRouteUpdateIfNotManual(account.ID, model.SiteDefaultGroupKey, "gpt-4.1", model.SiteModelRouteTypeOpenAIResponse, model.SiteModelRouteSourceRuntimeLearned, "repeated mismatch", ctx)
+	if err != nil {
+		t.Fatalf("repeat SiteModelRouteUpdateIfNotManual returned error: %v", err)
+	}
+	if updated {
+		t.Fatalf("expected unchanged route type not to trigger another projection")
+	}
+	var repeatedRow model.SiteModel
+	if err := dbpkg.GetDB().WithContext(ctx).Where("site_account_id = ? AND model_name = ?", account.ID, "gpt-4.1").First(&repeatedRow).Error; err != nil {
+		t.Fatalf("query repeated learned row failed: %v", err)
+	}
+	if repeatedRow.RouteRawPayload != "mismatch" || firstUpdatedAt == nil || repeatedRow.RouteUpdatedAt == nil || !repeatedRow.RouteUpdatedAt.Equal(*firstUpdatedAt) {
+		t.Fatalf("unchanged route type was rewritten: before=%+v after=%+v", learnedRow, repeatedRow)
 	}
 }
 

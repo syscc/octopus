@@ -12,6 +12,7 @@ import (
 	"github.com/bestruirui/octopus/internal/op"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func loadSiteAccount(ctx context.Context, accountID int) (*model.Site, *model.SiteAccount, error) {
@@ -48,7 +49,11 @@ func deleteManagedChannelsByAccount(ctx context.Context, accountID int) error {
 			return fmt.Errorf("failed to delete managed channel %d: %w", binding.ChannelID, err)
 		}
 	}
-	return db.GetDB().WithContext(ctx).Where("site_account_id = ?", accountID).Delete(&model.SiteChannelBinding{}).Error
+	if err := db.GetDB().WithContext(ctx).Where("site_account_id = ?", accountID).Delete(&model.SiteChannelBinding{}).Error; err != nil {
+		return err
+	}
+	op.SiteChannelBindingCacheInvalidate()
+	return nil
 }
 
 func isMissingManagedChannelError(err error) bool {
@@ -64,6 +69,22 @@ func persistSyncSnapshot(ctx context.Context, accountID int, snapshot *syncSnaps
 	}
 	now := time.Now()
 	err := db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var accountRef struct {
+			SiteID int
+		}
+		if err := tx.Model(&model.SiteAccount{}).Select("site_id").Where("id = ?", accountID).Take(&accountRef).Error; err != nil {
+			return err
+		}
+		var accountSite struct {
+			Platform model.SitePlatform
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Model(&model.Site{}).
+			Select("platform").
+			Where("id = ?", accountRef.SiteID).
+			Take(&accountSite).Error; err != nil {
+			return err
+		}
 		var existingGroups []model.SiteUserGroup
 		if err := tx.Where("site_account_id = ?", accountID).Find(&existingGroups).Error; err != nil {
 			return err
@@ -135,8 +156,12 @@ func persistSyncSnapshot(ctx context.Context, accountID int, snapshot *syncSnaps
 			incomingTokens = mergeCreatedSiteTokenIntoSyncedTokens(incomingTokens, snapshot.createdToken)
 		}
 		mergedTokens := mergePersistedSiteTokensWithHistory(accountID, existingTokens, incomingTokens, now, snapshot.preserveHistoricalGroups)
-		incomingModels := preparePersistedSyncModels(accountID, snapshot.models, existingModelMap, now)
-		finalModels := mergePersistedSiteModelsByGroup(existingModels, incomingModels, snapshot.groupResults)
+		incomingModels := preparePersistedSyncModels(accountID, accountSite.Platform, snapshot.models, existingModelMap, now)
+		finalModels := normalizePersistedRoutesForPlatform(
+			mergePersistedSiteModelsByGroup(existingModels, incomingModels, snapshot.groupResults),
+			accountSite.Platform,
+			now,
+		)
 
 		if len(snapshot.groups) > 0 {
 			if err := tx.Create(&snapshot.groups).Error; err != nil {
@@ -147,8 +172,24 @@ func persistSyncSnapshot(ctx context.Context, accountID int, snapshot *syncSnaps
 			return err
 		}
 		if len(mergedTokens) > 0 {
+			// Capture the requested state before Create: GORM applies the
+			// `default:true` tag back onto false-valued struct fields while
+			// constructing the INSERT, so checking mergedTokens afterwards
+			// would lose the explicit disabled state.
+			disabledTokenIndexes := make([]int, 0)
+			for i := range mergedTokens {
+				if !mergedTokens[i].Enabled {
+					disabledTokenIndexes = append(disabledTokenIndexes, i)
+				}
+			}
 			if err := tx.Create(&mergedTokens).Error; err != nil {
 				return err
+			}
+			for _, index := range disabledTokenIndexes {
+				mergedTokens[index].Enabled = false
+				if err := preserveDisabledSiteTokens(tx, []model.SiteToken{mergedTokens[index]}); err != nil {
+					return err
+				}
 			}
 		}
 		if len(finalModels) > 0 {
@@ -169,6 +210,25 @@ func persistSyncSnapshot(ctx context.Context, accountID int, snapshot *syncSnaps
 		return err
 	}
 	return nil
+}
+
+// preserveDisabledSiteTokens re-applies enabled=false for tokens persisted
+// with an explicit disabled state after a batch create. GORM omits
+// zero-valued (false) fields from the INSERT when the column carries a
+// database default (SiteToken.Enabled defaults to true), which would silently
+// re-enable them. Writing the column back by the actual created IDs behaves
+// identically on SQLite, MySQL and PostgreSQL.
+func preserveDisabledSiteTokens(tx *gorm.DB, tokens []model.SiteToken) error {
+	disabledIDs := make([]int, 0, len(tokens))
+	for i := range tokens {
+		if !tokens[i].Enabled && tokens[i].ID > 0 {
+			disabledIDs = append(disabledIDs, tokens[i].ID)
+		}
+	}
+	if len(disabledIDs) == 0 {
+		return nil
+	}
+	return tx.Model(&model.SiteToken{}).Where("id IN ?", disabledIDs).UpdateColumns(map[string]any{"enabled": false}).Error
 }
 
 func mergeHistoricalSiteGroups(incoming []model.SiteUserGroup, existing []model.SiteUserGroup) []model.SiteUserGroup {
@@ -196,7 +256,7 @@ func mergeHistoricalSiteGroups(incoming []model.SiteUserGroup, existing []model.
 	return result
 }
 
-func preparePersistedSyncModels(accountID int, incoming []model.SiteModel, existingModelMap map[string]model.SiteModel, now time.Time) []model.SiteModel {
+func preparePersistedSyncModels(accountID int, platform model.SitePlatform, incoming []model.SiteModel, existingModelMap map[string]model.SiteModel, now time.Time) []model.SiteModel {
 	prepared := make([]model.SiteModel, 0, len(incoming))
 	for i := range incoming {
 		item := incoming[i]
@@ -206,9 +266,9 @@ func preparePersistedSyncModels(accountID int, incoming []model.SiteModel, exist
 		if existing, ok := existingModelMap[key]; ok {
 			item.ID = existing.ID
 			item.Disabled = existing.Disabled
-			applyPersistedRouteState(&item, &existing, now)
+			applyPersistedRouteStateForPlatform(&item, &existing, platform, now)
 		} else {
-			applyPersistedRouteState(&item, nil, now)
+			applyPersistedRouteStateForPlatform(&item, nil, platform, now)
 		}
 		prepared = append(prepared, item)
 	}
@@ -436,7 +496,7 @@ func mergeReadyIncomingSiteToken(incoming model.SiteToken, existingTokens []mode
 				continue
 			}
 		}
-		if strings.TrimSpace(existing.Source) == "manual" {
+		if strings.TrimSpace(existing.Source) == "manual" && strings.TrimSpace(incoming.Source) != "direct" {
 			continue
 		}
 		if normalizeSiteTokenName(existing.Name) != normalizeSiteTokenName(incoming.Name) {
@@ -618,6 +678,39 @@ func markRouteMetadataGuessed(rawPayload string, routeType model.SiteModelRouteT
 	return metadata.Marshal()
 }
 
+func applyPersistedRouteStateForPlatform(item *model.SiteModel, existing *model.SiteModel, platform model.SitePlatform, now time.Time) {
+	if item == nil {
+		return
+	}
+	if platform != model.SitePlatformCloudflare {
+		applyPersistedRouteState(item, existing, now)
+		return
+	}
+	item.RouteType = model.SiteModelRouteTypeOpenAIChat
+	item.RouteSource = model.SiteModelRouteSourceSyncInferred
+	item.ManualOverride = false
+	item.RouteRawPayload = ""
+	if existing != nil &&
+		model.NormalizeSiteModelRouteType(existing.RouteType) == item.RouteType &&
+		existing.RouteSource == item.RouteSource &&
+		!existing.ManualOverride &&
+		strings.TrimSpace(existing.RouteRawPayload) == "" {
+		item.RouteUpdatedAt = existing.RouteUpdatedAt
+		return
+	}
+	item.RouteUpdatedAt = &now
+}
+
+func normalizePersistedRoutesForPlatform(items []model.SiteModel, platform model.SitePlatform, now time.Time) []model.SiteModel {
+	if platform != model.SitePlatformCloudflare {
+		return items
+	}
+	for i := range items {
+		existing := items[i]
+		applyPersistedRouteStateForPlatform(&items[i], &existing, platform, now)
+	}
+	return items
+}
 func applyPersistedRouteState(item *model.SiteModel, existing *model.SiteModel, now time.Time) {
 	if item == nil {
 		return

@@ -2,6 +2,7 @@ package grouphealth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,16 +11,18 @@ import (
 
 	"github.com/bestruirui/octopus/internal/helper"
 	"github.com/bestruirui/octopus/internal/model"
+	"github.com/bestruirui/octopus/internal/sitesync"
 	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
 	"github.com/bestruirui/octopus/internal/transformer/outbound"
 )
 
 type ProbeResult struct {
-	Success      bool
-	HTTPStatus   int
-	DurationMS   int64
-	ErrorMessage string
-	Header       http.Header // 上游响应头，供 POR 门3 做 Cloudflare 指纹识别
+	Success           bool
+	HTTPStatus        int
+	DurationMS        int64
+	ErrorMessage      string
+	CloudflareBlocked bool
+	Header            http.Header // 上游响应头，供 POR 门3 做 Cloudflare 指纹识别
 }
 
 type Prober struct {
@@ -46,32 +49,33 @@ func (p *Prober) RunCandidate(ctx context.Context, channel model.Channel, usedKe
 
 	request, err := buildProbeRequest(probeCtx, &channel, &usedKey, modelName)
 	if err != nil {
-		result.ErrorMessage = err.Error()
+		result.ErrorMessage = safeProbeError(err, "probe request invalid")
 		result.DurationMS = time.Since(startedAt).Milliseconds()
 		return result
 	}
 
 	applyCustomHeaders(request, channel.CustomHeader)
+	applySelectedProbeCredentialHeader(request.Header, channel.Type, usedKey.ChannelKey)
 	// 防止 Go 默认 User-Agent 泄露到上游
 	if request.Header.Get("User-Agent") == "" {
 		request.Header.Set("User-Agent", "")
 	}
 	if err := helper.ApplyParamOverride(request, channel.ParamOverride); err != nil {
-		result.ErrorMessage = err.Error()
+		result.ErrorMessage = safeProbeError(err, "probe request override failed")
 		result.DurationMS = time.Since(startedAt).Milliseconds()
 		return result
 	}
 
 	httpClient, err := helper.ChannelHTTPClientWithContext(probeCtx, &channel)
 	if err != nil {
-		result.ErrorMessage = err.Error()
+		result.ErrorMessage = safeProbeError(err, "probe client unavailable")
 		result.DurationMS = time.Since(startedAt).Milliseconds()
 		return result
 	}
 
 	response, err := httpClient.Do(request)
 	if err != nil {
-		result.ErrorMessage = err.Error()
+		result.ErrorMessage = safeProbeError(err, "probe request failed")
 		result.DurationMS = time.Since(startedAt).Milliseconds()
 		return result
 	}
@@ -87,12 +91,22 @@ func (p *Prober) RunCandidate(ctx context.Context, channel model.Channel, usedKe
 	}
 
 	body, _ := io.ReadAll(io.LimitReader(response.Body, 8*1024))
-	if len(body) > 0 {
-		result.ErrorMessage = fmt.Sprintf("upstream error: %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
-	} else {
-		result.ErrorMessage = fmt.Sprintf("upstream error: %d", response.StatusCode)
-	}
+	result.CloudflareBlocked = sitesync.IsCloudflareProtectionResponse(response.StatusCode, result.Header, body)
+	result.ErrorMessage = fmt.Sprintf("upstream error: %d", response.StatusCode)
 	return result
+}
+
+func safeProbeError(err error, fallback string) string {
+	if err == nil {
+		return fallback
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fallback + ": timed out"
+	}
+	if errors.Is(err, context.Canceled) {
+		return fallback + ": canceled"
+	}
+	return fallback
 }
 
 func buildProbeRequest(ctx context.Context, channel *model.Channel, usedKey *model.ChannelKey, modelName string) (*http.Request, error) {
@@ -180,9 +194,68 @@ func applyCustomHeaders(request *http.Request, headers []model.CustomHeader) {
 	}
 	for _, header := range headers {
 		key := strings.TrimSpace(header.HeaderKey)
-		if key == "" {
+		if !shouldProxyProbeChannelHeader(key) {
 			continue
 		}
 		request.Header.Set(key, header.HeaderValue)
+	}
+}
+
+var blockedProbeChannelHeaders = map[string]struct{}{
+	"authorization":       {},
+	"x-api-key":           {},
+	"x-goog-api-key":      {},
+	"api-key":             {},
+	"set-cookie":          {},
+	"connection":          {},
+	"keep-alive":          {},
+	"proxy-authenticate":  {},
+	"proxy-authorization": {},
+	"te":                  {},
+	"trailer":             {},
+	"transfer-encoding":   {},
+	"upgrade":             {},
+	"content-length":      {},
+	"host":                {},
+	"accept-encoding":     {},
+	"x-forwarded-for":     {},
+	"x-forwarded-host":    {},
+	"x-forwarded-proto":   {},
+	"x-forwarded-port":    {},
+	"x-real-ip":           {},
+	"forwarded":           {},
+	"cf-connecting-ip":    {},
+	"true-client-ip":      {},
+	"x-client-ip":         {},
+	"x-cluster-client-ip": {},
+}
+
+func shouldProxyProbeChannelHeader(name string) bool {
+	lowerName := strings.ToLower(strings.TrimSpace(name))
+	if lowerName == "" || strings.HasPrefix(lowerName, "sec-websocket-") {
+		return false
+	}
+	_, blocked := blockedProbeChannelHeaders[lowerName]
+	return !blocked
+}
+
+func applySelectedProbeCredentialHeader(headers http.Header, protocol outbound.OutboundType, key string) {
+	if headers == nil {
+		return
+	}
+	for _, name := range []string{"Authorization", "X-API-Key", "X-Goog-Api-Key", "Api-Key"} {
+		for headerName := range headers {
+			if strings.EqualFold(headerName, name) {
+				delete(headers, headerName)
+			}
+		}
+	}
+	switch protocol {
+	case outbound.OutboundTypeAnthropic:
+		headers.Set("X-API-Key", key)
+	case outbound.OutboundTypeGemini:
+		headers.Set("X-Goog-Api-Key", key)
+	default:
+		headers.Set("Authorization", "Bearer "+key)
 	}
 }

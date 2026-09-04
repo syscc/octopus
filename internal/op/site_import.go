@@ -12,6 +12,7 @@ import (
 	"github.com/bestruirui/octopus/internal/db"
 	"github.com/bestruirui/octopus/internal/model"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type rawImportObject map[string]any
@@ -77,7 +78,8 @@ var unsupportedImportHints = []string{
 }
 
 var directImportPlatforms = map[model.SitePlatform]struct{}{
-	model.SitePlatformAPI: {},
+	model.SitePlatformAPI:        {},
+	model.SitePlatformCloudflare: {},
 }
 
 func SiteImportAllAPIHub(ctx context.Context, body []byte) (*model.AllAPIHubImportResult, []int, error) {
@@ -196,7 +198,7 @@ func SiteImportMetAPI(ctx context.Context, body []byte) (*model.MetAPIImportResu
 				result.UpdatedAccounts++
 			}
 
-			tokens, groups, models, disabledModels, err := replaceMetAPIAccountData(tx, accountRecord.ID, input)
+			tokens, groups, models, disabledModels, err := replaceMetAPIAccountData(tx, accountRecord.ID, siteRecord.Platform, input)
 			if err != nil {
 				return err
 			}
@@ -285,12 +287,18 @@ func extractMetAPIAccounts(payload rawImportObject) ([]metAPIImportAccountData, 
 	siteByID := make(map[int]importedSiteInput, len(siteRows))
 	for _, row := range siteRows {
 		id := asInt(row["id"])
-		siteURL := normalizeImportBaseURL(firstNonEmptyString(asString(row["url"]), asString(row["baseUrl"]), asString(row["base_url"])))
+		rawSiteURL := firstNonEmptyString(asString(row["url"]), asString(row["baseUrl"]), asString(row["base_url"]))
+		siteURL := normalizeImportBaseURL(rawSiteURL)
 		siteName := firstNonEmptyString(asString(row["name"]), siteURL)
 		if id <= 0 || siteURL == "" {
 			continue
 		}
-		platform, ok := resolveImportedPlatform(firstNonEmptyString(asString(row["platform"]), asString(row["site_type"])), siteURL)
+		platformHint := firstNonEmptyString(asString(row["platform"]), asString(row["site_type"]))
+		if cloudflareImportURLInvalid(rawSiteURL, platformHint) {
+			warnings = append(warnings, fmt.Sprintf("跳过 metapi 站点 %s：Cloudflare Workers AI 站点地址无效", firstNonEmptyString(siteName, fmt.Sprintf("%d", id))))
+			continue
+		}
+		platform, ok := resolveImportedPlatform(platformHint, siteURL)
 		if !ok {
 			warnings = append(warnings, fmt.Sprintf("跳过 metapi 站点 %s：站点平台不受支持", firstNonEmptyString(siteName, fmt.Sprintf("%d", id))))
 			continue
@@ -522,11 +530,15 @@ func buildMetAPIDisabledModels(modelNames []string) []model.SiteModel {
 }
 
 func parseAllAPIHubAccountRow(row rawImportObject) (importedAccountInput, string, bool) {
-	siteURL := normalizeImportBaseURL(asString(row["site_url"]))
+	rawSiteURL := asString(row["site_url"])
+	siteURL := normalizeImportBaseURL(rawSiteURL)
 	siteName := firstNonEmptyString(asString(row["site_name"]), siteURL)
 	rowID := firstNonEmptyString(asString(row["id"]), asString(row["username"]), siteName, "unknown")
 	if siteURL == "" {
 		return importedAccountInput{}, fmt.Sprintf("跳过 ALL-API-Hub 账号 %s：site_url 无效", rowID), false
+	}
+	if cloudflareImportURLInvalid(rawSiteURL, row["site_type"]) {
+		return importedAccountInput{}, fmt.Sprintf("跳过 ALL-API-Hub 账号 %s：Cloudflare Workers AI 站点地址无效", rowID), false
 	}
 
 	platform, ok := resolveImportedPlatform(row["site_type"], siteURL)
@@ -596,11 +608,15 @@ func parseAllAPIHubAccountRow(row rawImportObject) (importedAccountInput, string
 }
 
 func parseAllAPIHubProfile(profile rawImportObject) (importedAccountInput, string, bool) {
-	baseURL := normalizeImportBaseURL(asString(profile["baseUrl"]))
+	rawBaseURL := asString(profile["baseUrl"])
+	baseURL := normalizeImportBaseURL(rawBaseURL)
 	apiKey := asString(profile["apiKey"])
 	profileID := firstNonEmptyString(asString(profile["id"]), asString(profile["name"]), baseURL, "unknown")
 	if baseURL == "" || apiKey == "" {
 		return importedAccountInput{}, fmt.Sprintf("跳过 ALL-API-Hub API 凭据 %s：baseUrl 或 apiKey 缺失", profileID), false
+	}
+	if cloudflareImportURLInvalid(rawBaseURL, profile["apiType"]) {
+		return importedAccountInput{}, fmt.Sprintf("跳过 ALL-API-Hub API 凭据 %s：Cloudflare Workers AI 站点地址无效", profileID), false
 	}
 
 	platform, ok := resolveImportedProfilePlatform(profile["apiType"], baseURL)
@@ -626,7 +642,7 @@ func parseAllAPIHubProfile(profile rawImportObject) (importedAccountInput, strin
 func upsertImportedSite(tx *gorm.DB, input importedSiteInput) (*model.Site, bool, error) {
 	normalizedBaseURL := normalizeImportBaseURL(input.BaseURL)
 	var siteRecord model.Site
-	err := tx.Where("platform = ? AND base_url = ?", input.Platform, normalizedBaseURL).First(&siteRecord).Error
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("platform = ? AND base_url = ?", input.Platform, normalizedBaseURL).First(&siteRecord).Error
 	if err == nil {
 		return &siteRecord, false, nil
 	}
@@ -649,10 +665,10 @@ func upsertImportedSite(tx *gorm.DB, input importedSiteInput) (*model.Site, bool
 	return &siteRecord, true, nil
 }
 
-func replaceMetAPIAccountData(tx *gorm.DB, accountID int, data metAPIImportAccountData) (int, int, int, int, error) {
+func replaceMetAPIAccountData(tx *gorm.DB, accountID int, platform model.SitePlatform, data metAPIImportAccountData) (int, int, int, int, error) {
 	groups := prepareMetAPIImportedGroups(accountID, data.Groups)
 	tokens := prepareMetAPIImportedTokens(accountID, data.Tokens)
-	models := prepareMetAPIImportedModels(accountID, append(data.Models, data.DisabledModels...))
+	models := prepareMetAPIImportedModels(accountID, platform, append(data.Models, data.DisabledModels...))
 
 	if err := tx.Where("site_account_id = ?", accountID).Delete(&model.SiteUserGroup{}).Error; err != nil {
 		return 0, 0, 0, 0, err
@@ -667,8 +683,22 @@ func replaceMetAPIAccountData(tx *gorm.DB, accountID int, data metAPIImportAccou
 		return 0, 0, 0, 0, err
 	}
 	if len(tokens) > 0 {
+		// Capture explicit disabled states before Create: GORM applies the
+		// `default:true` tag to false-valued struct fields during INSERT.
+		disabledTokenIndexes := make([]int, 0)
+		for i := range tokens {
+			if !tokens[i].Enabled {
+				disabledTokenIndexes = append(disabledTokenIndexes, i)
+			}
+		}
 		if err := tx.Create(&tokens).Error; err != nil {
 			return 0, 0, 0, 0, err
+		}
+		for _, index := range disabledTokenIndexes {
+			tokens[index].Enabled = false
+			if err := preserveImportedBooleans(tx, &model.SiteToken{}, tokens[index].ID, map[string]any{"enabled": false}); err != nil {
+				return 0, 0, 0, 0, err
+			}
 		}
 	}
 
@@ -754,7 +784,7 @@ func prepareMetAPIImportedTokens(accountID int, tokens []model.SiteToken) []mode
 	return result
 }
 
-func prepareMetAPIImportedModels(accountID int, models []model.SiteModel) []model.SiteModel {
+func prepareMetAPIImportedModels(accountID int, platform model.SitePlatform, models []model.SiteModel) []model.SiteModel {
 	seen := make(map[string]model.SiteModel, len(models))
 	for _, item := range models {
 		groupKey := model.NormalizeSiteGroupKey(item.GroupKey)
@@ -771,12 +801,19 @@ func prepareMetAPIImportedModels(accountID int, models []model.SiteModel) []mode
 		item.GroupKey = groupKey
 		item.ModelName = modelName
 		item.Source = firstNonEmptyString(item.Source, "metapi")
-		if strings.TrimSpace(string(item.RouteType)) == "" {
-			item.RouteType = model.InferSiteModelRouteType(modelName)
+		if platform == model.SitePlatformCloudflare {
+			item.RouteType = model.SiteModelRouteTypeOpenAIChat
+			item.RouteSource = model.SiteModelRouteSourceSyncInferred
+			item.ManualOverride = false
+			item.RouteRawPayload = ""
 		} else {
-			item.RouteType = model.NormalizeSiteModelRouteType(item.RouteType)
+			if strings.TrimSpace(string(item.RouteType)) == "" {
+				item.RouteType = model.InferSiteModelRouteType(modelName)
+			} else {
+				item.RouteType = model.NormalizeSiteModelRouteType(item.RouteType)
+			}
+			item.RouteSource = model.NormalizeSiteModelRouteSource(item.RouteSource, item.ManualOverride)
 		}
-		item.RouteSource = model.NormalizeSiteModelRouteSource(item.RouteSource, item.ManualOverride)
 		seen[key] = item
 	}
 	keys := make([]string, 0, len(seen))
@@ -948,11 +985,8 @@ func importedAccountProxyMode(tx *gorm.DB, rawProxy *string) (model.ProxyUsageMo
 	}
 	var existing model.ProxyConfiguration
 	if err := tx.Where("url = ?", normalized).First(&existing).Error; err == nil {
-		if !existing.Enabled {
-			if err := tx.Model(&existing).Update("enabled", true).Error; err != nil {
-				return model.ProxyUsageModeInherit, nil, fmt.Errorf("enable imported proxy configuration failed: %w", err)
-			}
-		}
+		// Import is incremental: an existing disabled proxy is an explicit local
+		// choice and must not be re-enabled by a remote snapshot.
 		return model.ProxyUsageModePool, &existing.ID, nil
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return model.ProxyUsageModeInherit, nil, err
@@ -1046,6 +1080,9 @@ func normalizeImportBaseURL(raw string) string {
 	if trimmed == "" {
 		return ""
 	}
+	if normalized, ok := model.NormalizeCloudflareWorkersAIBaseURL(trimmed); ok {
+		return normalized
+	}
 	if parsed, err := url.Parse(trimmed); err == nil && parsed.Scheme != "" && parsed.Host != "" {
 		return strings.TrimRight(parsed.Scheme+"://"+parsed.Host, "/")
 	}
@@ -1113,6 +1150,10 @@ func detectSupportedPlatform(values ...any) (model.SitePlatform, bool) {
 	}
 
 	switch {
+	case hasCloudflareWorkersAIURL(values...):
+		return model.SitePlatformCloudflare, false
+	case hasCloudflarePlatformHint(values...):
+		return "", true
 	case strings.Contains(combined, "api.openai.com"):
 		return model.SitePlatformAPI, false
 	case strings.Contains(combined, "api.anthropic.com"), strings.Contains(combined, "anthropic.com/v1"):
@@ -1135,6 +1176,77 @@ func detectSupportedPlatform(values ...any) (model.SitePlatform, bool) {
 	return "", false
 }
 
+func hasCloudflareWorkersAIURL(values ...any) bool {
+	for _, value := range values {
+		if _, ok := model.NormalizeCloudflareWorkersAIBaseURL(asString(value)); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCloudflarePlatformHint(values ...any) bool {
+	for _, value := range values {
+		text := strings.ToLower(strings.TrimSpace(asString(value)))
+		if text == "" {
+			continue
+		}
+		if parsed, err := url.Parse(text); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+			continue
+		}
+		normalized := strings.NewReplacer("_", "-", " ", "-").Replace(text)
+		for strings.Contains(normalized, "--") {
+			normalized = strings.ReplaceAll(normalized, "--", "-")
+		}
+		switch strings.Trim(normalized, "-") {
+		case "cloudflare", "workers-ai", "workersai", "cloudflare-workers-ai":
+			return true
+		}
+	}
+	return false
+}
+
+// isExactCloudflareAPIHostURL reports whether raw is a URL whose host is
+// exactly the Cloudflare API host. Lookalike hosts such as
+// api.cloudflare.com.evil.example never match, and scheme-less values are
+// retried with the documented https scheme so exports that omit it are still
+// recognized by host.
+func isExactCloudflareAPIHostURL(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return false
+	}
+	if parsed.Host == "" {
+		if parsed, err = url.Parse("https://" + trimmed); err != nil {
+			return false
+		}
+	}
+	return parsed.Host != "" && model.IsCloudflareWorkersAIHost(parsed.Hostname())
+}
+
+// cloudflareImportURLInvalid reports whether a record that clearly targets
+// Cloudflare Workers AI carries a URL that cannot be normalized to the
+// documented strict HTTPS base. Clear intent means the raw URL sits on
+// exactly api.cloudflare.com or the platform label explicitly names
+// cloudflare/workers-ai. Such records must be skipped per record before
+// normalizeImportBaseURL discards the path, otherwise they would degrade into
+// a generic NewAPI/API site and persist Cloudflare credentials against the
+// wrong platform.
+func cloudflareImportURLInvalid(rawURL string, rawPlatform any) bool {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return false
+	}
+	if _, ok := model.NormalizeCloudflareWorkersAIBaseURL(trimmed); ok {
+		return false
+	}
+	return hasCloudflarePlatformHint(rawPlatform) || isExactCloudflareAPIHostURL(trimmed)
+}
+
 func isDirectImportPlatform(platform model.SitePlatform) bool {
 	_, ok := directImportPlatforms[platform]
 	return ok
@@ -1142,7 +1254,7 @@ func isDirectImportPlatform(platform model.SitePlatform) bool {
 
 func platformSupportsCheckin(platform model.SitePlatform) bool {
 	switch platform {
-	case model.SitePlatformDoneHub, model.SitePlatformSub2API, model.SitePlatformAPI:
+	case model.SitePlatformDoneHub, model.SitePlatformSub2API, model.SitePlatformAPI, model.SitePlatformCloudflare:
 		return false
 	default:
 		return true

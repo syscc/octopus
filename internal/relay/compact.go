@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
 	"github.com/bestruirui/octopus/internal/transformer/outbound"
 	openaiOutbound "github.com/bestruirui/octopus/internal/transformer/outbound/openai"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/gin-gonic/gin"
 )
@@ -42,9 +44,13 @@ type responsesCompactResponse struct {
 
 // HandleResponsesCompact proxies OpenAI-compatible /responses/compact requests upstream.
 func HandleResponsesCompact(c *gin.Context) {
-	body, err := io.ReadAll(c.Request.Body)
+	body, err := httpbody.ReadRequest(c.Request, httpbody.MaxLLMRequestBodyBytes)
 	if err != nil {
-		resp.Error(c, http.StatusInternalServerError, err.Error())
+		if errors.Is(err, httpbody.ErrRequestBodyTooLarge) {
+			resp.Error(c, http.StatusRequestEntityTooLarge, "request body too large")
+		} else {
+			resp.Error(c, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 
@@ -111,6 +117,7 @@ func HandleResponsesCompact(c *gin.Context) {
 		}
 
 		item := iter.Item()
+		metrics.ActualModel = item.ModelName
 		channel, err := op.ChannelGet(item.ChannelID, c.Request.Context())
 		if err != nil {
 			iter.Skip(item.ChannelID, 0, fmt.Sprintf("channel_%d", item.ChannelID), fmt.Sprintf("channel not found: %v", err))
@@ -165,12 +172,12 @@ func HandleResponsesCompact(c *gin.Context) {
 				}
 			}
 
-			statusCode, retryAfter, attemptErr = forwardResponsesCompact(c, metrics, iter, channel, usedKey, body)
+			statusCode, retryAfter, attemptErr = forwardResponsesCompact(c, metrics, iter, channel, usedKey, item.ModelName, body)
 			if attemptErr == nil {
 				success = true
 				break
 			}
-			if !isRetryableStatus(statusCode) {
+			if isDownstreamWriteError(attemptErr) || !isRetryableStatus(statusCode) {
 				break
 			}
 		}
@@ -180,17 +187,29 @@ func HandleResponsesCompact(c *gin.Context) {
 		op.ChannelKeyUpdate(usedKey)
 
 		if success {
-			op.StatsChannelUpdate(channel.ID, dbmodel.StatsMetrics{RequestSuccess: 1})
-			balancer.RecordSuccess(channel.ID, usedKey.ID, requestModel)
+			balancer.RecordSuccess(channel.ID, usedKey.ID, item.ModelName)
 			balancer.SetSticky(apiKeyID, requestModel, channel.ID, usedKey.ID)
 			outlierwindow.Report(channel.ID, true, statusCode, time.Now())
 			metrics.SaveWithChannelStats(c.Request.Context(), true, nil, iter.Attempts(), false)
 			return
 		}
 
-		op.StatsChannelUpdate(channel.ID, dbmodel.StatsMetrics{RequestFailed: 1})
+		if isDownstreamWriteError(attemptErr) {
+			// Retrying cannot repair an unusable downstream and would duplicate the
+			// already completed upstream compaction request.
+			metrics.SaveWithChannelStats(c.Request.Context(), false, attemptErr, iter.Attempts(), false)
+			return
+		}
+
+		// 客户端取消与普通 relay 语义一致：取消不算上游硬失败，
+		// 不记渠道失败统计，也不进熔断/outlier。
+		if isClientCancellation(c.Request.Context(), attemptErr) {
+			metrics.SaveWithChannelStats(c.Request.Context(), false, attemptErr, iter.Attempts(), false)
+			return
+		}
+
 		failureKind := circuitFailureKind(group.RetryEnabled, statusCode)
-		balancer.RecordFailure(channel.ID, usedKey.ID, requestModel, failureKind)
+		balancer.RecordFailure(channel.ID, usedKey.ID, item.ModelName, failureKind)
 		outlierwindow.Report(channel.ID, false, statusCode, time.Now())
 		lastErr = attemptErr
 		lastStatusCode = statusCode
@@ -225,15 +244,34 @@ func supportsResponsesCompact(channelType outbound.OutboundType) bool {
 	}
 }
 
-func forwardResponsesCompact(c *gin.Context, metrics *RelayMetrics, iter *balancer.Iterator, channel *dbmodel.Channel, usedKey dbmodel.ChannelKey, requestBody []byte) (int, time.Duration, error) {
+func forwardResponsesCompact(c *gin.Context, metrics *RelayMetrics, iter *balancer.Iterator, channel *dbmodel.Channel, usedKey dbmodel.ChannelKey, actualModel string, requestBody []byte) (statusCode int, retryAfter time.Duration, returnErr error) {
 	span := iter.StartAttempt(channel.ID, usedKey.ID, channel.Name)
-	request, err := buildResponsesCompactRequest(c.Request.Context(), channel, usedKey.ChannelKey, requestBody)
+	defer func() {
+		// Keep one channel statistic per real upstream attempt. Downstream write
+		// failures and client cancellation are request-scoped and health-neutral.
+		stats := dbmodel.StatsMetrics{WaitTime: span.Duration().Milliseconds()}
+		if returnErr == nil {
+			stats.RequestSuccess = 1
+		} else if isDownstreamWriteError(returnErr) || isClientCancellation(c.Request.Context(), returnErr) {
+			return
+		} else {
+			stats.RequestFailed = 1
+		}
+		_ = op.StatsChannelUpdate(channel.ID, stats)
+	}()
+
+	request, err := buildResponsesCompactRequest(c.Request.Context(), channel, usedKey.ChannelKey, actualModel, requestBody)
 	if err != nil {
 		span.End(dbmodel.AttemptFailed, 0, err.Error())
 		return 0, 0, fmt.Errorf("failed to create compact request: %w", err)
 	}
-	metrics.SetTransportRequestPayload(requestBody, metrics.RequestModel)
+	metrics.ActualModel = actualModel
+	metrics.SetTransportRequestPayload(requestBody, actualModel)
 	copyProxyHeaders(c.Request.Header, channel, request.Header)
+	// Normalize all credential aliases after client/channel header merging. The
+	// selected key remains authoritative even if a manually constructed header
+	// map used a non-canonical spelling.
+	applySelectedCredentialHeader(request.Header, channel.Type, usedKey.ChannelKey)
 
 	response, err := sendCompactRequest(channel, request)
 	if err != nil {
@@ -242,17 +280,23 @@ func forwardResponsesCompact(c *gin.Context, metrics *RelayMetrics, iter *balanc
 	}
 	defer response.Body.Close()
 
-	body, readErr := io.ReadAll(response.Body)
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, httpbody.MaxErrorResponseBodyBytes))
+		if readErr != nil {
+			span.End(dbmodel.AttemptFailed, response.StatusCode, readErr.Error())
+			return response.StatusCode, 0, fmt.Errorf("failed to read compact response body: %w", readErr)
+		}
+		retryAfter := parseRetryAfter(response.Header.Get("Retry-After"))
+		statusCode := normalizeUpstreamStatusCode(response.StatusCode, string(body))
+		upstreamErr := newUpstreamHTTPError(statusCode, body)
+		span.End(dbmodel.AttemptFailed, statusCode, upstreamErr.Error())
+		return statusCode, retryAfter, upstreamErr
+	}
+
+	body, readErr := httpbody.ReadAll(response.Body, httpbody.MaxLLMResponseBodyBytes)
 	if readErr != nil {
 		span.End(dbmodel.AttemptFailed, response.StatusCode, readErr.Error())
 		return response.StatusCode, 0, fmt.Errorf("failed to read compact response body: %w", readErr)
-	}
-
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		retryAfter := parseRetryAfter(response.Header.Get("Retry-After"))
-		statusCode := normalizeUpstreamStatusCode(response.StatusCode, string(body))
-		span.End(dbmodel.AttemptFailed, statusCode, string(body))
-		return statusCode, retryAfter, fmt.Errorf("upstream error: %d: %s", response.StatusCode, string(body))
 	}
 
 	copyProxyResponseHeaders(c.Writer.Header(), response.Header)
@@ -260,25 +304,45 @@ func forwardResponsesCompact(c *gin.Context, metrics *RelayMetrics, iter *balanc
 	if strings.TrimSpace(contentType) == "" {
 		contentType = "application/json"
 	}
-	c.Data(response.StatusCode, contentType, body)
+	if _, writeErr := writeDownstreamResponse(c, response.StatusCode, contentType, body); writeErr != nil {
+		span.End(dbmodel.AttemptFailed, response.StatusCode, writeErr.Error())
+		return response.StatusCode, 0, writeErr
+	}
 
 	var compactResp responsesCompactResponse
 	if err := json.Unmarshal(body, &compactResp); err == nil {
-		metrics.SetInternalResponse(compactResponseToInternalResponse(&compactResp), metrics.RequestModel)
+		metrics.SetInternalResponse(compactResponseToInternalResponse(&compactResp), actualModel)
 	}
 
 	span.End(dbmodel.AttemptSuccess, response.StatusCode, "")
 	return response.StatusCode, 0, nil
 }
 
-func buildResponsesCompactRequest(ctx context.Context, channel *dbmodel.Channel, key string, requestBody []byte) (*http.Request, error) {
+func buildResponsesCompactRequest(ctx context.Context, channel *dbmodel.Channel, key, actualModel string, requestBody []byte) (*http.Request, error) {
 	parsedURL, err := url.Parse(strings.TrimSuffix(channel.GetBaseUrl(), "/"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse base url: %w", err)
 	}
 	parsedURL.Path = parsedURL.Path + "/responses/compact"
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, parsedURL.String(), bytes.NewReader(requestBody))
+	payload := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(requestBody, &payload); err != nil {
+		return nil, fmt.Errorf("failed to decode compact request: %w", err)
+	}
+	if payload == nil {
+		return nil, errors.New("compact request must be a JSON object")
+	}
+	modelJSON, err := json.Marshal(actualModel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode compact model: %w", err)
+	}
+	payload["model"] = modelJSON
+	encodedBody, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode compact request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, parsedURL.String(), bytes.NewReader(encodedBody))
 	if err != nil {
 		return nil, err
 	}
@@ -289,36 +353,44 @@ func buildResponsesCompactRequest(ctx context.Context, channel *dbmodel.Channel,
 }
 
 func copyProxyHeaders(src http.Header, channel *dbmodel.Channel, dst http.Header) {
-	for key, values := range src {
-		lowerKey := strings.ToLower(key)
-		if hopByHopHeaders[lowerKey] || lowerKey == "content-type" {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
+	if dst == nil {
+		return
+	}
+	for _, name := range []string{"Authorization", "X-API-Key", "X-Goog-Api-Key", "Api-Key"} {
+		deleteHeaderCaseInsensitive(dst, name)
+	}
+	entries := collectNormalizedHeaderEntries(src, func(name string) bool {
+		return !isBlockedUpstreamHeader(name) && !strings.EqualFold(name, "content-type")
+	})
+	for _, entry := range entries {
+		setHeaderValuesCaseInsensitive(dst, entry.name, entry.values)
+	}
+	if channel != nil {
+		for _, header := range channel.CustomHeader {
+			name := strings.TrimSpace(header.HeaderKey)
+			if strings.EqualFold(name, "content-type") || isBlockedChannelHeader(name) {
+				continue
+			}
+			setHeaderValuesCaseInsensitive(dst, name, []string{header.HeaderValue})
 		}
 	}
-	for _, header := range channel.CustomHeader {
-		if strings.EqualFold(header.HeaderKey, "Content-Type") {
-			continue
-		}
-		dst.Set(header.HeaderKey, header.HeaderValue)
-	}
-	// 防止 Go 默认 User-Agent 泄露到上游
-	if dst.Get("User-Agent") == "" {
-		dst.Set("User-Agent", "")
+	// The request is created with the selected channel key. Protected client
+	// and custom credential headers are skipped above, while a configured
+	// Cookie remains available as channel-scoped authentication.
+	if len(headerValuesCaseInsensitive(dst, "User-Agent")) == 0 {
+		setHeaderValuesCaseInsensitive(dst, "User-Agent", []string{""})
 	}
 }
 
 func copyProxyResponseHeaders(dst http.Header, src http.Header) {
-	for key, values := range src {
-		if hopByHopHeaders[strings.ToLower(key)] {
-			continue
-		}
-		dst.Del(key)
-		for _, value := range values {
-			dst.Add(key, value)
-		}
+	if dst == nil || src == nil {
+		return
+	}
+	entries := collectNormalizedHeaderEntries(src, func(name string) bool {
+		return !isBlockedUpstreamHeader(name)
+	})
+	for _, entry := range entries {
+		setHeaderValuesCaseInsensitive(dst, entry.name, entry.values)
 	}
 }
 

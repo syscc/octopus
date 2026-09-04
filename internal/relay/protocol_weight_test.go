@@ -6,7 +6,7 @@ import (
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
 	"github.com/bestruirui/octopus/internal/relay/balancer"
-	"github.com/bestruirui/octopus/internal/transformer/inbound"
+	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
 	"github.com/bestruirui/octopus/internal/transformer/outbound"
 )
 
@@ -29,7 +29,9 @@ func TestApplyProtocolPreferenceForModePreservesWeightedOrder(t *testing.T) {
 	}
 	iter := balancer.NewIterator(group, 0, "weighted-model")
 
-	applyProtocolPreferenceForMode(model.GroupModeWeighted, inbound.InboundTypeOpenAIChat, iter, ctx)
+	applyProtocolPreferenceForMode(model.GroupModeWeighted, &transformerModel.InternalLLMRequest{
+		RawAPIFormat: transformerModel.APIFormatOpenAIChatCompletion,
+	}, iter, ctx)
 
 	if !iter.Next() {
 		t.Fatal("expected weighted candidate")

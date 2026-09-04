@@ -1094,6 +1094,12 @@ func TestHandlerStopsFailoverWhenContinuationTransportIsUnavailable(t *testing.T
 	if sticky := balancer.GetSticky(77, "relay-ws-continuation-group", time.Minute); sticky != nil {
 		t.Fatalf("expected sticky to be cleared after continuation failure, got %#v", sticky)
 	}
+	wsUpstreamPool.healthMu.RLock()
+	health := wsUpstreamPool.health[firstChannel.ID]
+	wsUpstreamPool.healthMu.RUnlock()
+	if health == nil || health.consecutiveFailures != 1 {
+		t.Fatalf("continuation transport failure must degrade WS health once, health=%+v", health)
+	}
 	wsUpstreamPool.Remove(pc.poolKey)
 	wsUpstreamPool.Remove(newWSPoolKey(secondChannel.ID, secondChannel.Keys[0].ID, buildUpstreamWSHeaders(c.Request.Header, secondChannel, secondChannel.Keys[0].ChannelKey)))
 }

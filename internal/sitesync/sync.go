@@ -40,7 +40,7 @@ func syncAccountStateWithCreatedToken(ctx context.Context, siteRecord *model.Sit
 		return syncManagementPlatformWithCreatedToken(ctx, siteRecord, account, createdToken)
 	case model.SitePlatformSub2API:
 		return syncSub2APIWithCreatedToken(ctx, siteRecord, account, createdToken)
-	case model.SitePlatformAPI:
+	case model.SitePlatformAPI, model.SitePlatformCloudflare:
 		return syncOfficialPlatform(ctx, siteRecord, account)
 	default:
 		return nil, newUnsupportedSitePlatformError(siteRecord.Platform)
@@ -124,7 +124,7 @@ func checkinAccountState(ctx context.Context, siteRecord *model.Site, account *m
 	}
 
 	switch siteRecord.Platform {
-	case model.SitePlatformDoneHub, model.SitePlatformSub2API, model.SitePlatformAPI:
+	case model.SitePlatformDoneHub, model.SitePlatformSub2API, model.SitePlatformAPI, model.SitePlatformCloudflare:
 		return &model.SiteCheckinResult{Status: model.SiteExecutionStatusSkipped, Message: "checkin is not supported by this platform"}, "", nil
 	case model.SitePlatformAnyRouter:
 		return checkinAnyRouter(ctx, siteRecord, account)
@@ -158,7 +158,7 @@ func syncManagementPlatform(ctx context.Context, siteRecord *model.Site, account
 
 func syncManagementPlatformWithCreatedToken(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, createdToken *model.SiteToken) (*syncSnapshot, error) {
 	if account.CredentialType == model.SiteCredentialTypeAPIKey {
-		return syncWithDirectToken(ctx, siteRecord, account, resolveDirectToken(account), "manual")
+		return syncWithDirectToken(ctx, siteRecord, account, resolveDirectToken(account), "direct")
 	}
 
 	accessToken, err := resolveManagedAccessToken(ctx, siteRecord, account)
@@ -260,7 +260,7 @@ func syncSub2APIWithCreatedToken(ctx context.Context, siteRecord *model.Site, ac
 		return nil, fmt.Errorf("sub2api does not support username/password login")
 	}
 	if account.CredentialType == model.SiteCredentialTypeAPIKey {
-		return syncWithDirectToken(ctx, siteRecord, account, resolveDirectToken(account), "manual")
+		return syncWithDirectToken(ctx, siteRecord, account, resolveDirectToken(account), "direct")
 	}
 
 	accessToken, err := ensureFreshSub2APIAccessToken(ctx, siteRecord, account, false)
@@ -333,7 +333,7 @@ func syncSub2APIWithAccessToken(ctx context.Context, siteRecord *model.Site, acc
 }
 
 func syncOfficialPlatform(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount) (*syncSnapshot, error) {
-	return syncWithDirectToken(ctx, siteRecord, account, resolveDirectToken(account), "manual")
+	return syncWithDirectToken(ctx, siteRecord, account, resolveDirectToken(account), "direct")
 }
 
 func syncWithDirectToken(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, token string, source string) (*syncSnapshot, error) {

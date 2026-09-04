@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
     Trash2,
     CheckCircle2,
@@ -9,9 +9,20 @@ import {
     Activity,
     TrendingUp,
     Globe,
-    Key
+    Key,
+    ArrowLeftRight,
+    RefreshCw
 } from 'lucide-react';
-import { useUpdateChannel, useDeleteChannel, type Channel, type UpdateChannelRequest } from '@/api/endpoints/channel';
+import {
+    effectiveOpenAIProtocolCapabilities,
+    isOpenAIChannelType,
+    useUpdateChannel,
+    useDeleteChannel,
+    type Channel,
+    type OpenAIProtocolMode,
+    type OpenAIProtocolProbeResult,
+    type UpdateChannelRequest,
+} from '@/api/endpoints/channel';
 import {
     MorphingDialogTitle,
     MorphingDialogDescription,
@@ -23,7 +34,7 @@ import { type StatsMetricsFormatted } from '@/api/endpoints/stats';
 import { useTranslations } from 'next-intl';
 import { toast } from '@/components/common/Toast';
 import { Button } from '@/components/ui/button';
-import { ChannelForm, type ChannelFormData } from './Form';
+import { ChannelForm, ProtocolCapabilityIndicator, protocolModeLabelKey, useOpenAIProtocolProbeAction, type ChannelFormData, type OpenAIProtocolProbeAction } from './Form';
 import { formatMoney } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
@@ -56,11 +67,14 @@ function createChannelFormData(channel: Channel): ChannelFormData {
         auto_sync: channel.auto_sync,
         auto_group: channel.auto_group,
         match_regex: channel.match_regex ?? '',
+        openai_protocol_mode: channel.openai_protocol_mode ?? 'auto',
+        openai_chat_capability: channel.openai_chat_capability ?? 'unknown',
+        openai_responses_capability: channel.openai_responses_capability ?? 'unknown',
     };
 }
 
 export function CardContent({ channel, stats }: { channel: Channel; stats: StatsMetricsFormatted }) {
-    const { setIsOpen } = useMorphingDialog();
+    const { isOpen, setIsOpen } = useMorphingDialog();
     const updateChannel = useUpdateChannel();
     const deleteChannel = useDeleteChannel();
     const requestJump = useJumpStore((state) => state.requestJump);
@@ -68,9 +82,94 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
     const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
     const [formData, setFormData] = useState<ChannelFormData>(() => createChannelFormData(channel));
     const t = useTranslations('channel.detail');
+    const tForm = useTranslations('channel.form');
     const tProxy = useTranslations('proxyPool');
 
     const currentView = isEditing ? 'editing' : 'viewing';
+
+    const protocolMode: OpenAIProtocolMode = channel.openai_protocol_mode ?? 'auto';
+    const protocolCapabilities = effectiveOpenAIProtocolCapabilities(channel);
+
+    const { probeOpenAIProtocol, isPending: isProbePending } = useOpenAIProtocolProbeAction();
+    // 托管渠道的配置由站点投影管理；手动协议模式由服务端权威控制，
+    // 详情卡只提供自动模式的真实探测入口。
+    const canProbeOpenAIProtocol =
+        isOpenAIChannelType(channel.type) &&
+        !channel.managed &&
+        protocolMode === 'auto';
+
+    const autoProbeChannelRef = useRef<number | null>(null);
+    const latestProbeResultRef = useRef<OpenAIProtocolProbeResult | null>(null);
+    const probeSessionRef = useRef(0);
+    const isOpenRef = useRef(isOpen);
+    const formDataRef = useRef(formData);
+
+    useEffect(() => {
+        if (isOpen !== isOpenRef.current) {
+            probeSessionRef.current += 1;
+        }
+        isOpenRef.current = isOpen;
+    }, [isOpen]);
+
+    const probeOpenAIProtocolForDialog = useCallback<OpenAIProtocolProbeAction>((channelId, onProbed, options) => {
+        const session = probeSessionRef.current;
+        probeOpenAIProtocol(channelId, (result) => {
+            if (!isOpenRef.current || probeSessionRef.current !== session) return;
+            onProbed?.(result);
+        }, options);
+    }, [probeOpenAIProtocol]);
+
+    useEffect(() => {
+        formDataRef.current = formData;
+        if ((formData.openai_protocol_mode ?? 'auto') !== 'auto' || !isOpenAIChannelType(formData.type)) {
+            latestProbeResultRef.current = null;
+        }
+    }, [formData]);
+
+    const applyProbeResultToForm = useCallback((result: OpenAIProtocolProbeResult) => {
+        // Do not apply a late result after the dialog closed or after a manual selection.
+        if (!isOpenRef.current) return;
+        const current = formDataRef.current;
+        if (
+            (current.openai_protocol_mode ?? 'auto') !== 'auto' ||
+            !isOpenAIChannelType(current.type)
+        ) {
+            return;
+        }
+        latestProbeResultRef.current = result;
+        setFormData((previous) => {
+            if (
+                (previous.openai_protocol_mode ?? 'auto') !== 'auto' ||
+                !isOpenAIChannelType(previous.type)
+            ) {
+                return previous;
+            }
+            return {
+                ...previous,
+                openai_chat_capability: result.chat,
+                openai_responses_capability: result.responses,
+            };
+        });
+    }, []);
+
+    useEffect(() => {
+        if (!isOpen || !canProbeOpenAIProtocol) {
+            autoProbeChannelRef.current = null;
+            latestProbeResultRef.current = null;
+            return;
+        }
+        if (isProbePending || autoProbeChannelRef.current === channel.id) return;
+
+        autoProbeChannelRef.current = channel.id;
+        probeOpenAIProtocolForDialog(channel.id, applyProbeResultToForm, { notify: false });
+    }, [
+        applyProbeResultToForm,
+        canProbeOpenAIProtocol,
+        channel.id,
+        isOpen,
+        isProbePending,
+        probeOpenAIProtocolForDialog,
+    ]);
 
     const baseUrlsEqual = (a: Channel['base_urls'] | undefined, b: Channel['base_urls'] | undefined) =>
         JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
@@ -104,6 +203,13 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
         if (formData.auto_sync !== channel.auto_sync) req.auto_sync = formData.auto_sync;
         if (formData.auto_group !== channel.auto_group) req.auto_group = formData.auto_group;
         if ((formData.ws_mode ?? 'inherit') !== (channel.ws_mode ?? 'inherit')) req.ws_mode = formData.ws_mode;
+
+        // Capabilities are server-probed read-only values; only the manual mode override is writable,
+        // and it is only meaningful for OpenAI protocol channels.
+        if (isOpenAIChannelType(formData.type) &&
+            (formData.openai_protocol_mode ?? 'auto') !== (channel.openai_protocol_mode ?? 'auto')) {
+            req.openai_protocol_mode = formData.openai_protocol_mode;
+        }
 
         if (!headersEqual(formData.custom_header, channel.custom_header)) {
             req.custom_header = (formData.custom_header ?? [])
@@ -157,12 +263,36 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
             onSuccess: () => {
                 setIsEditing(false);
                 setIsOpen(false);
+            },
+            onError: (error) => {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                toast.error(t('actions.saveFailed'), { description: errorMessage });
             }
         });
     };
 
     const beginEditing = () => {
-        setFormData(createChannelFormData(channel));
+        const nextFormData = createChannelFormData(channel);
+        const currentMode = formData.openai_protocol_mode ?? 'auto';
+        const channelMode = channel.openai_protocol_mode ?? 'auto';
+        if (currentMode === 'auto' && channelMode === 'auto') {
+            const latestProbeResult = latestProbeResultRef.current;
+            if (latestProbeResult?.channel_id === channel.id) {
+                if (
+                    nextFormData.openai_chat_capability === 'unknown' &&
+                    latestProbeResult.chat !== 'unknown'
+                ) {
+                    nextFormData.openai_chat_capability = latestProbeResult.chat;
+                }
+                if (
+                    nextFormData.openai_responses_capability === 'unknown' &&
+                    latestProbeResult.responses !== 'unknown'
+                ) {
+                    nextFormData.openai_responses_capability = latestProbeResult.responses;
+                }
+            }
+        }
+        setFormData(nextFormData);
         setIsEditing(true);
     };
 
@@ -293,6 +423,40 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
                                         </dd>
                                     </div>
                                 </dl>
+
+                                {/* OpenAI 协议状态：仅 OpenAI Chat/Responses 渠道显示 */}
+                                {isOpenAIChannelType(channel.type) ? (
+                                    <section className="space-y-3">
+                                        <div className="flex items-center justify-between gap-2">
+                                            <h4 className="flex items-center gap-2 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+                                                <ArrowLeftRight className="size-3.5" />
+                                                {t('sections.protocol')}
+                                            </h4>
+                                            {canProbeOpenAIProtocol ? (
+                                                <Button
+                                                    type="button"
+                                                    variant="ghost"
+                                                    size="sm"
+                                                    onClick={() => probeOpenAIProtocolForDialog(channel.id, applyProbeResultToForm)}
+                                                    disabled={isProbePending}
+                                                    className="h-6 px-2 text-xs text-muted-foreground/50 hover:text-muted-foreground hover:bg-transparent"
+                                                >
+                                                    <RefreshCw className={cn('size-3', isProbePending && 'animate-spin')} />
+                                                    {isProbePending ? tForm('protocolProbing') : tForm('protocolReprobe')}
+                                                </Button>
+                                            ) : null}
+                                        </div>
+                                        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-2xl border bg-card p-3 sm:p-4">
+                                            <Badge variant="secondary" className="h-6 px-2 text-xs font-medium">
+                                                {tForm(protocolModeLabelKey(protocolMode))}
+                                            </Badge>
+                                            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                                                <ProtocolCapabilityIndicator capability={protocolCapabilities.chat} endpoint="OpenAI Chat" />
+                                                <ProtocolCapabilityIndicator capability={protocolCapabilities.responses} endpoint="OpenAI Responses" />
+                                            </div>
+                                        </div>
+                                    </section>
+                                ) : null}
 
                                 {/* 请求详情 */}
                                 <section className="space-y-3">
@@ -533,6 +697,10 @@ export function CardContent({ channel, stats }: { channel: Channel; stats: Stats
                                 onCancel={cancelEditing}
                                 cancelText={t('actions.cancel')}
                                 idPrefix="channel"
+                                persistedOpenAIProtocolMode={channel.openai_protocol_mode ?? 'auto'}
+                                persistedChannelId={channel.id}
+                                probeOpenAIProtocol={probeOpenAIProtocolForDialog}
+                                isOpenAIProtocolProbePending={isProbePending}
                             />
                         </TabsContent>
                     </TabsContents>

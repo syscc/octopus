@@ -81,6 +81,37 @@ func TestApplyPersistedRouteStateKeepsManualOverrideUntouched(t *testing.T) {
 	}
 }
 
+func TestApplyPersistedRouteStateForCloudflareClearsHistoricalOverride(t *testing.T) {
+	previous := time.Unix(1711929000, 0)
+	now := time.Unix(1711929600, 0)
+	existing := &model.SiteModel{
+		ModelName:       "claude-3-5-sonnet",
+		RouteType:       model.SiteModelRouteTypeAnthropic,
+		RouteSource:     model.SiteModelRouteSourceManualOverride,
+		ManualOverride:  true,
+		RouteRawPayload: "legacy-route-metadata",
+		RouteUpdatedAt:  &previous,
+	}
+	item := &model.SiteModel{
+		ModelName:       "claude-3-5-sonnet",
+		RouteType:       model.SiteModelRouteTypeAnthropic,
+		RouteSource:     model.SiteModelRouteSourceRuntimeLearned,
+		RouteRawPayload: "incoming-route-metadata",
+	}
+
+	applyPersistedRouteStateForPlatform(item, existing, model.SitePlatformCloudflare, now)
+
+	if item.RouteType != model.SiteModelRouteTypeOpenAIChat {
+		t.Fatalf("expected Cloudflare route openai_chat, got %q", item.RouteType)
+	}
+	if item.RouteSource != model.SiteModelRouteSourceSyncInferred || item.ManualOverride || item.RouteRawPayload != "" {
+		t.Fatalf("expected historical route state to be cleared, got %+v", item)
+	}
+	if item.RouteUpdatedAt == nil || !item.RouteUpdatedAt.Equal(now) {
+		t.Fatalf("expected route update timestamp %v, got %#v", now, item.RouteUpdatedAt)
+	}
+}
+
 func TestMergePersistedSiteTokensPreservesManualFullTokenWhenIncomingIsMasked(t *testing.T) {
 	now := time.Unix(1711929600, 0)
 	existing := []model.SiteToken{{
@@ -601,6 +632,96 @@ func TestPersistSyncSnapshotPreservesIncompleteDiscoveryHistory(t *testing.T) {
 	}
 }
 
+func TestPersistSyncSnapshotNormalizesEntireCloudflareModelSet(t *testing.T) {
+	ctx := setupProjectTestDB(t)
+	site := &model.Site{
+		Name:     "Cloudflare Storage Site",
+		Platform: model.SitePlatformCloudflare,
+		BaseURL:  "https://api.cloudflare.com/client/v4/accounts/account-id/ai",
+		Enabled:  true,
+	}
+	if err := op.SiteCreate(site, ctx); err != nil {
+		t.Fatalf("SiteCreate failed: %v", err)
+	}
+	account := &model.SiteAccount{
+		SiteID:         site.ID,
+		Name:           "Cloudflare Account",
+		CredentialType: model.SiteCredentialTypeAccessToken,
+		AccessToken:    "access-token",
+		Enabled:        true,
+	}
+	if err := op.SiteAccountCreate(account, ctx); err != nil {
+		t.Fatalf("SiteAccountCreate failed: %v", err)
+	}
+	previous := time.Unix(1711929000, 0)
+	historical := model.SiteModel{
+		SiteAccountID:   account.ID,
+		GroupKey:        "vip",
+		ModelName:       "historical-vip-model",
+		Source:          "sync",
+		RouteType:       model.SiteModelRouteTypeAnthropic,
+		RouteSource:     model.SiteModelRouteSourceManualOverride,
+		ManualOverride:  true,
+		RouteRawPayload: "historical-route",
+		RouteUpdatedAt:  &previous,
+	}
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&historical).Error; err != nil {
+		t.Fatalf("create historical model failed: %v", err)
+	}
+
+	snapshot := &syncSnapshot{
+		accessToken: account.AccessToken,
+		groups: []model.SiteUserGroup{
+			{GroupKey: model.SiteDefaultGroupKey, Name: model.SiteDefaultGroupName},
+			{GroupKey: "vip", Name: "VIP"},
+		},
+		models: []model.SiteModel{{
+			GroupKey:        model.SiteDefaultGroupKey,
+			ModelName:       "fresh-default-model",
+			Source:          "sync",
+			RouteType:       model.SiteModelRouteTypeGemini,
+			RouteSource:     model.SiteModelRouteSourceRuntimeLearned,
+			ManualOverride:  true,
+			RouteRawPayload: "incoming-route",
+		}},
+		groupResults: []siteGroupSyncResult{
+			{GroupKey: model.SiteDefaultGroupKey, GroupName: model.SiteDefaultGroupName, HasKey: true, Status: siteGroupSyncStatusSynced, Authoritative: true, ModelCount: 1},
+			{GroupKey: "vip", GroupName: "VIP", HasKey: true, Status: siteGroupSyncStatusFailed, Authoritative: false, Message: "temporary failure"},
+		},
+		status:  model.SiteExecutionStatusPartial,
+		message: "partial",
+	}
+	if err := persistSyncSnapshot(ctx, account.ID, snapshot); err != nil {
+		t.Fatalf("persistSyncSnapshot returned error: %v", err)
+	}
+
+	var persisted []model.SiteModel
+	if err := dbpkg.GetDB().WithContext(ctx).
+		Where("site_account_id = ?", account.ID).
+		Order("group_key ASC, model_name ASC").
+		Find(&persisted).Error; err != nil {
+		t.Fatalf("query persisted models failed: %v", err)
+	}
+	if len(persisted) != 2 {
+		t.Fatalf("expected fresh and preserved models, got %+v", persisted)
+	}
+	for _, item := range persisted {
+		if item.RouteType != model.SiteModelRouteTypeOpenAIChat ||
+			item.RouteSource != model.SiteModelRouteSourceSyncInferred ||
+			item.ManualOverride || item.RouteRawPayload != "" {
+			t.Fatalf("expected every Cloudflare model route to be canonical, got %+v", item)
+		}
+		if item.RouteUpdatedAt == nil {
+			t.Fatalf("expected route timestamp for %+v", item)
+		}
+	}
+	for _, item := range persisted {
+		if item.ModelName == historical.ModelName && !item.RouteUpdatedAt.After(previous) {
+			t.Fatalf("expected preserved historical route timestamp to advance, got %v", item.RouteUpdatedAt)
+		}
+	}
+}
+
 func TestPersistSyncSnapshotEmptySuspendsWithoutAdvancingSuccessTime(t *testing.T) {
 	ctx := setupProjectTestDB(t)
 	_, account := createProjectionFixture(t, ctx)
@@ -640,5 +761,131 @@ func TestPersistSyncSnapshotEmptySuspendsWithoutAdvancingSuccessTime(t *testing.
 	}
 	if reloaded.LastModelSyncSuccessAt == nil || !reloaded.LastModelSyncSuccessAt.Equal(previousSuccess) {
 		t.Fatalf("expected empty sync to preserve last success time %v, got %v", previousSuccess, reloaded.LastModelSyncSuccessAt)
+	}
+}
+
+func TestMergePersistedDirectTokenReplacesLegacyManualToken(t *testing.T) {
+	now := time.Unix(1711929600, 0)
+	existing := []model.SiteToken{{
+		ID: 41, SiteAccountID: 9, Name: "default", Token: "old-direct-token",
+		GroupKey: model.SiteDefaultGroupKey, GroupName: model.SiteDefaultGroupName,
+		Enabled: true, ValueStatus: model.SiteTokenValueStatusReady, Source: "manual",
+	}}
+	incoming := []model.SiteToken{{
+		Name: "default", Token: "new-direct-token", GroupKey: model.SiteDefaultGroupKey,
+		GroupName: model.SiteDefaultGroupName, Enabled: true,
+		ValueStatus: model.SiteTokenValueStatusReady, Source: "direct",
+	}}
+
+	merged := mergePersistedSiteTokens(9, existing, incoming, now)
+	if len(merged) != 1 || merged[0].Token != "new-direct-token" || merged[0].Source != "direct" {
+		t.Fatalf("expected direct sync to replace the legacy generated token, got %+v", merged)
+	}
+}
+
+func TestMergePersistedSyncKeepsManualToken(t *testing.T) {
+	now := time.Unix(1711929600, 0)
+	existing := []model.SiteToken{{
+		ID: 42, SiteAccountID: 9, Name: "default", Token: "user-manual-token",
+		GroupKey: model.SiteDefaultGroupKey, GroupName: model.SiteDefaultGroupName,
+		Enabled: true, ValueStatus: model.SiteTokenValueStatusReady, Source: "manual",
+	}}
+	incoming := []model.SiteToken{{
+		Name: "default", Token: "new-sync-token", GroupKey: model.SiteDefaultGroupKey,
+		GroupName: model.SiteDefaultGroupName, Enabled: true,
+		ValueStatus: model.SiteTokenValueStatusReady, Source: "sync",
+	}}
+
+	merged := mergePersistedSiteTokens(9, existing, incoming, now)
+	if len(merged) != 2 {
+		t.Fatalf("expected sync token plus manual token to coexist, got %+v", merged)
+	}
+	foundManual, foundSync := false, false
+	for _, token := range merged {
+		if token.Source == "manual" && token.Token == "user-manual-token" {
+			foundManual = true
+		}
+		if token.Source == "sync" && token.Token == "new-sync-token" {
+			foundSync = true
+		}
+	}
+	if !foundManual || !foundSync {
+		t.Fatalf("sync removed a manual token: %+v", merged)
+	}
+}
+
+// TestPersistSyncSnapshotPreservesExplicitlyDisabledTokens locks in the
+// contract that tokens persisted with enabled=false survive the
+// delete-and-recreate cycle in persistSyncSnapshot. GORM omits zero-valued
+// (false) fields from the INSERT when the column carries a database default
+// (SiteToken.Enabled defaults to true), which would silently re-enable both
+// tokens that inherit a disabled state from an existing row (old ID) and
+// brand-new tokens persisted with an explicit enabled=false (new ID).
+func TestPersistSyncSnapshotPreservesExplicitlyDisabledTokens(t *testing.T) {
+	ctx := setupProjectTestDB(t)
+	_, account := createProjectionFixture(t, ctx)
+
+	legacy := model.SiteToken{
+		SiteAccountID: account.ID,
+		Name:          "legacy-disabled",
+		Token:         "key-legacy-disabled",
+		GroupKey:      "default",
+		GroupName:     "default",
+		Enabled:       false,
+		ValueStatus:   model.SiteTokenValueStatusReady,
+		Source:        "sync",
+	}
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&legacy).Error; err != nil {
+		t.Fatalf("create legacy token failed: %v", err)
+	}
+	// Seed the persisted false explicitly because the model carries a
+	// database default and a plain GORM Create omits false on INSERT.
+	if err := dbpkg.GetDB().WithContext(ctx).Model(&model.SiteToken{}).Where("id = ?", legacy.ID).UpdateColumn("enabled", false).Error; err != nil {
+		t.Fatalf("disable legacy token failed: %v", err)
+	}
+
+	snapshot := &syncSnapshot{
+		accessToken: account.AccessToken,
+		tokens: []model.SiteToken{
+			// Re-matched against the legacy row by token value: the merged token
+			// must inherit Enabled=false from the persisted row (old-ID path).
+			{Name: "legacy-disabled", Token: "key-legacy-disabled", GroupKey: "default", GroupName: "default", Enabled: true, Source: "sync"},
+			// Brand-new token persisted with an explicit enabled=false (new-ID path).
+			{Name: "fresh-disabled", Token: "key-fresh-disabled", GroupKey: "default", GroupName: "default", Enabled: false, Source: "sync"},
+			{Name: "enabled-kept", Token: "key-enabled-kept", GroupKey: "default", GroupName: "default", Enabled: true, Source: "sync"},
+		},
+		status:  model.SiteExecutionStatusSuccess,
+		message: "ok",
+	}
+
+	if err := persistSyncSnapshot(ctx, account.ID, snapshot); err != nil {
+		t.Fatalf("persistSyncSnapshot returned error: %v", err)
+	}
+
+	var tokens []model.SiteToken
+	if err := dbpkg.GetDB().WithContext(ctx).
+		Where("site_account_id = ?", account.ID).
+		Order("name ASC").
+		Find(&tokens).Error; err != nil {
+		t.Fatalf("query reloaded tokens failed: %v", err)
+	}
+	byName := make(map[string]model.SiteToken, len(tokens))
+	for _, token := range tokens {
+		byName[token.Name] = token
+	}
+	if len(byName) != 3 {
+		t.Fatalf("expected 3 tokens after sync, got %d: %+v", len(byName), byName)
+	}
+	for _, name := range []string{"legacy-disabled", "fresh-disabled"} {
+		token, ok := byName[name]
+		if !ok {
+			t.Fatalf("expected token %q to persist after sync", name)
+		}
+		if token.Enabled {
+			t.Fatalf("expected token %q to stay disabled after snapshot persist, got enabled", name)
+		}
+	}
+	if token, ok := byName["enabled-kept"]; !ok || !token.Enabled {
+		t.Fatalf("expected enabled-kept token to stay enabled, got %#v", token)
 	}
 }

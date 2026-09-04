@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
   buildCheckinSummary,
+  sitePlatformSupportsCheckin,
   type CheckinActiveFilterStatus,
   type CheckinFilterStatus,
 } from "./checkin-status";
@@ -146,8 +147,12 @@ export function CheckinPanel({
   const manualCheckinUrls = useMemo(
     () =>
       (sites ?? [])
-        .filter((s) => s.external_checkin_url?.trim())
-        .map((s) => s.external_checkin_url!.trim()),
+        .filter(
+          (site) =>
+            sitePlatformSupportsCheckin(site.platform) &&
+            site.external_checkin_url?.trim(),
+        )
+        .map((site) => site.external_checkin_url!.trim()),
     [sites],
   );
 

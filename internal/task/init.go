@@ -14,17 +14,18 @@ import (
 )
 
 const (
-	TaskPriceUpdate       = "price_update"
-	TaskStatsSave         = "stats_save"
-	TaskRelayLogSave      = "relay_log_save"
-	TaskSyncLLM           = "sync_llm"
-	TaskCleanLLM          = "clean_llm"
-	TaskBaseUrlDelay      = "base_url_delay"
-	TaskSiteSync          = "site_sync"
-	TaskSiteCheckin       = "site_checkin"
-	TaskSiteCheckinRandom = "site_checkin_random_due"
-	TaskWSAffinityCleanup = "ws_affinity_cleanup"
-	TaskWebDAVBackup      = "webdav_backup"
+	TaskPriceUpdate                     = "price_update"
+	TaskStatsSave                       = "stats_save"
+	TaskRelayLogSave                    = "relay_log_save"
+	TaskSyncLLM                         = "sync_llm"
+	TaskCleanLLM                        = "clean_llm"
+	TaskBaseUrlDelay                    = "base_url_delay"
+	TaskSiteSync                        = "site_sync"
+	TaskSiteCheckin                     = "site_checkin"
+	TaskSiteCheckinRandom               = "site_checkin_random_due"
+	TaskWSAffinityCleanup               = "ws_affinity_cleanup"
+	TaskWebDAVBackup                    = "webdav_backup"
+	TaskOpenAIProtocolUnsupportedExpiry = "openai_protocol_unsupported_expiry"
 )
 
 // ModelInfoUpdateTask refreshes the model pricing metadata.
@@ -117,6 +118,14 @@ func ConfigureSiteCheckinSchedule() error {
 }
 
 func Init() {
+	// 先注册不依赖 Setting 的任务：下面几个读取失败会提前 return，
+	// 放在后面会导致该任务在设置异常时被静默跳过。
+	// 注册 OpenAI 协议 unsupported 判定过期任务
+	Register(TaskOpenAIProtocolUnsupportedExpiry, 6*time.Hour, true, OpenAIProtocolUnsupportedExpiryTask)
+
+	// 注册基础URL延迟任务
+	Register(TaskBaseUrlDelay, 24*time.Hour, true, ChannelBaseUrlDelayTask)
+
 	priceUpdateIntervalHours, err := op.SettingGetInt(model.SettingKeyModelInfoUpdateInterval)
 	if err != nil {
 		log.Errorf("failed to get model info update interval: %v", err)
@@ -125,9 +134,6 @@ func Init() {
 	priceUpdateInterval := time.Duration(priceUpdateIntervalHours) * time.Hour
 	// 注册价格更新任务
 	Register(string(model.SettingKeyModelInfoUpdateInterval), priceUpdateInterval, true, ModelInfoUpdateTask)
-
-	// 注册基础URL延迟任务
-	Register(TaskBaseUrlDelay, 24*time.Hour, true, ChannelBaseUrlDelayTask)
 
 	// 注册LLM同步任务
 	syncLLMIntervalHours, err := op.SettingGetInt(model.SettingKeySyncLLMInterval)

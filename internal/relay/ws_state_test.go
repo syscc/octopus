@@ -537,6 +537,88 @@ func TestBuildReplayRequestRetainsInstructionMessages(t *testing.T) {
 	}
 }
 
+func TestBuildChatReplayRequestUsesCompleteTranscript(t *testing.T) {
+	state := &wsConversationState{
+		Transcript: []transformerModel.Message{
+			{Role: "user", Content: transformerModel.MessageContent{Content: stringPtr("first question")}},
+			{Role: "assistant", Content: transformerModel.MessageContent{Content: stringPtr("first answer")}},
+		},
+	}
+	req := &transformerModel.InternalLLMRequest{
+		Model:              "gpt-4o",
+		RawAPIFormat:       transformerModel.APIFormatOpenAIResponse,
+		PreviousResponseID: stringPtr("resp_local"),
+		RawInputItems:      json.RawMessage(`[{"type":"input_text","text":"second question"}]`),
+		Messages: []transformerModel.Message{
+			{Role: "user", Content: transformerModel.MessageContent{Content: stringPtr("second question")}},
+		},
+	}
+
+	replayed := state.BuildChatReplayRequest(req)
+	if replayed == nil {
+		t.Fatal("expected Chat replay request to be built")
+	}
+	if replayed.OpenAIPreviousResponseID() != "" || len(replayed.OpenAIRawInputItems()) != 0 {
+		t.Fatalf("expected local continuation fields to be cleared, got previous=%q raw=%s", replayed.OpenAIPreviousResponseID(), replayed.OpenAIRawInputItems())
+	}
+	if replayed.IsOpenAIExactReplayRequest() || requiresNativeResponsesUpstream(replayed) {
+		t.Fatalf("expected transcript replay to remain Chat-compatible")
+	}
+	if len(replayed.Messages) != 3 {
+		t.Fatalf("expected prior user/assistant plus current user, got %#v", replayed.Messages)
+	}
+	if got := replayed.Messages[0].Content.Content; got == nil || *got != "first question" {
+		t.Fatalf("expected first user turn, got %#v", replayed.Messages[0])
+	}
+	if got := replayed.Messages[1].Content.Content; got == nil || *got != "first answer" {
+		t.Fatalf("expected assistant turn, got %#v", replayed.Messages[1])
+	}
+	if got := replayed.Messages[2].Content.Content; got == nil || *got != "second question" {
+		t.Fatalf("expected current user turn, got %#v", replayed.Messages[2])
+	}
+	if req.OpenAIPreviousResponseID() != "resp_local" || len(req.OpenAIRawInputItems()) == 0 {
+		t.Fatalf("expected original request to remain unchanged")
+	}
+
+	background := true
+	nativeOnly := cloneInternalRequest(req)
+	nativeOnly.Background = &background
+	if replayed := state.BuildChatReplayRequest(nativeOnly); replayed != nil {
+		t.Fatalf("expected native Responses controls to reject Chat transcript replay")
+	}
+}
+
+func TestBuildChatReplayRequestKeepsOnlyCurrentInstructions(t *testing.T) {
+	state := &wsConversationState{Transcript: []transformerModel.Message{
+		{Role: "system", Content: transformerModel.MessageContent{Content: stringPtr("old system")}},
+		{Role: "developer", Content: transformerModel.MessageContent{Content: stringPtr("old developer")}},
+		{Role: "user", Content: transformerModel.MessageContent{Content: stringPtr("first question")}},
+		{Role: "assistant", Content: transformerModel.MessageContent{Content: stringPtr("first answer")}},
+	}}
+	req := &transformerModel.InternalLLMRequest{
+		Model:              "gpt-4o",
+		RawAPIFormat:       transformerModel.APIFormatOpenAIResponse,
+		PreviousResponseID: stringPtr("resp_local"),
+		Messages: []transformerModel.Message{
+			{Role: "developer", Content: transformerModel.MessageContent{Content: stringPtr("current instructions")}},
+			{Role: "user", Content: transformerModel.MessageContent{Content: stringPtr("second question")}},
+		},
+	}
+
+	replayed := state.BuildChatReplayRequest(req)
+	if replayed == nil || len(replayed.Messages) != 4 {
+		t.Fatalf("expected one current instruction plus three conversation messages, got %+v", replayed)
+	}
+	if replayed.Messages[0].Role != "developer" || replayed.Messages[0].Content.Content == nil || *replayed.Messages[0].Content.Content != "current instructions" {
+		t.Fatalf("expected current instruction at the front, got %+v", replayed.Messages)
+	}
+	for index, message := range replayed.Messages[1:] {
+		if message.Role == "system" || message.Role == "developer" {
+			t.Fatalf("historical instruction leaked at replay index %d: %+v", index+1, message)
+		}
+	}
+}
+
 func TestRequestContainsToolOutputs(t *testing.T) {
 	if requestContainsToolOutputs(nil) {
 		t.Fatalf("expected nil request to not contain tool outputs")

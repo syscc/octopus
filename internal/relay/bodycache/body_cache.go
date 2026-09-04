@@ -28,11 +28,11 @@ const (
 )
 
 const (
-	envBodyMaxMB             = "OCTOPUS_IMAGES_BODY_MAX_MB"
-	envMemoryThresholdMB     = "OCTOPUS_IMAGES_BODY_MEMORY_THRESHOLD_MB"
-	envTmpDir                = "OCTOPUS_IMAGES_BODY_TMP_DIR"
-	envTmpCleanupHours       = "OCTOPUS_IMAGES_BODY_TMP_CLEANUP_HOURS"
-	bytesPerMB         int64 = 1024 * 1024
+	envBodyMaxMB               = "OCTOPUS_IMAGES_BODY_MAX_MB"
+	envMemoryThresholdMB       = "OCTOPUS_IMAGES_BODY_MEMORY_THRESHOLD_MB"
+	envTmpDir                  = "OCTOPUS_IMAGES_BODY_TMP_DIR"
+	envTmpCleanupHours         = "OCTOPUS_IMAGES_BODY_TMP_CLEANUP_HOURS"
+	bytesPerMB           int64 = 1024 * 1024
 )
 
 // BodyTooLargeError 表示读取请求体时超过最大限制。
@@ -72,12 +72,15 @@ func New(r io.ReadCloser) (*BodyCache, error) {
 	defer r.Close()
 
 	maxBytes := BodyMaxBytesFromEnv()
+	if maxBytes <= 0 {
+		maxBytes = megabytesToBytes(DefaultBodyMaxMB)
+	}
 	thresholdBytes := MemoryThresholdBytesFromEnv()
 	tmpDir := TmpDirFromEnv()
 
-	// 使用 maxBytes+1 的限制读取，用于准确判断是否超限。
-	limited := io.LimitReader(r, maxBytes+1)
-
+	// Read at most maxBytes, then inspect one additional byte. This avoids the
+	// maxBytes+1 overflow when a deliberately large environment value is used.
+	limited := io.LimitReader(r, maxBytes)
 	sw := &spillWriter{
 		thresholdBytes: thresholdBytes,
 		tmpDir:         tmpDir,
@@ -86,16 +89,22 @@ func New(r io.ReadCloser) (*BodyCache, error) {
 
 	n, err := io.Copy(sw, limited)
 	if err != nil {
-		// 出错时确保清理已创建的临时文件
-		_ = sw.Close()
+		_ = sw.cleanup()
 		return nil, err
 	}
-
-	if n > maxBytes {
-		_ = sw.Close()
-		return nil, &BodyTooLargeError{
-			MaxBytes:    maxBytes,
-			ActualBytes: n,
+	if n == maxBytes && maxBytes < maxInt64 {
+		var extra [1]byte
+		extraN, readErr := r.Read(extra[:])
+		if extraN > 0 {
+			_ = sw.cleanup()
+			return nil, &BodyTooLargeError{
+				MaxBytes:    maxBytes,
+				ActualBytes: incrementInt64(maxBytes),
+			}
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			_ = sw.cleanup()
+			return nil, readErr
 		}
 	}
 
@@ -223,7 +232,7 @@ func BodyMaxBytesFromEnv() int64 {
 	if mb <= 0 {
 		mb = DefaultBodyMaxMB
 	}
-	return int64(mb) * bytesPerMB
+	return megabytesToBytes(mb)
 }
 
 // MemoryThresholdBytesFromEnv 返回内存阈值（字节）。
@@ -232,7 +241,7 @@ func MemoryThresholdBytesFromEnv() int64 {
 	if mb <= 0 {
 		mb = DefaultMemoryThresholdMB
 	}
-	return int64(mb) * bytesPerMB
+	return megabytesToBytes(mb)
 }
 
 // TmpDirFromEnv 返回临时目录路径。
@@ -249,7 +258,10 @@ func TmpCleanupOlderThanFromEnv() time.Duration {
 	if h <= 0 {
 		h = DefaultTmpCleanupHours
 	}
-	return time.Duration(h) * time.Hour
+	if int64(h) > maxInt64/int64(time.Hour) {
+		return time.Duration(maxInt64)
+	}
+	return time.Duration(int64(h) * int64(time.Hour))
 }
 
 func envInt(name string, def int) int {
@@ -264,7 +276,50 @@ func envInt(name string, def int) int {
 	return v
 }
 
+func megabytesToBytes(mb int) int64 {
+	if mb <= 0 {
+		return 0
+	}
+	value := int64(mb)
+	if value > maxInt64/bytesPerMB {
+		return maxInt64
+	}
+	return value * bytesPerMB
+}
+
+func incrementInt64(value int64) int64 {
+	if value >= maxInt64 {
+		return maxInt64
+	}
+	return value + 1
+}
+
+func checkedSizeAdd(current int64, incoming int) (int64, error) {
+	if current < 0 || incoming < 0 || int64(incoming) > maxInt64-current {
+		return 0, errBodyCacheSizeOverflow
+	}
+	return current + int64(incoming), nil
+}
+
+func writeSpillBytes(dst io.Writer, data []byte) (int, error) {
+	n, err := dst.Write(data)
+	if n < 0 || n > len(data) {
+		return 0, errInvalidSpillWrite
+	}
+	if err == nil && n != len(data) {
+		return n, io.ErrShortWrite
+	}
+	return n, err
+}
+
 // spillWriter 在超过阈值时将数据从内存溢写到临时文件。
+const maxInt64 = int64(1<<63 - 1)
+
+var (
+	errBodyCacheSizeOverflow = errors.New("body cache size overflow")
+	errInvalidSpillWrite     = errors.New("invalid spill writer count")
+)
+
 type spillWriter struct {
 	thresholdBytes int64
 	tmpDir         string
@@ -274,13 +329,23 @@ type spillWriter struct {
 
 	buf bytes.Buffer
 
-	f       *os.File
+	f       io.WriteCloser
 	tmpPath string
 }
 
 func (w *spillWriter) Write(p []byte) (int, error) {
-	// 先判断是否需要落盘
-	if w.f == nil && w.size+int64(len(p)) > w.thresholdBytes {
+	if w == nil {
+		return 0, errors.New("nil spill writer")
+	}
+	if w.size < 0 {
+		return 0, errBodyCacheSizeOverflow
+	}
+	if _, err := checkedSizeAdd(w.size, len(p)); err != nil {
+		return 0, err
+	}
+
+	// 先判断是否需要落盘，使用减法比较避免 size+len 的整数溢出。
+	if w.f == nil && (w.thresholdBytes < 0 || w.size > w.thresholdBytes || int64(len(p)) > w.thresholdBytes-w.size) {
 		if err := w.ensureFile(); err != nil {
 			return 0, err
 		}
@@ -293,11 +358,23 @@ func (w *spillWriter) Write(p []byte) (int, error) {
 	} else {
 		n, err = w.buf.Write(p)
 	}
+	if n < 0 || n > len(p) {
+		return 0, errInvalidSpillWrite
+	}
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
 	w.size += int64(n)
 	return n, err
 }
 
 func (w *spillWriter) ensureFile() error {
+	if w == nil {
+		return errors.New("nil spill writer")
+	}
+	if w.f != nil {
+		return nil
+	}
 	dir := w.tmpDir
 	if strings.TrimSpace(dir) == "" {
 		dir = DefaultTmpDir
@@ -315,13 +392,10 @@ func (w *spillWriter) ensureFile() error {
 	w.f = f
 	w.tmpPath = f.Name()
 
-	// 把 buffer 内容写入文件
+	// 把 buffer 内容写入文件，并把短写视为失败。
 	if w.buf.Len() > 0 {
-		if _, err := w.f.Write(w.buf.Bytes()); err != nil {
-			_ = w.f.Close()
-			_ = os.Remove(w.tmpPath)
-			w.f = nil
-			w.tmpPath = ""
+		if _, err := writeSpillBytes(w.f, w.buf.Bytes()); err != nil {
+			_ = w.cleanup()
 			return err
 		}
 		w.buf.Reset()
@@ -347,10 +421,26 @@ func (w *spillWriter) TmpPath() string {
 
 // Close 关闭文件句柄（不删除文件）。
 func (w *spillWriter) Close() error {
-	if w.f == nil {
+	if w == nil || w.f == nil {
 		return nil
 	}
 	err := w.f.Close()
 	w.f = nil
 	return err
+}
+
+func (w *spillWriter) cleanup() error {
+	if w == nil {
+		return nil
+	}
+	closeErr := w.Close()
+	if w.tmpPath == "" {
+		return closeErr
+	}
+	removeErr := os.Remove(w.tmpPath)
+	if os.IsNotExist(removeErr) {
+		removeErr = nil
+	}
+	w.tmpPath = ""
+	return errors.Join(closeErr, removeErr)
 }

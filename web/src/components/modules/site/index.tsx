@@ -112,6 +112,7 @@ import {
 
 const PLATFORM_LABELS: Record<SitePlatform, string> = {
   [SitePlatform.API]: "API 直连",
+  [SitePlatform.Cloudflare]: "Cloudflare Workers AI",
   [SitePlatform.NewAPI]: "New API",
   [SitePlatform.AnyRouter]: "AnyRouter",
   [SitePlatform.OneAPI]: "One API",
@@ -462,7 +463,15 @@ function CompactMetric({
 
 function isCloudflareProtectionMessage(message?: string | null) {
   const lowered = (message ?? "").toLowerCase();
-  return lowered.includes("cloudflare") || message?.includes("Cloudflare 保护") === true;
+  return [
+    "cloudflare 保护",
+    "cloudflare protection",
+    "cloudflare challenge",
+    "attention required",
+    "just a moment",
+    "cf-error-code",
+    "cloudflare ray id",
+  ].some((marker) => lowered.includes(marker));
 }
 
 function ExecutionSummary({
@@ -1502,7 +1511,10 @@ export function Site() {
                   {site.custom_header.length > 0 ? (
                     <span>{site.custom_header.length} 个 Header</span>
                   ) : null}
-                  {site.external_checkin_url ? <span>手动签到</span> : null}
+                  {sitePlatformSupportsCheckin(site.platform) &&
+                  site.external_checkin_url ? (
+                    <span>手动签到</span>
+                  ) : null}
                 </div>
               </div>
 
@@ -1655,9 +1667,11 @@ export function Site() {
                           const supportsCheckin = sitePlatformSupportsCheckin(
                             site.platform,
                           );
-                          const canShowManualCheckin =
-                            supportsCheckin &&
-                            accountHasCheckinEnabled(account, site.platform);
+                          const checkinEnabled = accountHasCheckinEnabled(
+                            account,
+                            site.platform,
+                          );
+                          const canShowManualCheckin = checkinEnabled;
 
                           return (
                             <article
@@ -1720,11 +1734,13 @@ export function Site() {
                                         {account.auto_sync ? "自动同步" : "手动同步"}
                                       </span>
                                       <span>
-                                        {account.auto_checkin
-                                          ? account.random_checkin
-                                            ? "随机签到"
-                                            : "自动签到"
-                                          : "手动签到"}
+                                        {supportsCheckin
+                                          ? checkinEnabled
+                                            ? account.random_checkin
+                                              ? "随机签到"
+                                              : "自动签到"
+                                            : "手动签到"
+                                          : "不支持签到"}
                                       </span>
                                       <span>
                                         {account.proxy_mode === "inherit"
@@ -1854,10 +1870,7 @@ export function Site() {
                                       }
                                     />
                                     {supportsCheckin ? (
-                                      accountHasCheckinEnabled(
-                                        account,
-                                        site.platform,
-                                      ) ? (
+                                      checkinEnabled ? (
                                         <ExecutionSummary
                                           label="签到"
                                           status={normalizedStatus(
@@ -1878,8 +1891,7 @@ export function Site() {
                                         text="当前平台不支持签到"
                                       />
                                     )}
-                                    {account.auto_checkin &&
-                                    account.random_checkin ? (
+                                    {checkinEnabled && account.random_checkin ? (
                                       <div className="pl-4 text-xs text-muted-foreground">
                                         下次自动签到{" "}
                                         {account.next_auto_checkin_at
@@ -2396,7 +2408,7 @@ export function Site() {
                           {site.name}
                         </span>
                         <Badge variant="outline" className="rounded-full text-xs">
-                          {site.platform}
+                          {PLATFORM_LABELS[site.platform]}
                         </Badge>
                         <span className="truncate text-xs text-muted-foreground">
                           {site.base_url}

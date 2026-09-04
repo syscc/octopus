@@ -43,6 +43,12 @@ func (a *StreamAggregator) Response() *InternalLLMResponse {
 		if chunk.Model != "" {
 			result.Model = chunk.Model
 		}
+		if chunk.Created != 0 {
+			result.Created = chunk.Created
+		}
+		if len(chunk.RawResponsesOutputItems) > 0 {
+			result.RawResponsesOutputItems = append(result.RawResponsesOutputItems[:0], chunk.RawResponsesOutputItems...)
+		}
 		if chunk.Usage != nil {
 			result.Usage = chunk.Usage
 		}
@@ -115,6 +121,16 @@ func mergeChoiceDelta(existingChoice *Choice, choice Choice) {
 				existingChoice.Message.ReasoningContent = new(string)
 			}
 			*existingChoice.Message.ReasoningContent += reasoning
+		}
+		if delta.ReasoningSignature != nil {
+			signature := *delta.ReasoningSignature
+			existingChoice.Message.ReasoningSignature = &signature
+		}
+		if len(delta.ReasoningBlocks) > 0 {
+			existingChoice.Message.ReasoningBlocks = append(existingChoice.Message.ReasoningBlocks, delta.ReasoningBlocks...)
+		}
+		if len(delta.RedactedThinkingBlocks) > 0 {
+			existingChoice.Message.RedactedThinkingBlocks = append(existingChoice.Message.RedactedThinkingBlocks, delta.RedactedThinkingBlocks...)
 		}
 		for _, toolCall := range delta.ToolCalls {
 			existingChoice.Message.ToolCalls = MergeToolCallDelta(existingChoice.Message.ToolCalls, toolCall)

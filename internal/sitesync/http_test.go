@@ -137,6 +137,48 @@ func TestRequestJSONKeepsJSONForbiddenMessage(t *testing.T) {
 	}
 }
 
+func TestRequestJSONExtractsCloudflareErrorsArray(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("CF-Ray", "abc123-LAX")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"success":false,"errors":[{"code":10000,"message":"Workers AI permission denied"}]}`))
+	}))
+	defer server.Close()
+
+	_, err := requestJSON(context.Background(), &model.Site{BaseURL: server.URL}, http.MethodGet, server.URL, nil, nil)
+	if err == nil {
+		t.Fatal("expected requestJSON to fail")
+	}
+	if IsCloudflareProtectionError(err) {
+		t.Fatalf("expected Cloudflare API error, got protection error: %v", err)
+	}
+	if err.Error() != "http 403: Workers AI permission denied" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRequestJSONExtractsCloudflareErrorEnvelope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Server", "cloudflare")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"success":false,"errors":[{"code":10000,"message":"Invalid API Token"}],"messages":[],"result":null}`))
+	}))
+	defer server.Close()
+
+	_, err := requestJSON(context.Background(), &model.Site{BaseURL: server.URL}, http.MethodGet, server.URL, nil, nil)
+	if err == nil {
+		t.Fatalf("expected requestJSON to fail")
+	}
+	if IsCloudflareProtectionError(err) {
+		t.Fatalf("expected Cloudflare API error envelope, got protection error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Invalid API Token") {
+		t.Fatalf("expected API error message, got %v", err)
+	}
+}
+
 func TestNormalizeModelNamesPreservesCaseDistinctVariants(t *testing.T) {
 	models := normalizeModelNames([]string{" GPT-5.5 ", "gpt-5.5", "gpt-5.5", ""})
 

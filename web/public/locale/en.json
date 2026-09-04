@@ -832,7 +832,8 @@
                 "tokens": "Token Usage",
                 "costs": "Cost Details",
                 "baseUrls": "Base URLs",
-                "keys": "Keys"
+                "keys": "Keys",
+                "protocol": "OpenAI Protocol"
             },
             "noBaseUrls": "No Base URLs",
             "noKeys": "No Keys",
@@ -853,6 +854,7 @@
                 "cancel": "Cancel",
                 "save": "Save",
                 "saving": "Saving...",
+                "saveFailed": "Save failed",
                 "delete": "Delete",
                 "confirmDelete": "Confirm Delete",
                 "deleting": "Deleting..."
@@ -861,7 +863,8 @@
         "create": {
             "dialogTitle": "Create New Channel",
             "submit": "Create Channel",
-            "submitting": "Creating..."
+            "submitting": "Creating...",
+            "submitFailed": "Create failed"
         },
         "form": {
             "add": "Add",
@@ -912,6 +915,24 @@
             "wsModeOff": "Off",
             "matchRegex": "Match Regex",
             "matchRegexPlaceholder": "Optional: regex pattern to match request model names",
+            "protocolMode": "OpenAI Protocol Mode",
+            "protocolModeAuto": "Auto-detect",
+            "protocolModeChatOnly": "Chat Completions only",
+            "protocolModeResponsesOnly": "Responses only",
+            "protocolModeBoth": "Both supported",
+            "protocolModeManualHint": "Selections are saved as a manual override. Switch to Auto-detect to use future probe results.",
+            "protocolAtLeastOne": "Select at least one OpenAI protocol.",
+            "capabilityUnknown": "Pending detection",
+            "capabilitySupported": "Supported",
+            "capabilityUnsupported": "Unsupported",
+            "protocolReprobe": "Re-probe",
+            "protocolProbing": "Probing...",
+            "protocolProbeSuccess": "Protocol probe completed",
+            "protocolProbeSkipped": "Protocol probe was skipped",
+            "protocolProbePartialFailed": "Protocol probe finished with failures",
+            "protocolProbeFailed": "Protocol probe failed",
+            "protocolProbeEndpointFailed": "probe failed",
+            "protocolAutoHint": "Detected capabilities initialize these selections. Changing a checkbox switches to a saved manual mode.",
             "remark": "Remark"
         }
     },

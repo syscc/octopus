@@ -9,10 +9,20 @@ import (
 	"github.com/coder/websocket"
 )
 
+// wsFrameWriter abstracts the WebSocket frame sink so partial multi-frame
+// writes can be exercised deterministically in tests (*websocket.Conn satisfies it).
+type wsFrameWriter interface {
+	Write(ctx context.Context, typ websocket.MessageType, data []byte) error
+}
+
+type wsFrameCloser interface {
+	Close(code websocket.StatusCode, reason string) error
+}
+
 // WSStreamWriter implements StreamWriter for WebSocket clients.
 // It converts SSE "data: {...}\n\n" formatted bytes to bare JSON WebSocket text frames.
 type WSStreamWriter struct {
-	conn    *websocket.Conn
+	conn    wsFrameWriter
 	ctx     context.Context
 	written bool
 	mu      sync.Mutex
@@ -40,6 +50,14 @@ func (w *WSStreamWriter) Write(data []byte) (int, error) {
 		err := w.conn.Write(writeCtx, websocket.MessageText, line)
 		cancel()
 		if err != nil {
+			// A single Write may carry multiple SSE data lines (one WS frame
+			// each). Once any frame reached the client the payload is visible
+			// downstream, so Written() must reflect it even though this Write
+			// failed on a later frame; otherwise the Written defense line in
+			// relay (no retry/failover/replay after payload) is bypassed.
+			if wroteFrame {
+				w.written = true
+			}
 			return 0, err
 		}
 		wroteFrame = true
@@ -67,6 +85,15 @@ func (w *WSStreamWriter) Header() http.Header {
 
 func (w *WSStreamWriter) WriteHeader(code int) {
 	// WebSocket doesn't have per-message status codes
+}
+
+// CloseWithError terminates a downstream WebSocket after a visible write
+// failed in a way that could not be classified as an ordinary disconnect.
+// This prevents the client from waiting indefinitely for a terminal event.
+func (w *WSStreamWriter) CloseWithError() {
+	if closer, ok := w.conn.(wsFrameCloser); ok {
+		_ = closer.Close(websocket.StatusInternalError, "stream write failed")
+	}
 }
 
 // extractSSEDataLines extracts the data payload from SSE formatted bytes.

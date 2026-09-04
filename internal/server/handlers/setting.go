@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	"github.com/bestruirui/octopus/internal/server/resp"
 	"github.com/bestruirui/octopus/internal/server/router"
 	"github.com/bestruirui/octopus/internal/task"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/bestruirui/octopus/internal/utils/safe"
 	"github.com/gin-gonic/gin"
@@ -174,10 +174,25 @@ func importDB(c *gin.Context) {
 	var dump model.DBDump
 
 	contentType := c.GetHeader("Content-Type")
+	if httpbody.RequestContentLengthTooLarge(c.Request, httpbody.MaxManagementImportBodyBytes) {
+		resp.Error(c, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	if strings.Contains(contentType, "multipart/form-data") {
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, httpbody.MaxManagementImportBodyBytes)
+		}
 		fh, err := c.FormFile("file")
 		if err != nil {
-			resp.Error(c, http.StatusBadRequest, "missing upload file field 'file'")
+			if httpbody.IsRequestBodyTooLarge(err) {
+				resp.Error(c, http.StatusRequestEntityTooLarge, "request body too large")
+			} else {
+				resp.Error(c, http.StatusBadRequest, "missing upload file field 'file'")
+			}
+			return
+		}
+		if fh.Size > httpbody.MaxManagementImportBodyBytes {
+			resp.Error(c, http.StatusRequestEntityTooLarge, "request body too large")
 			return
 		}
 		f, err := fh.Open()
@@ -186,9 +201,13 @@ func importDB(c *gin.Context) {
 			return
 		}
 		defer f.Close()
-		body, err := io.ReadAll(f)
+		body, err := httpbody.ReadRequestBody(f, httpbody.MaxManagementImportBodyBytes)
 		if err != nil {
-			resp.Error(c, http.StatusBadRequest, err.Error())
+			if httpbody.IsRequestBodyTooLarge(err) {
+				resp.Error(c, http.StatusRequestEntityTooLarge, "request body too large")
+			} else {
+				resp.Error(c, http.StatusBadRequest, err.Error())
+			}
 			return
 		}
 		if err := decodeDBDump(body, &dump); err != nil {
@@ -196,9 +215,13 @@ func importDB(c *gin.Context) {
 			return
 		}
 	} else {
-		body, err := io.ReadAll(c.Request.Body)
+		body, err := httpbody.ReadRequest(c.Request, httpbody.MaxManagementImportBodyBytes)
 		if err != nil {
-			resp.Error(c, http.StatusBadRequest, err.Error())
+			if httpbody.IsRequestBodyTooLarge(err) {
+				resp.Error(c, http.StatusRequestEntityTooLarge, "request body too large")
+			} else {
+				resp.Error(c, http.StatusBadRequest, err.Error())
+			}
 			return
 		}
 		if err := decodeDBDump(body, &dump); err != nil {

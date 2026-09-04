@@ -95,10 +95,12 @@ func SiteChannelAccountGet(siteID int, accountID int, ctx context.Context) (*mod
 
 func SiteChannelResetAccountRoutes(siteID int, accountID int, ctx context.Context) error {
 	return db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		site, err := lockSiteAndAccount(tx, siteID, accountID)
+		if err != nil {
+			return err
+		}
 		var rows []model.SiteModel
-		if err := tx.Joins("JOIN site_accounts ON site_accounts.id = site_models.site_account_id").
-			Where("site_accounts.site_id = ? AND site_models.site_account_id = ?", siteID, accountID).
-			Find(&rows).Error; err != nil {
+		if err := tx.Where("site_account_id = ?", accountID).Find(&rows).Error; err != nil {
 			return err
 		}
 		for _, row := range rows {
@@ -107,6 +109,10 @@ func SiteChannelResetAccountRoutes(siteID int, accountID int, ctx context.Contex
 			if metadata, ok := model.ParseSiteModelRouteMetadata(row.RouteRawPayload); ok {
 				routeType = metadata.RouteType
 				routeRawPayload = row.RouteRawPayload
+			}
+			if site.Platform == model.SitePlatformCloudflare {
+				routeType = model.SiteModelRouteTypeOpenAIChat
+				routeRawPayload = ""
 			}
 			if err := tx.Model(&model.SiteModel{}).Where("id = ?", row.ID).Updates(map[string]any{
 				"route_type":        routeType,
@@ -214,21 +220,21 @@ func buildSiteChannelGroups(ctx context.Context, site model.Site, account model.
 		})
 	}
 	for _, binding := range account.ChannelBindings {
-		baseKey, _ := model.ParseSiteChannelBindingKey(binding.GroupKey)
+		baseKey, bindingRoute := model.ParseSiteChannelBindingKey(binding.GroupKey)
 		group := ensureSiteChannelGroup(groups, baseKey, baseKey)
 		group.HasProjectedChannel = true
 		group.ProjectedChannelIDs = append(group.ProjectedChannelIDs, binding.ChannelID)
+		if _, ok := projectedChannels[binding.ChannelID]; ok {
+			continue
+		}
 		channel, err := ChannelGet(binding.ChannelID, ctx)
 		if err != nil {
 			continue
 		}
-		if _, ok := projectedChannels[binding.ChannelID]; ok {
-			continue
-		}
 		projectedChannels[binding.ChannelID] = channel
-		routeType := model.SiteModelRouteTypeOpenAIChat
-		if _, parsed := model.ParseSiteChannelBindingKey(binding.GroupKey); parsed != "" {
-			routeType = parsed
+		routeType := bindingRoute
+		if site.Platform == model.SitePlatformCloudflare {
+			routeType = model.SiteModelRouteTypeOpenAIChat
 		}
 		paramOverride := ""
 		if channel.ParamOverride != nil {
@@ -261,25 +267,37 @@ func buildSiteChannelGroups(ctx context.Context, site model.Site, account model.
 	}
 	for _, item := range account.Models {
 		key := model.NormalizeSiteGroupKey(item.GroupKey)
-		if !siteModelBelongsToGroup(item, key) {
+		if !siteModelBelongsToGroup(item, key, site.Platform) {
 			continue
 		}
 		group := ensureSiteChannelGroup(groups, key, key)
 		routeMetadata, _ := model.ParseSiteModelRouteMetadata(item.RouteRawPayload)
-		channelID, hasChannel := findProjectedChannelID(account.ChannelBindings, key, item.RouteType, split)
+		routeType := model.NormalizeSiteModelRouteType(item.RouteType)
+		if site.Platform == model.SitePlatformCloudflare {
+			routeType = model.SiteModelRouteTypeOpenAIChat
+		}
+		channelID, hasChannel := findProjectedChannelID(account.ChannelBindings, key, routeType, split)
 		modelView := model.SiteChannelModel{
-			ModelName:      item.ModelName,
-			Source:         item.Source,
-			RouteType:      model.NormalizeSiteModelRouteType(item.RouteType),
-			RouteSource:    model.NormalizeSiteModelRouteSource(item.RouteSource, item.ManualOverride),
-			ManualOverride: item.ManualOverride,
-			Disabled:       item.Disabled,
-			RouteMetadata:  routeMetadata,
-			History:        historyMap[key+"\x00"+item.ModelName],
+			ModelName:               item.ModelName,
+			Source:                  item.Source,
+			RouteType:               routeType,
+			RouteSource:             model.NormalizeSiteModelRouteSource(item.RouteSource, item.ManualOverride),
+			ManualOverride:          item.ManualOverride,
+			Disabled:                item.Disabled,
+			RouteMetadata:           routeMetadata,
+			History:                 historyMap[key+"\x00"+item.ModelName],
+			DisableProtocolFallback: item.DisableProtocolFallback,
 		}
 		if hasChannel {
 			id := channelID
 			modelView.ProjectedChannelID = &id
+			// 协议能力是渠道级事实，站点模型不再复制一份：直接回显投影渠道
+			// 当前学到的能力，让前端的勾选状态始终跟着真实探测结果走。
+			if channel, err := ChannelGet(channelID, ctx); err == nil && channel != nil &&
+				model.IsOpenAITextChannelType(channel.Type) {
+				modelView.OpenAIChatCapability = channel.OpenAIChatCapability.Normalize()
+				modelView.OpenAIResponsesCapability = channel.OpenAIResponsesCapability.Normalize()
+			}
 		}
 		group.Models = append(group.Models, modelView)
 	}
@@ -307,7 +325,10 @@ func buildSiteChannelGroups(ctx context.Context, site model.Site, account model.
 	return result
 }
 
-func siteModelBelongsToGroup(item model.SiteModel, groupKey string) bool {
+func siteModelBelongsToGroup(item model.SiteModel, groupKey string, platform model.SitePlatform) bool {
+	if platform == model.SitePlatformCloudflare {
+		return true
+	}
 	metadata, ok := model.ParseSiteModelRouteMetadata(item.RouteRawPayload)
 	if !ok || len(metadata.EnableGroups) == 0 {
 		return true
@@ -474,39 +495,43 @@ func SiteManualModelsAdd(siteID int, accountID int, req *model.SiteManualModelAd
 	if len(req.Models) == 0 {
 		return fmt.Errorf("models is required")
 	}
-	if _, err := siteChannelAccount(siteID, accountID, ctx); err != nil {
-		return err
-	}
-
-	seen := make(map[string]struct{}, len(req.Models))
-	rows := make([]model.SiteModel, 0, len(req.Models))
-	now := time.Now()
-	for _, item := range req.Models {
-		modelName := strings.TrimSpace(item.ModelName)
-		if modelName == "" {
-			return fmt.Errorf("model name is required")
-		}
-		if _, ok := seen[modelName]; ok {
-			return fmt.Errorf("duplicate model in request: %s", modelName)
-		}
-		seen[modelName] = struct{}{}
-		routeType := model.NormalizeSiteModelRouteType(item.RouteType)
-		if routeType == model.SiteModelRouteTypeUnknown {
-			return fmt.Errorf("unsupported route type for model %s", modelName)
-		}
-		rows = append(rows, model.SiteModel{
-			SiteAccountID:  accountID,
-			GroupKey:       groupKey,
-			ModelName:      modelName,
-			Source:         "manual",
-			RouteType:      routeType,
-			RouteSource:    model.SiteModelRouteSourceManualOverride,
-			ManualOverride: true,
-			RouteUpdatedAt: &now,
-		})
-	}
 
 	return db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		site, err := lockSiteAndAccount(tx, siteID, accountID)
+		if err != nil {
+			return err
+		}
+		seen := make(map[string]struct{}, len(req.Models))
+		rows := make([]model.SiteModel, 0, len(req.Models))
+		now := time.Now()
+		for _, item := range req.Models {
+			modelName := strings.TrimSpace(item.ModelName)
+			if modelName == "" {
+				return fmt.Errorf("model name is required")
+			}
+			if _, ok := seen[modelName]; ok {
+				return fmt.Errorf("duplicate model in request: %s", modelName)
+			}
+			seen[modelName] = struct{}{}
+			routeType, err := validateSiteModelRouteForPlatform(site.Platform, item.RouteType)
+			if err != nil {
+				return fmt.Errorf("model %s: %w", modelName, err)
+			}
+			if routeType == model.SiteModelRouteTypeUnknown {
+				return fmt.Errorf("unsupported route type for model %s", modelName)
+			}
+			rows = append(rows, model.SiteModel{
+				SiteAccountID:  accountID,
+				GroupKey:       groupKey,
+				ModelName:      modelName,
+				Source:         "manual",
+				RouteType:      routeType,
+				RouteSource:    model.SiteModelRouteSourceManualOverride,
+				ManualOverride: true,
+				RouteUpdatedAt: &now,
+			})
+		}
+
 		var existing []model.SiteModel
 		if err := tx.Where("site_account_id = ? AND group_key = ?", accountID, groupKey).Find(&existing).Error; err != nil {
 			return err
@@ -635,23 +660,10 @@ func UpdateSiteSourceKeys(siteID int, accountID int, req *model.SiteSourceKeyUpd
 	}
 	targetGroupKey := model.NormalizeSiteGroupKey(req.GroupKey)
 
-	site, err := SiteGet(siteID, ctx)
-	if err != nil {
-		return err
-	}
-
-	var account *model.SiteAccount
-	for i := range site.Accounts {
-		if site.Accounts[i].ID == accountID {
-			account = &site.Accounts[i]
-			break
-		}
-	}
-	if account == nil {
-		return newSiteChannelAccountNotFoundError()
-	}
-
 	return db.GetDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockSiteAndAccount(tx, siteID, accountID); err != nil {
+			return err
+		}
 		var existingTokens []model.SiteToken
 		if err := tx.Where("site_account_id = ? AND group_key = ?", accountID, targetGroupKey).Find(&existingTokens).Error; err != nil {
 			return err
@@ -667,18 +679,27 @@ func UpdateSiteSourceKeys(siteID int, accountID int, req *model.SiteSourceKeyUpd
 			if err != nil {
 				return err
 			}
+			requestedEnabled := item.Enabled
 			row := model.SiteToken{
 				SiteAccountID: accountID,
 				Name:          strings.TrimSpace(item.Name),
 				Token:         normalizedToken,
 				GroupKey:      targetGroupKey,
 				GroupName:     model.NormalizeSiteGroupName(targetGroupKey, targetGroupKey),
-				Enabled:       item.Enabled,
+				Enabled:       requestedEnabled,
 				ValueStatus:   model.SiteTokenValueStatusReady,
 				Source:        "manual",
 			}
 			if err := tx.Create(&row).Error; err != nil {
 				return err
+			}
+			// GORM may apply the `default:true` tag to the in-memory struct as
+			// well as the INSERT; use the pre-create value for the explicit write.
+			if !requestedEnabled {
+				row.Enabled = false
+				if err := preserveImportedBooleans(tx, &model.SiteToken{}, row.ID, map[string]any{"enabled": false}); err != nil {
+					return err
+				}
 			}
 		}
 

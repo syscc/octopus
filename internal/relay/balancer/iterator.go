@@ -201,6 +201,25 @@ func (it *Iterator) Attempts() []model.ChannelAttempt {
 	return it.attempts
 }
 
+// AppendAttemptHistory carries completed decisions from an earlier relay phase
+// into a replacement iterator, such as an exact replay. The attempt counter
+// advances with the inherited history so newly started attempts keep globally
+// increasing AttemptNum values for the request-level relay log.
+func (it *Iterator) AppendAttemptHistory(attempts []model.ChannelAttempt) {
+	if it == nil || len(attempts) == 0 {
+		return
+	}
+	it.attempts = append(it.attempts, attempts...)
+	for _, attempt := range attempts {
+		if attempt.AttemptNum > it.count {
+			it.count = attempt.AttemptNum
+		}
+	}
+	if it.count < len(it.attempts) {
+		it.count = len(it.attempts)
+	}
+}
+
 // AttemptSpan 管理单次通道尝试的生命周期（计时、状态、结果）
 type AttemptSpan struct {
 	attempt   model.ChannelAttempt

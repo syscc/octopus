@@ -13,12 +13,12 @@ import (
 
 const siteTokenSourceCreated = "created"
 
-func CreateAccountToken(ctx context.Context, accountID int, req model.SiteChannelKeyCreateRequest) (*model.SiteSyncResult, error) {
+func CreateAccountToken(ctx context.Context, siteID int, accountID int, req model.SiteChannelKeyCreateRequest) (*model.SiteSyncResult, error) {
 	siteRecord, account, err := loadSiteAccount(ctx, accountID)
 	if err != nil {
 		return nil, err
 	}
-	if siteRecord == nil || account == nil {
+	if siteRecord == nil || account == nil || siteRecord.ID != siteID || account.SiteID != siteID {
 		return nil, fmt.Errorf("site account not found")
 	}
 

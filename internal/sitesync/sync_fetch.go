@@ -704,6 +704,9 @@ func fetchModelsForSiteToken(ctx context.Context, siteRecord *model.Site, accoun
 	if siteRecord != nil && siteRecord.Platform == model.SitePlatformSub2API {
 		return fetchSub2APIModelsForSiteToken(ctx, siteRecord, account, token)
 	}
+	if siteRecord != nil && siteRecord.Platform == model.SitePlatformCloudflare {
+		return fetchCloudflareModelsForSiteToken(ctx, siteRecord, account, token)
+	}
 
 	// Normalize the token the same way projection does, so the model-fetch
 	// request authenticates with the value the upstream actually expects

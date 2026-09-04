@@ -106,8 +106,9 @@ func createSiteChannelKey(c *gin.Context) {
 		resp.InvalidJSON(c)
 		return
 	}
-	if _, err := sitesvc.CreateAccountToken(c.Request.Context(), accountID, req); err != nil {
-		resp.ErrorWithAppError(c, http.StatusInternalServerError, apperror.Wrap(op.CodeSiteChannelKeyCreateFailed, "site channel key create failed", err).WithStatus(http.StatusInternalServerError))
+	if _, err := sitesvc.CreateAccountToken(c.Request.Context(), siteID, accountID, req); err != nil {
+		status := siteChannelMutationErrorStatus(err)
+		resp.ErrorWithAppError(c, status, apperror.Wrap(op.CodeSiteChannelKeyCreateFailed, "site channel key create failed", err).WithStatus(status))
 		return
 	}
 	data, err := op.SiteChannelAccountGet(siteID, accountID, c.Request.Context())
@@ -181,11 +182,10 @@ func updateSiteChannelModelRoutes(c *gin.Context) {
 		resp.InvalidJSON(c)
 		return
 	}
-	for _, item := range req {
-		if err := op.SiteModelRouteUpdate(accountID, item.GroupKey, item.ModelName, item.RouteType, model.SiteModelRouteSourceManualOverride, true, item.RouteRawPayload, c.Request.Context()); err != nil {
-			resp.ErrorWithAppError(c, http.StatusInternalServerError, apperror.Wrap(op.CodeSiteChannelRouteUpdateFailed, "site channel route update failed", err).WithStatus(http.StatusInternalServerError))
-			return
-		}
+	if err := op.SiteModelRoutesUpdate(siteID, accountID, req, c.Request.Context()); err != nil {
+		status := siteChannelMutationErrorStatus(err)
+		resp.ErrorWithAppError(c, status, apperror.Wrap(op.CodeSiteChannelRouteUpdateFailed, "site channel route update failed", err).WithStatus(status))
+		return
 	}
 	if err := reprojectSiteChannelAccount(c.Request.Context(), accountID); err != nil {
 		resp.ErrorWithAppError(c, http.StatusInternalServerError, apperror.Wrap(op.CodeSiteChannelProjectFailed, "site channel project failed", err).WithStatus(http.StatusInternalServerError))
@@ -209,11 +209,10 @@ func updateSiteChannelModelDisabled(c *gin.Context) {
 		resp.InvalidJSON(c)
 		return
 	}
-	for _, item := range req {
-		if err := op.SiteModelDisabledUpdate(accountID, item.GroupKey, item.ModelName, item.Disabled, c.Request.Context()); err != nil {
-			resp.ErrorWithAppError(c, http.StatusInternalServerError, apperror.Wrap(op.CodeSiteChannelModelDisableFailed, "site channel model disable failed", err).WithStatus(http.StatusInternalServerError))
-			return
-		}
+	if err := op.SiteModelsDisabledUpdate(siteID, accountID, req, c.Request.Context()); err != nil {
+		status := siteChannelMutationErrorStatus(err)
+		resp.ErrorWithAppError(c, status, apperror.Wrap(op.CodeSiteChannelModelDisableFailed, "site channel model disable failed", err).WithStatus(status))
+		return
 	}
 	if err := reprojectSiteChannelAccount(c.Request.Context(), accountID); err != nil {
 		resp.ErrorWithAppError(c, http.StatusInternalServerError, apperror.Wrap(op.CodeSiteChannelProjectFailed, "site channel project failed", err).WithStatus(http.StatusInternalServerError))

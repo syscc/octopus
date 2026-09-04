@@ -3,7 +3,9 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -696,5 +698,26 @@ func TestAnthropicServerToolBeta(t *testing.T) {
 		if got := anthropicServerToolBeta(in); got != want {
 			t.Fatalf("anthropicServerToolBeta(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestTransformResponseUnstructuredHTTPErrorDoesNotExposeBody(t *testing.T) {
+	const secret = "private-provider-body-should-not-leak"
+	outbound := &MessageOutbound{}
+	response := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Body:       io.NopCloser(strings.NewReader(secret)),
+	}
+
+	_, err := outbound.TransformResponse(context.Background(), response)
+	if err == nil {
+		t.Fatal("expected upstream response error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("transformer error exposed upstream body: %q", err)
+	}
+	var responseErr *model.ResponseError
+	if !errors.As(err, &responseErr) || responseErr.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected safe ResponseError with status, got %T %v", err, err)
 	}
 }

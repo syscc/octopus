@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/transformer/outbound"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 	"github.com/dlclark/regexp2"
 )
 
@@ -191,14 +191,54 @@ func applyDefaultModelRequestHeaders(req *http.Request, request model.Channel) {
 		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 	}
 	for _, header := range request.CustomHeader {
-		if header.HeaderKey != "" {
-			req.Header.Set(header.HeaderKey, header.HeaderValue)
+		key := strings.TrimSpace(header.HeaderKey)
+		if key == "" || isProtectedModelRequestHeader(key) {
+			continue
 		}
+		req.Header.Set(key, header.HeaderValue)
 	}
 }
 
+var blockedModelRequestHeaders = map[string]struct{}{
+	"authorization":       {},
+	"x-api-key":           {},
+	"x-goog-api-key":      {},
+	"api-key":             {},
+	"set-cookie":          {},
+	"connection":          {},
+	"keep-alive":          {},
+	"proxy-authenticate":  {},
+	"proxy-authorization": {},
+	"te":                  {},
+	"trailer":             {},
+	"transfer-encoding":   {},
+	"upgrade":             {},
+	"content-length":      {},
+	"host":                {},
+	"accept-encoding":     {},
+	"x-forwarded-for":     {},
+	"x-forwarded-host":    {},
+	"x-forwarded-proto":   {},
+	"x-forwarded-port":    {},
+	"x-real-ip":           {},
+	"forwarded":           {},
+	"cf-connecting-ip":    {},
+	"true-client-ip":      {},
+	"x-client-ip":         {},
+	"x-cluster-client-ip": {},
+}
+
+func isProtectedModelRequestHeader(name string) bool {
+	lowerName := strings.ToLower(strings.TrimSpace(name))
+	if lowerName == "" || strings.HasPrefix(lowerName, "sec-websocket-") {
+		return true
+	}
+	_, blocked := blockedModelRequestHeaders[lowerName]
+	return blocked
+}
+
 func decodeModelJSONResponse(resp *http.Response, result any) error {
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := httpbody.ReadResponse(resp)
 	if err != nil {
 		return err
 	}

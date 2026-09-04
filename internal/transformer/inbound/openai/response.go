@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,8 @@ type ResponseInbound struct {
 	hasRefusalPartStarted   bool
 	hasFinished             bool
 	responseCompleted       bool
+	terminalOutcome         model.PassthroughTerminalOutcome
+	terminalError           error
 	finalFinishReason       string
 
 	// Response metadata
@@ -30,6 +33,10 @@ type ResponseInbound struct {
 	model      string
 	createdAt  int64
 	truncation *string
+
+	// terminalProviderExtensions preserves raw Responses output items supplied
+	// by the outbound adapter until the terminal event is emitted.
+	terminalProviderExtensions *model.ProviderExtensions
 
 	// Content tracking
 	outputIndex    int
@@ -317,9 +324,19 @@ func (i *ResponseInbound) TransformResponse(ctx context.Context, response *model
 }
 
 func (i *ResponseInbound) TransformStream(ctx context.Context, stream *model.InternalLLMResponse) ([]byte, error) {
-	// Handle [DONE] marker
+	if stream == nil {
+		return nil, nil
+	}
+	// A malformed response may carry both Error and [DONE]. Convert the error
+	// first so the semantic failure cannot be overwritten by a successful Done.
+	if stream.Error != nil {
+		i.streamAggregator.Add(stream)
+		return i.processStreamEvents(ctx, model.StreamEventsFromInternalResponse(stream), false)
+	}
+	// Responses streams terminate with response.completed/incomplete/failed,
+	// never with the Chat Completions [DONE] sentinel.
 	if stream.Object == "[DONE]" {
-		return []byte("data: [DONE]\n\n"), nil
+		return i.processStreamEvents(ctx, []model.StreamEvent{{Kind: model.StreamEventKindDone}}, false)
 	}
 
 	// Preserve the original chunk for aggregation; the stream-event view is a
@@ -336,16 +353,26 @@ func (i *ResponseInbound) TransformStreamEvents(ctx context.Context, events []mo
 }
 
 func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []model.StreamEvent, aggregate bool) ([]byte, error) {
-	if len(events) == 0 {
+	if len(events) == 0 || i.responseCompleted {
 		return nil, nil
 	}
+
+	// A provider frame can contain a valid prefix followed by an error and
+	// transport-only Done. Stop at the first wire terminal; a later real error
+	// is retained as the semantic result but content after Done is discarded.
+	processEvents, errorEvent, sawDone := model.SplitStreamEventsAtTerminal(events)
+	if errorEvent != nil {
+		processEvents = append(append([]model.StreamEvent(nil), processEvents...), *errorEvent)
+	}
 	if aggregate {
-		if stream := model.InternalResponseFromStreamEvents(events); stream != nil && stream.Object != "[DONE]" {
+		if stream := model.InternalResponseFromStreamEvents(processEvents); stream != nil && stream.Object != "[DONE]" {
 			i.streamAggregator.Add(stream)
 		}
 	}
 
 	var out [][]byte
+	sawUsage := false
+	sawMessageStop := false
 
 	// Initialize tool call tracking maps if needed
 	if i.toolCalls == nil {
@@ -354,30 +381,31 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 		i.toolCallOutputIndex = make(map[int]int)
 	}
 
-	for _, event := range events {
+	for _, event := range processEvents {
 		if event.ID != "" {
 			i.responseID = event.ID
 		}
 		if event.Model != "" {
 			i.model = event.Model
 		}
+		if i.createdAt == 0 && event.Created != 0 {
+			i.createdAt = event.Created
+		}
+		switch event.Kind {
+		case model.StreamEventKindMessageStart,
+			model.StreamEventKindTextDelta,
+			model.StreamEventKindThinkingDelta,
+			model.StreamEventKindSignatureDelta,
+			model.StreamEventKindContentBlockStart,
+			model.StreamEventKindToolCallStart,
+			model.StreamEventKindToolCallDelta,
+			model.StreamEventKindMessageStop:
+			out = append(out, i.ensureResponseStarted()...)
+		}
 
 		switch event.Kind {
 		case model.StreamEventKindMessageStart:
-			if !i.hasResponseCreated {
-				i.hasResponseCreated = true
-				response := &ResponsesResponse{
-					Object:     "response",
-					ID:         i.responseID,
-					Model:      i.model,
-					CreatedAt:  i.createdAt,
-					Status:     lo.ToPtr("in_progress"),
-					Truncation: i.truncation,
-					Output:     []ResponsesItem{},
-				}
-				out = append(out, i.enqueueEvent(&ResponsesStreamEvent{Type: "response.created", Response: response}))
-				out = append(out, i.enqueueEvent(&ResponsesStreamEvent{Type: "response.in_progress", Response: response}))
-			}
+			// The lifecycle events were emitted by ensureResponseStarted above.
 
 		case model.StreamEventKindTextDelta:
 			if event.Delta == nil {
@@ -423,48 +451,53 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 			}
 
 		case model.StreamEventKindMessageStop:
+			sawMessageStop = true
 			if !i.hasFinished {
 				i.hasFinished = true
 				i.finalFinishReason = event.StopReason.String()
+				if event.ProviderExtensions != nil {
+					i.terminalProviderExtensions = event.ProviderExtensions
+				}
 				out = append(out, i.closeCurrentContentPart()...)
 				out = append(out, i.closeCurrentOutputItem()...)
 			}
 
 		case model.StreamEventKindUsageDelta:
-			if event.Usage != nil && i.hasFinished && !i.responseCompleted {
-				i.responseCompleted = true
-				i.usage = event.Usage
-				eventType, status := responsesTerminalEvent(i.finalFinishReason)
-				output := i.finalOutputItems()
-				if event.ProviderExtensions != nil && event.ProviderExtensions.OpenAI != nil && len(event.ProviderExtensions.OpenAI.RawResponseItems) > 0 {
-					var items []ResponsesItem
-					if err := json.Unmarshal(event.ProviderExtensions.OpenAI.RawResponseItems, &items); err == nil {
-						output = items
-					}
+			if event.Usage != nil {
+				// Some Chat-compatible providers attach an all-zero placeholder to
+				// the finish chunk, then send the real usage in a later tail chunk.
+				// Waiting for actual counts prevents response.completed from being
+				// emitted before that final usage arrives.
+				if streamUsageHasCounts(event.Usage) {
+					i.usage = event.Usage
+					sawUsage = true
+				} else if !sawMessageStop {
+					// Preserve the legacy contract for a standalone zero-usage
+					// terminal chunk. A zero usage event in the same batch as the
+					// finish event is treated as a placeholder instead.
+					i.usage = event.Usage
+					sawUsage = true
 				}
-				response := &ResponsesResponse{
-					Object:     "response",
-					ID:         i.responseID,
-					Model:      i.model,
-					CreatedAt:  i.createdAt,
-					Status:     &status,
-					Truncation: i.truncation,
-					Output:     output,
-					Usage:      convertUsageToResponses(i.usage),
+				if event.ProviderExtensions != nil {
+					i.terminalProviderExtensions = event.ProviderExtensions
 				}
-				out = append(out, i.enqueueEvent(&ResponsesStreamEvent{Type: eventType, Response: response}))
 			}
 
 		case model.StreamEventKindDone:
-			if len(out) == 0 {
-				return []byte("data: [DONE]\n\n"), nil
-			}
+			// SplitStreamEventsAtTerminal records Done without projecting it into
+			// the adapter loop so content after the terminal cannot leak.
 
 		case model.StreamEventKindError:
 			if event.Error == nil {
 				continue
 			}
 			i.responseCompleted = true
+			i.terminalOutcome = model.PassthroughTerminalOutcomeFailed
+			i.terminalError = event.Error
+			code := event.Error.Detail.Code
+			if code == "" {
+				code = "500"
+			}
 			response := &ResponsesResponse{
 				Object:    "response",
 				ID:        i.responseID,
@@ -472,12 +505,16 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 				CreatedAt: i.createdAt,
 				Status:    lo.ToPtr("failed"),
 				Error: &ResponsesError{
-					Code:    500,
+					Code:    code,
 					Message: event.Error.Detail.Message,
 				},
 			}
 			out = append(out, i.enqueueEvent(&ResponsesStreamEvent{Type: "response.failed", Response: response}))
 		}
+	}
+
+	if !i.responseCompleted && i.hasFinished && (sawUsage || sawDone) {
+		out = append(out, i.emitTerminalEvent())
 	}
 
 	if len(out) == 0 {
@@ -491,6 +528,349 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 		}
 	}
 	return result, nil
+}
+
+func streamUsageHasCounts(usage *model.Usage) bool {
+	if usage == nil {
+		return false
+	}
+	return usage.PromptTokens != 0 || usage.CompletionTokens != 0 || usage.TotalTokens != 0 ||
+		usage.ToolUsePromptTokens != 0 || usage.CacheCreationInputTokens != 0 || usage.CacheReadInputTokens != 0
+}
+
+// FinalizeStream emits terminal Responses data at upstream EOF.
+//
+// Semantics:
+//   - A terminal was already emitted (responseCompleted) → nil, nil.
+//   - The upstream sent a finish reason but no usage/done → emit the normal
+//     terminal event (response.completed/incomplete per finish reason).
+//   - No lifecycle/payload was ever projected → nil, nil so the processor can
+//     report a truly empty upstream stream.
+//   - Partial lifecycle/payload was projected but the upstream ended without
+//     any finish signal → emit exactly one synthetic response.incomplete
+//     terminal (never fabricated finish reasons, never [DONE]) and return
+//     model.ErrIncompleteUpstreamStream so relay treats the attempt as failed
+//     without failing over (payload was already written).
+func (i *ResponseInbound) FinalizeStream(ctx context.Context) ([]byte, error) {
+	if i.responseCompleted {
+		return nil, nil
+	}
+	if i.hasFinished {
+		return i.emitTerminalEvent(), nil
+	}
+	if !i.hasResponseCreated {
+		return nil, nil
+	}
+	return i.finalizeIncomplete(), model.ErrIncompleteUpstreamStream
+}
+
+// FinalizeInterruptedStream emits an incomplete terminal for an upstream
+// transport failure after partial output. Unlike FinalizeStream, it never
+// treats a previously observed finish reason as proof of successful
+// completion: the missing wire terminal/usage means the response is still
+// incomplete. An already emitted terminal remains idempotent.
+func (i *ResponseInbound) FinalizeInterruptedStream(ctx context.Context) ([]byte, error) {
+	if i.responseCompleted {
+		return nil, nil
+	}
+	// A caller invokes this method only after payload has reached the client.
+	// Keep the terminal invariant even when an unusual provider omitted the
+	// response.created lifecycle event.
+	if !i.hasResponseCreated {
+		i.hasResponseCreated = true
+	}
+	return i.finalizeIncomplete(), model.ErrIncompleteUpstreamStream
+}
+
+// finalizeIncomplete closes any open content/output items and emits exactly
+// one response.incomplete terminal event carrying the aggregated output,
+// usage, created_at, truncation and reasoning metadata. No finish reason is
+// fabricated.
+func (i *ResponseInbound) finalizeIncomplete() []byte {
+	if i.responseCompleted {
+		return nil
+	}
+
+	var events [][]byte
+	events = append(events, i.closeCurrentContentPart()...)
+	events = append(events, i.closeCurrentOutputItem()...)
+
+	if i.responseCompleted {
+		// closeCurrentOutputItem cannot emit a terminal, but guard against
+		// future changes double-completing the response.
+		return joinSSEEvents(events)
+	}
+	i.responseCompleted = true
+	i.terminalOutcome = model.PassthroughTerminalOutcomeIncomplete
+
+	output := i.finalOutputItems()
+	if extensions := i.terminalProviderExtensions; extensions != nil && extensions.OpenAI != nil && len(extensions.OpenAI.RawResponseItems) > 0 {
+		var items []ResponsesItem
+		if err := json.Unmarshal(extensions.OpenAI.RawResponseItems, &items); err == nil {
+			output = items
+		}
+	}
+	terminal := i.enqueueEvent(&ResponsesStreamEvent{
+		Type: "response.incomplete",
+		Response: &ResponsesResponse{
+			Object:     "response",
+			ID:         i.responseID,
+			Model:      i.model,
+			CreatedAt:  i.createdAt,
+			Status:     lo.ToPtr("incomplete"),
+			Truncation: i.truncation,
+			Output:     output,
+			Usage:      convertUsageToResponses(i.usage),
+		},
+	})
+	events = append(events, terminal)
+	return joinSSEEvents(events)
+}
+
+func joinSSEEvents(events [][]byte) []byte {
+	var out []byte
+	for _, event := range events {
+		if event != nil {
+			out = append(out, event...)
+		}
+	}
+	return out
+}
+
+// responsesPassthroughTerminalTypes lists the raw Responses SSE event types
+// that prove the upstream stream completed on its own.
+var responsesPassthroughTerminalTypes = map[string]struct{}{
+	"response.completed":  {},
+	"response.failed":     {},
+	"response.incomplete": {},
+	"error":               {},
+}
+
+// FinalizeIncompleteStream synthesizes exactly one legal response.incomplete
+// SSE terminal for a raw passthrough Responses stream that reached EOF
+// without any terminal event. Response metadata (id / model / created_at)
+// and completed output items are recovered from the buffered lifecycle
+// events. When the raw stream already contains a terminal event the stream
+// is complete and nothing is synthesized.
+func (i *ResponseInbound) FinalizeIncompleteStream(ctx context.Context, rawStream []byte) ([]byte, error) {
+	if i.responseCompleted || len(rawStream) == 0 {
+		return nil, nil
+	}
+	snapshot := parseResponsesRawSnapshot(rawStream)
+	if snapshot.terminalSeen {
+		return nil, nil
+	}
+
+	// The sidecar transformer has already populated this adapter with the raw
+	// partial stream. Align generated closing events with the upstream wire
+	// sequence, whose earlier bytes were passed through unchanged.
+	if snapshot.sequenceSeen {
+		i.sequenceNumber = snapshot.maxSequence + 1
+	}
+	if i.responseID == "" {
+		i.responseID = snapshot.id
+	}
+	if i.model == "" {
+		i.model = snapshot.model
+	}
+	if i.createdAt == 0 {
+		i.createdAt = snapshot.createdAt
+	}
+	if len(snapshot.output) > 0 && !snapshot.openItemSeen {
+		// Those done events were already passed through to the client. Adopt their
+		// authoritative item IDs/output and discard the sidecar's synthetic open
+		// item so finalization emits only the missing response.incomplete terminal.
+		i.adoptPassthroughCompletedOutput(snapshot.output)
+	} else if snapshot.openItemSeen && snapshot.openItemID != "" {
+		// The upstream item was added but truncated before output_item.done. Align
+		// the sidecar's synthetic state with the item identity already visible to
+		// the client before closing the partial item.
+		i.currentItemID = snapshot.openItemID
+		i.outputIndex = snapshot.openOutputIndex
+	}
+	// If sidecar decoding could not recognize any lifecycle event, the raw
+	// response metadata still proves that payload existed. Emit a terminal with
+	// the recoverable metadata rather than ending the client stream silently.
+	if !i.hasResponseCreated {
+		i.hasResponseCreated = true
+	}
+	return i.finalizeIncomplete(), model.ErrIncompleteUpstreamStream
+}
+
+// responsesRawSnapshot carries the response metadata recoverable from a raw
+// passthrough Responses SSE stream.
+type responsesRawSnapshot struct {
+	id              string
+	model           string
+	createdAt       int64
+	output          []ResponsesItem
+	terminalSeen    bool
+	sequenceSeen    bool
+	maxSequence     int
+	openItemSeen    bool
+	openItemID      string
+	openOutputIndex int
+}
+
+// parseResponsesRawSnapshot walks raw SSE blocks and records response
+// lifecycle metadata plus completed output items.
+func parseResponsesRawSnapshot(raw []byte) responsesRawSnapshot {
+	snapshot := responsesRawSnapshot{}
+	normalized := bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+	for _, block := range bytes.Split(normalized, []byte("\n\n")) {
+		var dataLines [][]byte
+		for _, line := range bytes.Split(block, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			if bytes.HasPrefix(line, []byte("data:")) {
+				dataLines = append(dataLines, bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:"))))
+			}
+		}
+		if len(dataLines) == 0 {
+			continue
+		}
+		payload := bytes.Join(dataLines, []byte("\n"))
+		if len(payload) == 0 || payload[0] != '{' {
+			continue
+		}
+		var probe struct {
+			Type           string             `json:"type"`
+			SequenceNumber *int               `json:"sequence_number"`
+			OutputIndex    *int               `json:"output_index"`
+			Response       *ResponsesResponse `json:"response"`
+			Item           *ResponsesItem     `json:"item"`
+		}
+		if err := json.Unmarshal(payload, &probe); err != nil {
+			continue
+		}
+		if probe.SequenceNumber != nil {
+			if !snapshot.sequenceSeen || *probe.SequenceNumber > snapshot.maxSequence {
+				snapshot.maxSequence = *probe.SequenceNumber
+			}
+			snapshot.sequenceSeen = true
+		}
+		if _, ok := responsesPassthroughTerminalTypes[probe.Type]; ok {
+			snapshot.terminalSeen = true
+		}
+		if probe.Response != nil {
+			if probe.Response.ID != "" {
+				snapshot.id = probe.Response.ID
+			}
+			if probe.Response.Model != "" {
+				snapshot.model = probe.Response.Model
+			}
+			if probe.Response.CreatedAt != 0 {
+				snapshot.createdAt = probe.Response.CreatedAt
+			}
+		}
+		switch probe.Type {
+		case "response.output_item.added":
+			if probe.Item != nil {
+				snapshot.openItemSeen = true
+				snapshot.openItemID = probe.Item.ID
+				if probe.OutputIndex != nil {
+					snapshot.openOutputIndex = *probe.OutputIndex
+				}
+			}
+		case "response.output_item.done":
+			if probe.Item != nil {
+				snapshot.output = append(snapshot.output, *probe.Item)
+				doneIndexMatches := probe.OutputIndex != nil && *probe.OutputIndex == snapshot.openOutputIndex
+				if snapshot.openItemSeen && (probe.Item.ID == snapshot.openItemID || doneIndexMatches) {
+					snapshot.openItemSeen = false
+					snapshot.openItemID = ""
+				}
+			}
+		}
+	}
+	return snapshot
+}
+
+func (i *ResponseInbound) adoptPassthroughCompletedOutput(items []ResponsesItem) {
+	i.completedOutputItems = append([]ResponsesItem(nil), items...)
+	i.hasMessageItemStarted = false
+	i.hasReasoningItemStarted = false
+	i.hasContentPartStarted = false
+	i.hasRefusalPartStarted = false
+	i.currentItemID = ""
+	i.outputIndex = len(items)
+	i.contentIndex = 0
+	i.accumulatedText.Reset()
+	i.accumulatedReasoning.Reset()
+	i.accumulatedRefusal.Reset()
+	i.messageContentOrder = nil
+	i.reasoningBlockSignatures = nil
+	for index := range i.toolCallItemStarted {
+		i.toolCallItemStarted[index] = false
+	}
+}
+
+// InitializeResponse copies request-bound settings into a fresh adapter
+// instance for a new relay attempt. Only immutable request data is carried;
+// mutable stream/response state is intentionally not initialized.
+func (i *ResponseInbound) InitializeResponse(request *model.InternalLLMRequest) {
+	if request == nil || request.Truncation == nil {
+		return
+	}
+	truncation := *request.Truncation
+	i.truncation = &truncation
+}
+
+func (i *ResponseInbound) StreamTerminalOutcome() (model.PassthroughTerminalOutcome, error) {
+	return i.terminalOutcome, i.terminalError
+}
+
+func (i *ResponseInbound) emitTerminalEvent() []byte {
+	if i.responseCompleted || !i.hasFinished {
+		return nil
+	}
+	i.responseCompleted = true
+	eventType, status := responsesTerminalEvent(i.finalFinishReason)
+	switch eventType {
+	case "response.failed":
+		i.terminalOutcome = model.PassthroughTerminalOutcomeFailed
+	case "response.incomplete":
+		i.terminalOutcome = model.PassthroughTerminalOutcomeIncomplete
+	default:
+		i.terminalOutcome = model.PassthroughTerminalOutcomeCompleted
+	}
+	output := i.finalOutputItems()
+	if extensions := i.terminalProviderExtensions; extensions != nil && extensions.OpenAI != nil && len(extensions.OpenAI.RawResponseItems) > 0 {
+		var items []ResponsesItem
+		if err := json.Unmarshal(extensions.OpenAI.RawResponseItems, &items); err == nil {
+			output = items
+		}
+	}
+	response := &ResponsesResponse{
+		Object:     "response",
+		ID:         i.responseID,
+		Model:      i.model,
+		CreatedAt:  i.createdAt,
+		Status:     &status,
+		Truncation: i.truncation,
+		Output:     output,
+		Usage:      convertUsageToResponses(i.usage),
+	}
+	return i.enqueueEvent(&ResponsesStreamEvent{Type: eventType, Response: response})
+}
+
+func (i *ResponseInbound) ensureResponseStarted() [][]byte {
+	if i.hasResponseCreated {
+		return nil
+	}
+	i.hasResponseCreated = true
+	response := &ResponsesResponse{
+		Object:     "response",
+		ID:         i.responseID,
+		Model:      i.model,
+		CreatedAt:  i.createdAt,
+		Status:     lo.ToPtr("in_progress"),
+		Truncation: i.truncation,
+		Output:     []ResponsesItem{},
+	}
+	return [][]byte{
+		i.enqueueEvent(&ResponsesStreamEvent{Type: "response.created", Response: response}),
+		i.enqueueEvent(&ResponsesStreamEvent{Type: "response.in_progress", Response: response}),
+	}
 }
 
 func (i *ResponseInbound) enqueueEvent(ev *ResponsesStreamEvent) []byte {
@@ -1327,7 +1707,7 @@ type ResponsesUsage struct {
 }
 
 type ResponsesError struct {
-	Code    int    `json:"code"`
+	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
 }
 

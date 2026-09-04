@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	"github.com/bestruirui/octopus/internal/server/router"
 	sitesvc "github.com/bestruirui/octopus/internal/site"
 	"github.com/bestruirui/octopus/internal/sitesync"
+	"github.com/bestruirui/octopus/internal/utils/httpbody"
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/bestruirui/octopus/internal/utils/safe"
 	"github.com/gin-gonic/gin"
@@ -75,7 +75,11 @@ func listSite(c *gin.Context) {
 func importAllAPIHub(c *gin.Context) {
 	body, err := readImportPayload(c)
 	if err != nil {
-		resp.ErrorWithAppError(c, http.StatusBadRequest, err)
+		if httpbody.IsRequestBodyTooLarge(err) {
+			resp.Error(c, http.StatusRequestEntityTooLarge, "request body too large")
+		} else {
+			resp.ErrorWithAppError(c, http.StatusBadRequest, err)
+		}
 		return
 	}
 
@@ -100,7 +104,11 @@ func importAllAPIHub(c *gin.Context) {
 func importMetAPI(c *gin.Context) {
 	body, err := readImportPayload(c)
 	if err != nil {
-		resp.ErrorWithAppError(c, http.StatusBadRequest, err)
+		if httpbody.IsRequestBodyTooLarge(err) {
+			resp.Error(c, http.StatusRequestEntityTooLarge, "request body too large")
+		} else {
+			resp.ErrorWithAppError(c, http.StatusBadRequest, err)
+		}
 		return
 	}
 
@@ -115,19 +123,31 @@ func importMetAPI(c *gin.Context) {
 
 func readImportPayload(c *gin.Context) ([]byte, error) {
 	contentType := c.GetHeader("Content-Type")
+	if httpbody.RequestContentLengthTooLarge(c.Request, httpbody.MaxSiteImportBodyBytes) {
+		return nil, httpbody.ErrRequestBodyTooLarge
+	}
 	if strings.Contains(contentType, "multipart/form-data") {
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, httpbody.MaxSiteImportBodyBytes)
+		}
 		fileHeader, err := c.FormFile("file")
 		if err != nil {
+			if httpbody.IsRequestBodyTooLarge(err) {
+				return nil, httpbody.ErrRequestBodyTooLarge
+			}
 			return nil, apperror.Wrap(op.CodeSiteImportEmptyPayload, "site import empty payload", err).WithStatus(http.StatusBadRequest)
+		}
+		if fileHeader.Size > httpbody.MaxSiteImportBodyBytes {
+			return nil, httpbody.ErrRequestBodyTooLarge
 		}
 		file, err := fileHeader.Open()
 		if err != nil {
 			return nil, apperror.Wrap(op.CodeSiteImportEmptyPayload, "site import empty payload", err).WithStatus(http.StatusBadRequest)
 		}
 		defer file.Close()
-		return io.ReadAll(file)
+		return httpbody.ReadRequestBody(file, httpbody.MaxSiteImportBodyBytes)
 	}
-	return io.ReadAll(c.Request.Body)
+	return httpbody.ReadRequestBody(c.Request.Body, httpbody.MaxSiteImportBodyBytes)
 }
 
 func createSite(c *gin.Context) {

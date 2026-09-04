@@ -18,3 +18,7 @@ CONTEXT.md
 plans/
 reports/
 .DS_Store
+
+# Locally built binary
+/octopus
+research.md

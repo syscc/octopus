@@ -146,7 +146,7 @@ docker compose up -d
 |------|------|
 | **站点名称** | 随便起，方便自己区分，例如「主站 OneAPI」 |
 | **平台类型** | 见下表；不确定可留「自动检测」（新建时才有，偶尔检测不准就手动选） |
-| **站点地址** | **只填域名**，如 `https://example.com`，**不要带** `/v1`、`/api` 等路径 |
+| **站点地址** | 一般平台只填域名；Cloudflare Workers AI 填账户级基址：`https://api.cloudflare.com/client/v4/accounts/{account_id}/ai`（带 `/v1` 也支持） |
 | **默认协议** | 仅「API 直连」平台需要：选择该站点默认走哪种协议（OpenAI Chat / Anthropic / Gemini） |
 | **手动签到 URL**（可选） | 填了之后可在站点总览里"一键打开"该页面手动签到 |
 | **代理** | 直连 / 系统代理 / 代理池（见 [12.x 代理池](#1213-代理池)） |
@@ -162,6 +162,7 @@ docker compose up -d
 | **AnyRouter** | L 站登录的 any 类站点（凭据填 cookie，见下） |
 | **One API / One Hub / Done Hub** | 对应同名开源面板 |
 | **Sub2API** | sub2api 类站点 |
+| **Cloudflare Workers AI** | Cloudflare 官方 Workers AI；自动同步文本生成模型并投影为 OpenAI 兼容渠道 |
 | **API 直连** | 官方或直连类供应商（OpenAI / Claude / Gemini），需要额外选择**默认协议**（见下方说明） |
 
 > 💡 **API 直连平台的「默认协议」**：选择 API 直连后，需要指定一个**默认协议类型**（OpenAI Chat / Anthropic / Gemini），告诉 octopus 该站点默认走哪种协议。平台检测时会自动推荐合适的协议。旧版本中的 OpenAI / Claude / Gemini 三个平台类型已自动合并为「API 直连」，升级后无需手动操作。
@@ -179,6 +180,7 @@ docker compose up -d
 | **New API 类** | Access Token | 站点的**「系统访问令牌」**（不是登录密码！） | 必填 **Platform User ID**（站点里的用户 ID） |
 | **AnyRouter（any）** | Access Token | **cookie**，格式 `session=MTc1234567890` | — |
 | **Sub2API** | Access Token | 站点的 access token | 建议同时填 `refresh_token` 与 `token_expires_at`（F12 拿，401 会自动续期）|
+| **Cloudflare Workers AI** | Access Token | Cloudflare Workers AI API Token（需 `Workers AI Read` 或 `Workers AI Edit` 权限） | Account ID 已包含在站点地址中 |
 | **OpenAI/Claude/Gemini（API 直连）** | API Key | 对应的密钥 | — |
 
 > 🔎 **New API 类站点的「系统访问令牌」在哪？**
@@ -409,8 +411,9 @@ base_url = "http://127.0.0.1:8080/v1"
 | 字段 | 说明 |
 |------|------|
 | 渠道名称 | 自定义 |
-| 渠道类型 | OpenAI Chat / OpenAI Response / Anthropic / Gemini / 火山引擎 / OpenAI Embedding |
-| Base URLs | 只填基础地址，程序按类型自动补 `/chat/completions`、`/responses`、`/messages` 等；可填多个端点做"最低延迟优选" |
+| 渠道类型 | OpenAI / Anthropic / Gemini / 火山引擎 / OpenAI Embedding |
+| OpenAI 协议模式 | 仅 OpenAI 文本渠道：自动探测 / 仅 Chat Completions / 仅 Responses / 两者均支持。除非已知供应商契约，否则建议自动探测 |
+| Base URLs | 只填基础地址；Octopus 按选定或生效协议自动补 `/chat/completions`、`/responses`、`/messages` 等；可填多个端点做最低延迟优选 |
 | API Key | **可加多个 Key**（实现多 Key 轮询，见 FAQ Q6） |
 | 高级设置 | 自定义 Header、渠道代理、参数覆盖（JSON）、自动同步、自动分组、Responses WS 模式、匹配正则、备注 |
 
@@ -429,11 +432,11 @@ Octopus 支持 **OpenAI Chat / OpenAI Responses / Anthropic** 三种格式互相
 
 **核心规则**：
 
-- **只要把渠道放进分组**，当下游请求的格式与渠道的格式不一致时，**会自动转换**，你不需要做任何额外设置。
-- **同模型不要配两种端点格式**。推荐统一设成 **Response**——放进分组后，照样能用 Chat 格式去请求它。
+- **只要把渠道放进分组**。下游请求格式决定协议优先级：优先使用直接兼容的端点，必要时只转换可无损表示的请求。
+- OpenAI 渠道使用**自动探测**时，对未知的 Chat 或 Responses 端点只探测一次：明确的端点路由失败会记为不支持，成功会记为支持，后续请求直接跳过已知不兼容端点。模型级失败不会禁用整个渠道的协议。
+- 已知供应商契约时，可手动选择**仅 Chat Completions**、**仅 Responses**或**两者均支持**。Cloudflare Workers AI 渠道始终强制为仅 Chat。
+- 只有在尚未向客户端写出响应 payload 且请求能由备用协议表示时，才允许协议回退。
 - **透传（passthrough）**：`Response` 格式与 `Anthropic message` 格式在两端一致时会走透传，不被改写；一旦发生格式转换就不再是透传。Codex 的 `fast`、远程压缩端点（Responses compact proxy）在全程 Response 时都会透传。
-
-> 所以"cc 调用 Response 格式的 GPT"基本是没问题的；要用 Gemini 格式的话可以试，遇到 Bug 欢迎反馈。
 
 ---
 
@@ -502,10 +505,11 @@ Octopus 支持 **OpenAI Chat / OpenAI Responses / Anthropic** 三种格式互相
 - **New API 类**：填站点「个人设置 → 账户管理 → 安全设置 → **系统访问令牌**」生成的那串，**不要用账号密码登录**；并且 New API 还要填 **Platform User ID**。
 - **any（AnyRouter）**：填 **cookie**，格式 `session=MTc1234567890`，平台类型记得选 **AnyRouter** 而不是 New API。
 - **API 直连（OpenAI/Claude/Gemini）**：填对应的 API Key，并选择正确的**默认协议**。
-- 除 any 和 API 直连 外的站点都填系统访问令牌，**不要填 cookie**。
+- **Cloudflare Workers AI**：填 Workers AI API Token；站点地址需包含 Account ID，例如 `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai`。
+- 除 AnyRouter、API 直连和 Cloudflare Workers AI 外的站点都填系统访问令牌，**不要填 cookie**。
 
 ### Q5. 站点网址要怎么填？
-**只填域名**，例如 `https://wzw.pp.ua`，**不要带** `/v1` 等路径。
+一般平台只填域名，例如 `https://wzw.pp.ua`，不要带 `/v1` 等路径。**Cloudflare Workers AI 是例外**：必须填写包含 Account ID 的账户级基址 `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai`，也可直接填写文档中的 `/ai/v1` 形式。
 
 ### Q6. 一个渠道有多个 Key，想轮流用怎么配？
 用**普通渠道**，在里面加多个 Key；然后把该渠道所在**分组的「会话保持」设为 0**。这样各 Key 的累计调用金额会趋于一致，如果每次成本差不多，就接近轮流使用的效果。会话保持不为 0 会"黏"住一个 Key。普通渠道面板里能看到每个 Key 的使用金额，多请求几次就能看出来。

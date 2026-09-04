@@ -685,3 +685,62 @@ func TestBuildSiteModelSummaryAggregatesAndBuckets(t *testing.T) {
 		t.Fatalf("expected LastRequestAt to reflect latest hour, got %v", summary.LastRequestAt)
 	}
 }
+
+// TestUpdateSiteSourceKeysAddsDisabledKeyWithoutReenabling locks in the
+// contract that a source key added with an explicit enabled=false stays
+// disabled. GORM omits zero-valued (false) fields from struct INSERTs when
+// the column has a database default (SiteToken.Enabled defaults to true),
+// which would silently enable the key right after creation.
+func TestUpdateSiteSourceKeysAddsDisabledKeyWithoutReenabling(t *testing.T) {
+	ctx := setupSiteOpTestDB(t)
+
+	site := &model.Site{
+		Name:     "source-key-disabled-site",
+		Platform: model.SitePlatformNewAPI,
+		BaseURL:  "https://example.com",
+		Enabled:  true,
+	}
+	if err := SiteCreate(site, ctx); err != nil {
+		t.Fatalf("SiteCreate failed: %v", err)
+	}
+
+	account := &model.SiteAccount{
+		SiteID:         site.ID,
+		Name:           "source-key-disabled-account",
+		CredentialType: model.SiteCredentialTypeAccessToken,
+		AccessToken:    "token",
+		Enabled:        true,
+	}
+	if err := SiteAccountCreate(account, ctx); err != nil {
+		t.Fatalf("SiteAccountCreate failed: %v", err)
+	}
+
+	if err := UpdateSiteSourceKeys(site.ID, account.ID, &model.SiteSourceKeyUpdateRequest{
+		GroupKey: model.SiteDefaultGroupKey,
+		KeysToAdd: []model.SiteSourceKeyAddRequest{
+			{Name: "added-disabled", Token: "added-disabled-key", Enabled: false},
+			{Name: "added-enabled", Token: "added-enabled-key", Enabled: true},
+		},
+	}, ctx); err != nil {
+		t.Fatalf("UpdateSiteSourceKeys failed: %v", err)
+	}
+
+	var disabled model.SiteToken
+	if err := dbpkg.GetDB().WithContext(ctx).Where("token = ?", "added-disabled-key").First(&disabled).Error; err != nil {
+		t.Fatalf("query added disabled token failed: %v", err)
+	}
+	if disabled.Enabled {
+		t.Fatalf("expected added key to stay disabled, got enabled")
+	}
+	if disabled.Source != "manual" {
+		t.Fatalf("expected added key source manual, got %q", disabled.Source)
+	}
+
+	var enabled model.SiteToken
+	if err := dbpkg.GetDB().WithContext(ctx).Where("token = ?", "added-enabled-key").First(&enabled).Error; err != nil {
+		t.Fatalf("query added enabled token failed: %v", err)
+	}
+	if !enabled.Enabled {
+		t.Fatalf("expected added enabled key to stay enabled")
+	}
+}

@@ -10,6 +10,7 @@ import (
 
 	dbmodel "github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
+	"github.com/bestruirui/octopus/internal/outlierwindow"
 	"github.com/bestruirui/octopus/internal/relay/balancer"
 	"github.com/bestruirui/octopus/internal/transformer/inbound"
 	transformerModel "github.com/bestruirui/octopus/internal/transformer/model"
@@ -199,10 +200,17 @@ func processWSResponseCreate(
 		if conversationState.ShouldUseNativeContinuation(originalRequest) {
 			log.Debugf("ws relay using native continuation (apikey=%d, request_model=%s, previous_response_id=%s)", apiKeyID, requestModel, currentPreviousResponseID(originalRequest))
 		} else if conversationState.ShouldUseLocalReplay(originalRequest) {
-			replayedRequest := conversationState.BuildReplayRequest(originalRequest)
-			if replayedRequest != nil {
-				executionRequest = replayedRequest
+			var replayedRequest *transformerModel.InternalLLMRequest
+			if conversationState.LastOutboundTypeSet && conversationState.LastOutboundType == outbound.OutboundTypeOpenAIChat {
+				replayedRequest = conversationState.BuildChatReplayRequest(originalRequest)
+			} else {
+				replayedRequest = conversationState.BuildReplayRequest(originalRequest)
 			}
+			if replayedRequest == nil {
+				rejectWSLocalReplay(ctx, conn, apiKeyID, requestModel, downstreamSessionID)
+				return nil
+			}
+			executionRequest = replayedRequest
 		}
 	}
 
@@ -252,15 +260,30 @@ func processWSResponseCreate(
 			return preferredSticky.ChannelKeyID
 		}())
 	result := runWSRelay(ctx, req, group)
-	if result.ResetConversation && autoRestart && !req.streamWriter.Written() {
+	if result.ResetConversation && autoRestart && !result.Written && !req.streamWriter.Written() {
 		log.Debugf("ws relay switching to replay (apikey=%d, request_model=%s, failed_previous_response_id=%s, reset_conversation=%t)",
 			apiKeyID, requestModel, failedPreviousResponseID, result.ResetConversation)
 		balancer.DeleteSticky(apiKeyID, requestModel)
-		replayedRequest := conversationState.BuildReplayRequest(originalRequest)
+		var replayedRequest *transformerModel.InternalLLMRequest
+		if conversationState.LastOutboundTypeSet && conversationState.LastOutboundType == outbound.OutboundTypeOpenAIChat {
+			replayedRequest = conversationState.BuildChatReplayRequest(originalRequest)
+		} else {
+			replayedRequest = conversationState.BuildReplayRequest(originalRequest)
+		}
+		if replayedRequest == nil {
+			req.metrics.SaveWithChannelStats(ctx, false, result.Err, req.iter.Attempts(), false)
+			rejectWSLocalReplay(ctx, conn, apiKeyID, requestModel, downstreamSessionID)
+			return nil
+		}
 		replayReq, replayGroup, replayErr := newWSRelayRequest(ctx, conn, inAdapter, apiKeyID, requestModel, replayedRequest, originalRequest, preferredSticky, nil)
 		if replayErr == nil {
 			replayReq.metrics.SetWSMode(dbmodel.RelayLogWSModeReplay)
 			replayReq.metrics.SetWSRecovery(dbmodel.RelayLogWSRecoveryReplay)
+			// Replay uses a replacement request/iterator, but it is still one
+			// client request. Carry the failed continuation decisions forward so
+			// the final request-level log retains every attempt and numbering
+			// continues after the initial relay phase.
+			replayReq.iter.AppendAttemptHistory(req.iter.Attempts())
 			req = replayReq
 			group = replayGroup
 			result = runWSRelay(ctx, req, group)
@@ -269,13 +292,6 @@ func processWSResponseCreate(
 
 	result = finalizeWSRelay(ctx, conn, req, result)
 	if result.Success {
-		if result.OutboundType == outbound.OutboundTypeOpenAIChat {
-			// Chat fallback has no native Responses continuation anchor. Do not
-			// persist a synthetic response_id that would make the next turn look
-			// continuable through Responses.
-			deleteWSConversationState(apiKeyID, requestModel, downstreamSessionID)
-			return nil
-		}
 		if conversationState == nil {
 			conversationState = &wsConversationState{DownstreamSessionID: downstreamSessionID}
 		}
@@ -284,6 +300,8 @@ func processWSResponseCreate(
 			conversationState.ChannelID = channelID
 			conversationState.ChannelKeyID = keyID
 		}
+		conversationState.LastOutboundType = result.OutboundType
+		conversationState.LastOutboundTypeSet = true
 		if req.metrics.WSMode != nil && *req.metrics.WSMode == dbmodel.RelayLogWSModeReplay {
 			conversationState.RememberReplayAlias(failedPreviousResponseID)
 			conversationState.MarkReplayRecovered(originalRequest)
@@ -292,9 +310,10 @@ func processWSResponseCreate(
 		}
 		conversationState.ApplySuccessfulTurn(originalRequest, req.metrics.InternalResponse)
 		storeWSConversationState(apiKeyID, requestModel, conversationState, wsConversationStateTTL(group.SessionKeepTime))
-		log.Debugf("ws relay success state stored (apikey=%d, request_model=%s, ws_mode=%v, ws_recovery=%v, last_response_id=%s, channel=%d, key=%d)",
+		log.Debugf("ws relay success state stored (apikey=%d, request_model=%s, ws_mode=%v, ws_recovery=%v, last_response_id=%s, outbound_type=%d, channel=%d, key=%d)",
 			apiKeyID, requestModel, req.metrics.WSMode, req.metrics.WSRecovery,
-			strings.TrimSpace(conversationState.LastResponseID), conversationState.ChannelID, conversationState.ChannelKeyID)
+			strings.TrimSpace(conversationState.LastResponseID), conversationState.LastOutboundType,
+			conversationState.ChannelID, conversationState.ChannelKeyID)
 		return conversationState
 	}
 	if result.ResetConversation {
@@ -304,6 +323,12 @@ func processWSResponseCreate(
 	}
 
 	return conversationState
+}
+
+func rejectWSLocalReplay(ctx context.Context, conn *websocket.Conn, apiKeyID int, requestModel, downstreamSessionID string) {
+	log.Warnf("ws local replay merge failed (apikey=%d, request_model=%s), refusing to forward local response id", apiKeyID, requestModel)
+	deleteWSConversationState(apiKeyID, requestModel, downstreamSessionID)
+	writeWSError(ctx, conn, http.StatusConflict, "conversation_restart_required", "本地会话无法安全重放，请重新开启对话")
 }
 
 func bestEffortWarmupUpstreamWS(
@@ -350,7 +375,8 @@ func bestEffortWarmupUpstreamWS(
 			lastErr = err
 			continue
 		}
-		if !channel.Enabled || !isOpenAIProtocolChannel(channel.Type) {
+		if !channel.Enabled || !isOpenAIProtocolChannel(channel.Type) ||
+			!channelAllowsOutboundProtocol(channel, outbound.OutboundTypeOpenAIResponse) {
 			continue
 		}
 
@@ -425,6 +451,9 @@ func newWSRelayRequest(
 	preferredSticky *balancer.SessionEntry,
 	rawBody []byte,
 ) (*relayRequest, *dbmodel.Group, error) {
+	if executionRequest == nil {
+		return nil, nil, fmt.Errorf("internal request is nil")
+	}
 	group, err := op.GroupGetEnabledMap(requestModel, ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("model not found")
@@ -434,25 +463,26 @@ func newWSRelayRequest(
 	if iter.Len() == 0 {
 		return nil, nil, fmt.Errorf("no available channel")
 	}
-	applyProtocolPreferenceForMode(group.Mode, inbound.InboundTypeOpenAIResponse, iter, ctx)
+	applyProtocolPreferenceForMode(group.Mode, executionRequest, iter, ctx)
 
 	if executionRequest != nil && executionRequest.IsOpenAIExactReplayRequest() {
 		rawBody = nil
 	}
 
 	return &relayRequest{
-		c:               nil,
-		ctx:             ctx,
-		inAdapter:       inAdapter,
-		internalRequest: executionRequest,
-		metrics:         NewRelayMetrics(apiKeyID, requestModel, rawBody, metricsRequest),
-		apiKeyID:        apiKeyID,
-		requestModel:    requestModel,
-		groupID:         group.ID,
-		groupSessionTTL: group.SessionKeepTime,
-		iter:            iter,
-		rawBody:         append([]byte(nil), rawBody...),
-		streamWriter:    NewWSStreamWriter(ctx, conn),
+		c:                 nil,
+		ctx:               ctx,
+		inAdapter:         inAdapter,
+		newInboundAdapter: func() transformerModel.Inbound { return inbound.Get(inbound.InboundTypeOpenAIResponse) },
+		internalRequest:   executionRequest,
+		metrics:           NewRelayMetrics(apiKeyID, requestModel, rawBody, metricsRequest),
+		apiKeyID:          apiKeyID,
+		requestModel:      requestModel,
+		groupID:           group.ID,
+		groupSessionTTL:   group.SessionKeepTime,
+		iter:              iter,
+		rawBody:           append([]byte(nil), rawBody...),
+		streamWriter:      NewWSStreamWriter(ctx, conn),
 	}, &group, nil
 }
 
@@ -537,7 +567,14 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 			}
 		}
 
-		outboundType := outboundTypeForRequest(req.internalRequest, channel.Type)
+		outboundType, protocolCompatible := outboundTypeForChannel(req.internalRequest, channel)
+		if !protocolCompatible {
+			req.iter.Skip(channel.ID, 0, channel.Name, "channel protocol capability is incompatible with request")
+			if nativeResponsesRequired && isOpenAIProtocolChannel(channel.Type) {
+				nativeResponses.markEndpointUnsupported()
+			}
+			continue
+		}
 		outAdapter := outbound.Get(outboundType)
 		if outAdapter == nil {
 			req.iter.Skip(channel.ID, 0, channel.Name, fmt.Sprintf("unsupported channel type: %d", channel.Type))
@@ -598,6 +635,17 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 					return wsRelayResult{Canceled: true, Err: relayCtx.Err()}
 				case <-time.After(delay):
 				}
+
+				// 与 HTTP Handler 一致：每轮重试从更新后的通道能力重选出站
+				// 协议，刚学习 unsupported 的端点不再被同渠道重试打到；
+				// 候选顺序（weighted/sticky）保持不变。
+				recomputedOutboundType, recomputedCompatible := outboundTypeForChannel(req.internalRequest, channel)
+				if !recomputedCompatible {
+					log.Debugf("ws same-channel retry for %s skipped: protocol capability incompatible after learning", channel.Name)
+					break
+				}
+				outboundType = recomputedOutboundType
+				outAdapter = outbound.Get(outboundType)
 			}
 
 			ra := &relayAttempt{
@@ -611,39 +659,52 @@ func runWSRelay(ctx context.Context, req *relayRequest, group *dbmodel.Group) ws
 			}
 
 			result = ra.attempt()
-			if result.Success || result.Written || result.Canceled || result.ResetConversation || !isRetryableStatus(result.StatusCode) {
+			if result.Success || result.Written || result.Canceled || isDownstreamWriteFailure(result) || result.TerminalOutcome != transformerModel.PassthroughTerminalOutcomeNone || result.ResetConversation || result.FirstTokenTimeout || !isRetryableStatus(result.StatusCode) {
 				break
 			}
 		}
 
 		if nativeResponsesRequired {
-			nativeResponses.markAttempt(result, shouldTryProtocolFallbackForAttempt(req.internalRequest, channel.Type, result.OutboundType, result.StatusCode, result.Err))
+			nativeResponses.markAttempt(result, shouldTryProtocolFallbackForAttempt(req.internalRequest, channel, result.OutboundType, result.StatusCode, result.protocolError()))
 		}
-		protocolUnavailable := shouldTryProtocolFallbackForAttempt(req.internalRequest, channel.Type, result.OutboundType, result.StatusCode, result.Err)
 
-		if !result.Success && !result.Written && !result.Canceled && !result.ResetConversation && !protocolUnavailable {
-			failureKind := circuitFailureKind(group.RetryEnabled, result.StatusCode)
-			if replayExact && result.StatusCode == http.StatusServiceUnavailable && isNoAvailableAccountError(relayErrorMessage(result.Err)) {
-				failureKind = balancer.FailureHard
-			}
-			balancer.RecordFailure(channel.ID, usedKey.ID, req.internalRequest.Model, failureKind)
-		}
+		// A partial WS stream is committed to the downstream client and cannot
+		// be retried, but it is still a hard failure for circuit/outlier health.
+		recordIncompleteUpstreamFailure(channel.ID, usedKey.ID, req.internalRequest.Model, result)
+		recordWrittenStructuredUpstreamFailure(channel.ID, usedKey.ID, req.internalRequest.Model, group.RetryEnabled, result)
+		forceHard := replayExact && result.StatusCode == http.StatusServiceUnavailable &&
+			isNoAvailableAccountError(upstreamClassificationMessage(result.Err))
+		recordFinalAttemptFailure(
+			channel.ID, usedKey.ID, req.internalRequest.Model, group.RetryEnabled, forceHard, result,
+		)
 
 		if result.Success {
+			outlierwindow.Report(channel.ID, true, result.StatusCode, time.Now())
 			var respID string
 			if req.metrics.InternalResponse != nil {
 				respID = req.metrics.InternalResponse.ID
 			}
 			return wsRelayResult{Success: true, ResponseID: respID, OutboundType: result.OutboundType}
 		}
+		if isDownstreamWriteFailure(result) {
+			// The downstream connection is unusable even when its failed write
+			// accepted zero bytes. Mark the relay result committed so finalization
+			// neither retries another channel nor writes a second error frame.
+			return wsRelayResult{Written: true, Err: result.Err}
+		}
+		if result.Canceled || result.Written || result.TerminalOutcome != transformerModel.PassthroughTerminalOutcomeNone {
+			return wsRelayResult{
+				ResetConversation: result.ResetConversation,
+				Written:           result.Written,
+				Canceled:          result.Canceled,
+				Err:               result.Err,
+			}
+		}
 		if result.ResetConversation {
 			if publicErr, ok := classifyWSPublicError(result.Err, result.StatusCode); ok {
 				return wsRelayResult{ResetConversation: publicErr.ResetConversation, Err: result.Err, PublicError: &publicErr}
 			}
 			return wsRelayResult{ResetConversation: true, Err: result.Err}
-		}
-		if result.Canceled || result.Written {
-			return wsRelayResult{Written: result.Written, Canceled: result.Canceled, Err: result.Err}
 		}
 		lastErr = result.Err
 		lastResult = result
