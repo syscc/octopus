@@ -558,7 +558,7 @@ func requestJSONWithManagedAccessToken(ctx context.Context, siteRecord *model.Si
 	if discoverErr != nil {
 		return nil, discoverErr
 	}
-	if userID <= 0 {
+	if userID == "" {
 		return nil, err
 	}
 	rememberManagedPlatformUserID(userID, accounts...)
@@ -635,12 +635,12 @@ func shouldRetryManagedRequestWithUserID(err error) bool {
 		strings.Contains(message, "未提供")
 }
 
-func discoverManagedUserID(ctx context.Context, siteRecord *model.Site, accessToken string, accounts ...*model.SiteAccount) (int, error) {
+func discoverManagedUserID(ctx context.Context, siteRecord *model.Site, accessToken string, accounts ...*model.SiteAccount) (string, error) {
 	requestURL := buildSiteURL(siteRecord.BaseURL, "/api/user/self")
 
 	payload, err := requestJSONWithManagedHeaders(ctx, siteRecord, http.MethodGet, requestURL, nil, accessToken, nil, accounts...)
 	if err == nil {
-		if userID := anyRouterExtractUserID(payload); userID > 0 {
+		if userID := anyRouterExtractUserID(payload); userID != "" {
 			return userID, nil
 		}
 	}
@@ -660,25 +660,28 @@ func discoverManagedUserID(ctx context.Context, siteRecord *model.Site, accessTo
 			}
 			continue
 		}
-		if anyRouterExtractUserID(payload) > 0 {
+		if anyRouterExtractUserID(payload) != "" {
 			return userID, nil
 		}
 	}
 
-	return 0, firstErr
+	return "", firstErr
 }
 
-func firstManagedPlatformUserID(accounts ...*model.SiteAccount) int {
+func firstManagedPlatformUserID(accounts ...*model.SiteAccount) string {
 	for _, account := range accounts {
-		if account != nil && account.PlatformUserID != nil && *account.PlatformUserID > 0 {
-			return *account.PlatformUserID
+		if account != nil && account.PlatformUserID != nil {
+			if userID := strings.TrimSpace(*account.PlatformUserID); userID != "" {
+				return userID
+			}
 		}
 	}
-	return 0
+	return ""
 }
 
-func rememberManagedPlatformUserID(userID int, accounts ...*model.SiteAccount) {
-	if userID <= 0 {
+func rememberManagedPlatformUserID(userID string, accounts ...*model.SiteAccount) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
 		return
 	}
 	for _, account := range accounts {
@@ -692,8 +695,9 @@ func rememberManagedPlatformUserID(userID int, accounts ...*model.SiteAccount) {
 	}
 }
 
-func managedUserIDHeaders(userID int) map[string]string {
-	if userID <= 0 {
+func managedUserIDHeaders(userID string) map[string]string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
 		return nil
 	}
 	headers := map[string]string{}

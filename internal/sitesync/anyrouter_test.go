@@ -168,8 +168,8 @@ func TestAnyRouterCookieTokenCanProbeUserIDAndSyncTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("anyRouterDiscoverUserID returned error: %v", err)
 	}
-	if userID != 131936 {
-		t.Fatalf("expected discovered user id 131936, got %d", userID)
+	if userID != "131936" {
+		t.Fatalf("expected discovered user id 131936, got %q", userID)
 	}
 
 	tokens, err := fetchAnyRouterManagementTokens(context.Background(), site, nil, cookieShieldedToken, userID)

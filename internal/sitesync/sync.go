@@ -306,7 +306,7 @@ func syncSub2APIWithAccessToken(ctx context.Context, siteRecord *model.Site, acc
 		account,
 		accessToken,
 		pickModelTokensByGroup(tokens),
-		0,
+		"",
 		siteModelSourceSync,
 		func(token model.SiteToken, allowGlobalFallback bool) (siteModelFetchResult, error) {
 			models, err := fetchModelsForSiteToken(ctx, siteRecord, account, token)
@@ -324,7 +324,7 @@ func syncSub2APIWithAccessToken(ctx context.Context, siteRecord *model.Site, acc
 	}
 	preserveHistoricalGroups := !discoveryState.authoritative || !discoveryState.complete || !tokenFetch.complete
 	status := buildSyncSnapshotStatus(groupResults)
-	balance, balanceUsed, todayIncome := fetchSiteAccountBalance(ctx, siteRecord, account, accessToken, 0)
+	balance, balanceUsed, todayIncome := fetchSiteAccountBalance(ctx, siteRecord, account, accessToken, "")
 	snapshot := &syncSnapshot{accessToken: accessToken, groups: groups, tokens: tokens, models: siteModels, groupResults: groupResults, groupDiscoveryState: discoveryState, preserveHistoricalGroups: preserveHistoricalGroups, status: status, balance: balance, balanceUsed: balanceUsed, todayIncome: todayIncome, message: buildSyncSnapshotMessage(groupResults)}
 	if status == model.SiteExecutionStatusFailed {
 		return snapshot, buildSyncSnapshotFailure(groupResults)

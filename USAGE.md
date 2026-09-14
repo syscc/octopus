@@ -177,7 +177,7 @@ The way to fill in Access Token varies by platform — this is the biggest pitfa
 
 | Platform | Recommended Credential | What to Put in Access Token | Extra Fields |
 |----------|----------------------|---------------------------|--------------|
-| **New API** | Access Token | The site's **"System Access Token"** (not the login password!) | Must fill **Platform User ID** (user ID on the relay site) |
+| **New API** | Access Token | The site's **"System Access Token"** (not the login password!) | Optional **Platform User ID** (letters or numbers; some upstream operations may require it) |
 | **AnyRouter (any)** | Access Token | **Cookie**, format: `session=MTc1234567890` | — |
 | **Sub2API** | Access Token | The site's access token | Recommended to also fill `refresh_token` and `token_expires_at` (get via F12, auto-refreshes on 401) |
 | **Cloudflare Workers AI** | Access Token | A Cloudflare Workers AI API Token with `Workers AI Read` or `Workers AI Edit` permission | Account ID is included in the Site URL |
@@ -187,7 +187,7 @@ The way to fill in Access Token varies by platform — this is the biggest pitfa
 > Log in to the relay site → Profile Settings → Account Management → Security Settings → **System Access Token**. The generated string is the Access Token.
 > **Strongly discouraged: logging in with username/password** — many sites don't return an Access Token after login, resulting in `Site login succeeded but no Access Token returned`.
 >
-> 🔎 **What is Platform User ID?** New API needs it for syncing tokens, groups, and check-in (it's your user ID on the relay site, e.g., `11494`). The import feature tries to fill this automatically.
+> 🔎 **What is Platform User ID?** It is your user ID on the relay site and may contain letters or numbers. It is optional in Octopus, but some upstream sites may require it for syncing tokens, groups, or check-in. The import feature tries to fill this automatically.
 
 Account switches:
 
@@ -502,7 +502,7 @@ Because **you haven't created a group yet**. In Octopus, "group name = available
 - The relay site **never had a Key created for that group** → create a Key on the relay site first, or use "Quick Create Key" in Octopus.
 
 ### Q4. What exactly goes in Access Token?
-- **New API**: The site's "Profile → Account Management → Security Settings → **System Access Token**" — **don't use username/password login**. New API also requires **Platform User ID**.
+- **New API**: The site's "Profile → Account Management → Security Settings → **System Access Token**" — **don't use username/password login**. **Platform User ID** is optional and supports letters or numbers, but some upstream operations may require it.
 - **any (AnyRouter)**: A **cookie**, format: `session=MTc1234567890`. Platform type must be **AnyRouter**, not New API.
 - **API Direct (OpenAI/Claude/Gemini)**: The corresponding API Key or Access Token, and select the correct **default protocol**.
 - **Cloudflare Workers AI**: Enter the Workers AI API Token. The Site URL must include the Account ID, for example `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai`.

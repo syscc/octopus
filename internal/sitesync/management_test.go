@@ -93,7 +93,7 @@ func TestSyncManagementPlatformDiscoversNewAPIUserID(t *testing.T) {
 func TestSyncManagementPlatformRestoresMaskedKeysFromBatchEndpoint(t *testing.T) {
 	batchCalled := false
 	detailCalled := false
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -227,7 +227,7 @@ func TestSyncManagementPlatformUsesStoredNewAPIUserID(t *testing.T) {
 	}))
 	defer server.Close()
 
-	platformUserID := 7788
+	platformUserID := "7788"
 	snapshot, err := syncManagementPlatform(context.Background(), &model.Site{
 		Platform: model.SitePlatformNewAPI,
 		BaseURL:  server.URL,
@@ -252,7 +252,7 @@ func TestSyncManagementPlatformUsesStoredNewAPIUserID(t *testing.T) {
 
 func TestSyncManagementPlatformUsesV1ModelsWhenRootModelEndpointReturnsHTML(t *testing.T) {
 	observedV1AuthHeader := ""
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -314,7 +314,7 @@ func TestSyncManagementPlatformUsesV1ModelsWhenRootModelEndpointReturnsHTML(t *t
 
 func TestSyncManagementPlatformFallsBackToUserModelsWhenTokenModelsUnavailable(t *testing.T) {
 	observedUserModelsHeader := ""
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -398,7 +398,7 @@ func TestSyncManagementPlatformFallsBackToUserModelsWhenTokenModelsUnavailable(t
 }
 
 func TestSyncManagementPlatformDoesNotFallbackWithoutExplicitGroupMatch(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -451,7 +451,7 @@ func TestSyncManagementPlatformDoesNotFallbackWithoutExplicitGroupMatch(t *testi
 }
 
 func TestSyncManagementPlatformPrefersStableGroupErrorOverHTMLSummary(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -502,7 +502,7 @@ func TestSyncManagementPlatformPrefersStableGroupErrorOverHTMLSummary(t *testing
 }
 
 func TestSyncManagementPlatformReturnsStableMissingGroupKeyError(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -544,7 +544,7 @@ func TestSyncManagementPlatformReturnsStableMissingGroupKeyError(t *testing.T) {
 }
 
 func TestSyncManagementPlatformFallsBackUsingAvailableModelExplicitGroups(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -602,7 +602,7 @@ func TestSyncManagementPlatformFallsBackUsingAvailableModelExplicitGroups(t *tes
 }
 
 func TestSyncManagementPlatformMarksAllGroupsEmptyWhenSessionModelsAreEmpty(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -664,7 +664,7 @@ func TestSyncManagementPlatformMarksAllGroupsEmptyWhenSessionModelsAreEmpty(t *t
 }
 
 func TestSyncManagementPlatformFallsBackPerFailedGroupWithoutOverwritingExactModels(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 	userModelCalls := 0
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -759,7 +759,7 @@ func TestSyncManagementPlatformFallsBackPerFailedGroupWithoutOverwritingExactMod
 }
 
 func TestSyncManagementPlatformReturnsPartialWhenSomeGroupsRemainUnresolved(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -844,7 +844,7 @@ func TestSyncManagementPlatformReturnsPartialWhenSomeGroupsRemainUnresolved(t *t
 }
 
 func TestSyncManagementPlatformCachesFallbackUserModelsAcrossFailedGroups(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 	userModelCalls := 0
 	pricingCalls := 0
 	availableModelCalls := 0
@@ -925,7 +925,7 @@ func TestSyncManagementPlatformCachesFallbackUserModelsAcrossFailedGroups(t *tes
 }
 
 func TestSyncManagementPlatformAssignsModelsPerTokenGroup(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -994,7 +994,7 @@ func TestSyncManagementPlatformAssignsModelsPerTokenGroup(t *testing.T) {
 }
 
 func TestSyncManagementPlatformAppliesPricingRouteMetadata(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1068,7 +1068,7 @@ func TestSyncManagementPlatformAppliesPricingRouteMetadata(t *testing.T) {
 }
 
 func TestSyncManagementPlatformExpandsModelsToExplicitGroupsWithoutKey(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1132,7 +1132,7 @@ func TestSyncManagementPlatformExpandsModelsToExplicitGroupsWithoutKey(t *testin
 }
 
 func TestSyncManagementPlatformAddsHeuristicResponsesForGPT5(t *testing.T) {
-	platformUserID := 7788
+	platformUserID := "7788"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -105,16 +105,16 @@ func createAnyRouterToken(ctx context.Context, siteRecord *model.Site, account *
 		return createdSiteTokenFromPayload(payload, groupKey, jsonString(payloadBody["name"])), nil
 	}
 
-	tryUserIDs := []int{userID}
-	if alternateUserID, probeErr := anyRouterProbeAlternateUserIDByCookie(ctx, siteRecord, account, accessToken, userID); probeErr == nil && alternateUserID > 0 {
+	tryUserIDs := []string{userID}
+	if alternateUserID, probeErr := anyRouterProbeAlternateUserIDByCookie(ctx, siteRecord, account, accessToken, userID); probeErr == nil && alternateUserID != "" {
 		tryUserIDs = append(tryUserIDs, alternateUserID)
 	}
-	if userID <= 0 {
-		if probedUserID, probeErr := anyRouterProbeUserIDByCookie(ctx, siteRecord, account, accessToken); probeErr == nil && probedUserID > 0 {
+	if userID == "" {
+		if probedUserID, probeErr := anyRouterProbeUserIDByCookie(ctx, siteRecord, account, accessToken); probeErr == nil && probedUserID != "" {
 			tryUserIDs = append(tryUserIDs, probedUserID)
 		}
 	}
-	tryUserIDs = slicesCompactInts(tryUserIDs)
+	tryUserIDs = compactUserIDs(tryUserIDs)
 
 	for _, candidateUserID := range tryUserIDs {
 		for _, cookie := range anyRouterBuildCookieCandidates(accessToken) {
@@ -486,16 +486,13 @@ func siteTokenFailureStatusText(value string) bool {
 	return false
 }
 
-func slicesCompactInts(values []int) []int {
+func compactUserIDs(values []string) []string {
 	if len(values) == 0 {
 		return nil
 	}
-	seen := make(map[int]struct{}, len(values))
-	result := make([]int, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
 	for _, value := range values {
-		if value < 0 {
-			continue
-		}
 		if _, ok := seen[value]; ok {
 			continue
 		}

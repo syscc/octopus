@@ -563,7 +563,7 @@ func TestSiteAccountUpdateCanClearNullableFields(t *testing.T) {
 		t.Fatalf("SiteCreate failed: %v", err)
 	}
 
-	platformUserID := 456
+	platformUserID := "456"
 	account := &model.SiteAccount{
 		SiteID:         site.ID,
 		Name:           "nullable-account",
@@ -811,7 +811,7 @@ func TestSiteImportAllAPIHubImportsAndUpdatesAccounts(t *testing.T) {
 		if account.AccessToken != "managed-session-token" {
 			t.Fatalf("expected managed access token to be imported, got %q", account.AccessToken)
 		}
-		if account.PlatformUserID == nil || *account.PlatformUserID != 7788 {
+		if account.PlatformUserID == nil || *account.PlatformUserID != "7788" {
 			t.Fatalf("expected managed platform user id 7788, got %#v", account.PlatformUserID)
 		}
 		if !account.AutoCheckin {
@@ -943,7 +943,7 @@ func TestSiteImportMetAPIImportsSiteBasics(t *testing.T) {
 	if managed.APIKey != "sk-metapi-default" {
 		t.Fatalf("expected metapi api token fallback, got %q", managed.APIKey)
 	}
-	if managed.PlatformUserID == nil || *managed.PlatformUserID != 456 {
+	if managed.PlatformUserID == nil || *managed.PlatformUserID != "456" {
 		t.Fatalf("expected platform user id 456, got %#v", managed.PlatformUserID)
 	}
 	if managed.AccountProxy != nil {

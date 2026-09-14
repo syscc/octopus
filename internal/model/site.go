@@ -1,9 +1,11 @@
 package model
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -232,7 +234,7 @@ type SiteAccount struct {
 	APIKey                     string               `json:"api_key"`
 	RefreshToken               string               `json:"refresh_token"`
 	TokenExpiresAt             int64                `json:"token_expires_at" gorm:"default:0"`
-	PlatformUserID             *int                 `json:"platform_user_id"`
+	PlatformUserID             *string              `json:"platform_user_id" gorm:"type:text"`
 	ProxyMode                  ProxyUsageMode       `json:"proxy_mode" gorm:"type:varchar(16);not null;default:'inherit'"`
 	ProxyConfigID              *int                 `json:"proxy_config_id"`
 	AccountProxy               *string              `json:"-" gorm:"column:account_proxy"`
@@ -270,10 +272,18 @@ func (a *SiteAccount) UnmarshalJSON(data []byte) error {
 	type alias SiteAccount
 	aux := struct {
 		*alias
-		AccountProxy *string `json:"account_proxy"`
+		AccountProxy   *string         `json:"account_proxy"`
+		PlatformUserID json.RawMessage `json:"platform_user_id"`
 	}{alias: (*alias)(a)}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
+	}
+	if aux.PlatformUserID != nil {
+		platformUserID, err := parsePlatformUserIDJSON(aux.PlatformUserID)
+		if err != nil {
+			return err
+		}
+		a.PlatformUserID = platformUserID
 	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -412,7 +422,7 @@ type SiteAccountUpdateRequest struct {
 	APIKey                     *string             `json:"api_key,omitempty"`
 	RefreshToken               *string             `json:"refresh_token,omitempty"`
 	TokenExpiresAt             *int64              `json:"token_expires_at,omitempty"`
-	PlatformUserID             *int                `json:"platform_user_id,omitempty"`
+	PlatformUserID             *string             `json:"platform_user_id,omitempty"`
 	PlatformUserIDSet          bool                `json:"-"`
 	ProxyMode                  *ProxyUsageMode     `json:"proxy_mode,omitempty"`
 	ProxyConfigID              *int                `json:"proxy_config_id,omitempty"`
@@ -428,11 +438,21 @@ type SiteAccountUpdateRequest struct {
 
 func (r *SiteAccountUpdateRequest) UnmarshalJSON(data []byte) error {
 	type alias SiteAccountUpdateRequest
-	var aux alias
+	aux := struct {
+		*alias
+		PlatformUserID json.RawMessage `json:"platform_user_id"`
+	}{alias: &alias{}}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
-	*r = SiteAccountUpdateRequest(aux)
+	*r = SiteAccountUpdateRequest(*aux.alias)
+	if aux.PlatformUserID != nil {
+		platformUserID, err := parsePlatformUserIDJSON(aux.PlatformUserID)
+		if err != nil {
+			return err
+		}
+		r.PlatformUserID = platformUserID
+	}
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -441,6 +461,37 @@ func (r *SiteAccountUpdateRequest) UnmarshalJSON(data []byte) error {
 	_, r.PlatformUserIDSet = raw["platform_user_id"]
 	_, r.ProxyConfigIDSet = raw["proxy_config_id"]
 	return nil
+}
+
+// parsePlatformUserIDJSON keeps compatibility with legacy integer IDs while
+// allowing platform-specific textual IDs. Numeric input follows the old int
+// behavior: only positive, in-range integers are retained.
+func parsePlatformUserIDJSON(data []byte) (*string, error) {
+	trimmed := bytes.TrimSpace(data)
+	if bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var value string
+		if err := json.Unmarshal(trimmed, &value); err != nil {
+			return nil, err
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return nil, nil
+		}
+		return &value, nil
+	}
+
+	parsed, err := strconv.ParseInt(string(trimmed), 10, strconv.IntSize)
+	if err != nil {
+		return nil, fmt.Errorf("platform_user_id must be a string, integer, or null")
+	}
+	if parsed <= 0 {
+		return nil, nil
+	}
+	value := strconv.FormatInt(parsed, 10)
+	return &value, nil
 }
 
 type SiteSyncResult struct {
@@ -1124,8 +1175,13 @@ func (a *SiteAccount) Normalize() {
 	if a.TokenExpiresAt > 0 && a.TokenExpiresAt < 1_000_000_000_000 {
 		a.TokenExpiresAt *= 1000
 	}
-	if a.PlatformUserID != nil && *a.PlatformUserID <= 0 {
-		a.PlatformUserID = nil
+	if a.PlatformUserID != nil {
+		trimmed := strings.TrimSpace(*a.PlatformUserID)
+		if trimmed == "" {
+			a.PlatformUserID = nil
+		} else {
+			a.PlatformUserID = &trimmed
+		}
 	}
 	if a.AccountProxy != nil {
 		trimmed := strings.TrimSpace(*a.AccountProxy)
@@ -1180,9 +1236,6 @@ func (a *SiteAccount) Validate() error {
 	}
 	if a.CheckinRandomWindowMinutes > 1440 {
 		return fmt.Errorf("checkin random window minutes must be less than or equal to 1440")
-	}
-	if a.PlatformUserID != nil && *a.PlatformUserID <= 0 {
-		return fmt.Errorf("platform user id must be greater than 0")
 	}
 	if a.TokenExpiresAt < 0 {
 		return fmt.Errorf("token expires at must be greater than or equal to 0")

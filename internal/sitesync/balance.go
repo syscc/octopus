@@ -24,7 +24,7 @@ var (
 	logIncomeContentNumberRE = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?`)
 )
 
-func fetchSiteAccountBalance(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, userID int) (float64, float64, float64) {
+func fetchSiteAccountBalance(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, userID string) (float64, float64, float64) {
 	if siteRecord == nil || account == nil {
 		return 0, 0, 0
 	}
@@ -44,13 +44,13 @@ func fetchSiteAccountBalance(ctx context.Context, siteRecord *model.Site, accoun
 	}
 }
 
-func fetchManagementQuotaBalance(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, userID int, quotaIsRemaining bool) (float64, float64, float64) {
+func fetchManagementQuotaBalance(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, userID string, quotaIsRemaining bool) (float64, float64, float64) {
 	if strings.TrimSpace(accessToken) == "" {
 		return 0, 0, 0
 	}
-	knownUserID := userID > 0
+	knownUserID := userID != ""
 	if !knownUserID {
-		if discovered, _ := anyRouterDiscoverUserID(ctx, siteRecord, account, accessToken); discovered > 0 {
+		if discovered, _ := anyRouterDiscoverUserID(ctx, siteRecord, account, accessToken); discovered != "" {
 			userID = discovered
 			rememberManagedPlatformUserID(userID, account)
 		}
@@ -70,12 +70,12 @@ func fetchManagementQuotaBalance(ctx context.Context, siteRecord *model.Site, ac
 		if isValidUserSelfPayload(cookiePayload, cookieErr) {
 			payload = cookiePayload
 			err = nil
-		} else if userID > 0 {
+		} else if userID != "" {
 			// Attempt 3: probe for an alternate userID (e.g., the real gob-encoded user inside the
 			// session cookie) when the passed-in userID doesn't match reality. Safe for multi-account:
-			// anyRouterProbeAlternateUserIDByCookie returns 0 when the probed ID matches the current
+			// anyRouterProbeAlternateUserIDByCookie returns an empty ID when the probed ID matches the current
 			// one, and it only returns IDs that genuinely validate against the session.
-			if alt, _ := anyRouterProbeAlternateUserIDByCookie(ctx, siteRecord, account, accessToken, userID); alt > 0 {
+			if alt, _ := anyRouterProbeAlternateUserIDByCookie(ctx, siteRecord, account, accessToken, userID); alt != "" {
 				altPayload, _, altErr := anyRouterRequestJSONWithCookies(ctx, siteRecord, http.MethodGet, requestURL, nil,
 					anyRouterAuthHeaders(accessToken, alt), account)
 				if isValidUserSelfPayload(altPayload, altErr) {
@@ -144,7 +144,7 @@ func supportsTodayIncomeLogFallback(platform model.SitePlatform) bool {
 	}
 }
 
-func fetchTodayIncomeFromLogs(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, userID int) (float64, bool) {
+func fetchTodayIncomeFromLogs(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, accessToken string, userID string) (float64, bool) {
 	if strings.TrimSpace(accessToken) == "" {
 		return 0, false
 	}

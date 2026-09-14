@@ -19,7 +19,7 @@ func applyDetectedRoutesToSiteModels(
 	account *model.SiteAccount,
 	accessToken string,
 	modelToken model.SiteToken,
-	platformUserID int,
+	platformUserID string,
 	items []model.SiteModel,
 ) []model.SiteModel {
 	if siteRecord == nil || len(items) == 0 {
@@ -59,7 +59,7 @@ func detectSiteModelRoutes(
 	account *model.SiteAccount,
 	accessToken string,
 	modelToken model.SiteToken,
-	platformUserID int,
+	platformUserID string,
 	items []model.SiteModel,
 ) map[string]siteModelRouteDetection {
 	modelFilter := make(map[string]struct{}, len(items))
@@ -229,7 +229,7 @@ func detectAnyRouterPricingRoutes(
 	siteRecord *model.Site,
 	account *model.SiteAccount,
 	accessToken string,
-	platformUserID int,
+	platformUserID string,
 	modelFilter map[string]struct{},
 ) map[string]siteModelRouteDetection {
 	token := strings.TrimSpace(accessToken)
@@ -238,7 +238,7 @@ func detectAnyRouterPricingRoutes(
 	}
 
 	userID := platformUserID
-	if userID <= 0 {
+	if userID == "" {
 		if discovered, err := anyRouterDiscoverUserID(ctx, siteRecord, account, token); err == nil {
 			userID = discovered
 		}

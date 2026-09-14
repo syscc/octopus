@@ -1118,7 +1118,7 @@ func syncSiteModelsByGroup(
 	account *model.SiteAccount,
 	accessToken string,
 	groupTokens []model.SiteToken,
-	platformUserID int,
+	platformUserID string,
 	source string,
 	fetcher func(token model.SiteToken, allowGlobalFallback bool) (siteModelFetchResult, error),
 ) ([]model.SiteModel, []siteGroupSyncResult) {

@@ -90,7 +90,7 @@ export type SiteAccount = {
   api_key: string;
   refresh_token: string;
   token_expires_at: number;
-  platform_user_id?: number | null;
+  platform_user_id?: string | number | null;
   proxy_mode: ProxyMode;
   proxy_config_id?: number | null;
   enabled: boolean;

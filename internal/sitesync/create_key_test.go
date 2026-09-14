@@ -136,7 +136,7 @@ func TestInitialAccessTokenSyncRestoresExistingKeyAndProjectsChannel(t *testing.
 	ctx := setupProjectTestDB(t)
 
 	batchCalled := false
-	platformUserID := 7788
+	platformUserID := "7788"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 

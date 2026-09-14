@@ -349,23 +349,6 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
             const platformUserIDInput = shouldIncludePlatformUserID
                 ? accountForm.platform_user_id.trim()
                 : '';
-            if (shouldIncludePlatformUserID && !platformUserIDInput) {
-                toast.error('请输入 Platform User ID');
-                return;
-            }
-
-            const parsedPlatformUserID = platformUserIDInput
-                ? Number(platformUserIDInput)
-                : null;
-            if (
-                shouldIncludePlatformUserID &&
-                parsedPlatformUserID !== null &&
-                (!Number.isInteger(parsedPlatformUserID) || parsedPlatformUserID <= 0)
-            ) {
-                toast.error('Platform User ID 必须是大于 0 的整数');
-                return;
-            }
-
             let parsedTokenExpiresAt = 0;
             try {
                 parsedTokenExpiresAt = parseTokenExpiresAtInput(accountForm.token_expires_at);
@@ -402,7 +385,7 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
                 api_key: trimmedAPIKey,
                 refresh_token: isAccessToken ? accountForm.refresh_token.trim() : '',
                 token_expires_at: isAccessToken ? parsedTokenExpiresAt : 0,
-                platform_user_id: shouldIncludePlatformUserID ? parsedPlatformUserID : null,
+                platform_user_id: shouldIncludePlatformUserID ? platformUserIDInput || null : null,
                 proxy_mode: accountForm.proxy_mode,
                 proxy_config_id:
                     accountForm.proxy_mode === 'pool' ? accountForm.proxy_config_id : null,
@@ -677,7 +660,7 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
 
                                             {currentPlatform === SitePlatform.NewAPI ? (
                                                 <label className="grid gap-2 text-sm">
-                                                    <span className="font-medium">Platform User ID</span>
+                                                    <span className="font-medium">Platform User ID（选填）</span>
                                                     <Input
                                                         value={accountForm.platform_user_id}
                                                         onChange={(event) =>
@@ -690,12 +673,11 @@ export function AccountEditDialog({ open, onOpenChange, site, account }: Account
                                                                     : current,
                                                             )
                                                         }
-                                                        placeholder="例如 11494"
+                                                        placeholder="可选：请输入平台用户 ID"
                                                         className="rounded-xl"
-                                                        required
                                                     />
                                                     <span className="text-xs text-muted-foreground">
-                                                        New API 站点同步 token、分组和签到时需要用户
+                                                        支持字母或数字 ID；部分上游同步或签到可能需要该
                                                         ID。导入数据会尽量自动填充该值。
                                                     </span>
                                                 </label>

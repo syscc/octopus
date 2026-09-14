@@ -1,12 +1,15 @@
 package op
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/bestruirui/octopus/internal/db"
@@ -33,7 +36,7 @@ type importedAccountInput struct {
 	APIKey         string
 	RefreshToken   string
 	TokenExpiresAt int64
-	PlatformUserID *int
+	PlatformUserID *string
 	AccountProxy   *string
 	Enabled        bool
 	AutoSync       bool
@@ -84,7 +87,7 @@ var directImportPlatforms = map[model.SitePlatform]struct{}{
 
 func SiteImportAllAPIHub(ctx context.Context, body []byte) (*model.AllAPIHubImportResult, []int, error) {
 	var payload rawImportObject
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := decodeImportJSON(body, &payload); err != nil {
 		return nil, nil, newSiteImportInvalidJSONError()
 	}
 	if len(payload) == 0 {
@@ -153,7 +156,7 @@ func SiteImportAllAPIHub(ctx context.Context, body []byte) (*model.AllAPIHubImpo
 
 func SiteImportMetAPI(ctx context.Context, body []byte) (*model.MetAPIImportResult, error) {
 	var payload rawImportObject
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := decodeImportJSON(body, &payload); err != nil {
 		return nil, newSiteImportInvalidJSONError()
 	}
 	if len(payload) == 0 {
@@ -437,7 +440,7 @@ func parseMetAPIAccountRow(row rawImportObject, sites map[int]importedSiteInput,
 		AutoCheckin:    asBool(row["checkinEnabled"], true) && platformSupportsCheckin(siteInput.Platform),
 		Balance:        asFloat64(row["balance"]),
 		BalanceUsed:    asFloat64(row["balanceUsed"]),
-		PlatformUserID: asIntPointer(extraConfig["platformUserId"]),
+		PlatformUserID: asPlatformUserIDPointer(extraConfig["platformUserId"]),
 		AccountProxy:   asStringPointer(extraConfig["proxyUrl"]),
 	}
 
@@ -555,7 +558,7 @@ func parseAllAPIHubAccountRow(row rawImportObject) (importedAccountInput, string
 	refreshTokenCandidate := firstNonEmptyString(asString(accountInfo["refresh_token"]), asString(row["refresh_token"]))
 	tokenExpiresAt := asInt64(accountInfo["token_expires_at"])
 	cookieSession := asString(cookieAuth["sessionCookie"])
-	platformUserID := asIntPointer(accountInfo["id"])
+	platformUserID := asPlatformUserIDPointer(accountInfo["id"])
 
 	input := importedAccountInput{
 		Site: importedSiteInput{
@@ -1275,10 +1278,26 @@ func asObjectFromJSONString(value string) rawImportObject {
 		return nil
 	}
 	var result rawImportObject
-	if err := json.Unmarshal([]byte(value), &result); err != nil {
+	if err := decodeImportJSON([]byte(value), &result); err != nil {
 		return nil
 	}
 	return result
+}
+
+func decodeImportJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }
 
 func asObjectSlice(value any) []rawImportObject {
@@ -1335,6 +1354,9 @@ func asBool(value any, fallback bool) bool {
 		return typed != 0
 	case int:
 		return typed != 0
+	case json.Number:
+		parsed, err := typed.Float64()
+		return err == nil && parsed != 0
 	}
 	return fallback
 }
@@ -1356,7 +1378,15 @@ func asIntPointer(value any) *int {
 			return &result
 		}
 	case json.Number:
-		if parsed, err := typed.Int64(); err == nil && parsed > 0 {
+		parsed, err := typed.Int64()
+		if err != nil {
+			parsedFloat, floatErr := typed.Float64()
+			if floatErr != nil {
+				return nil
+			}
+			parsed = int64(parsedFloat)
+		}
+		if parsed > 0 {
 			result := int(parsed)
 			return &result
 		}
@@ -1367,6 +1397,38 @@ func asIntPointer(value any) *int {
 		}
 	}
 	return nil
+}
+
+func asPlatformUserIDPointer(value any) *string {
+	switch typed := value.(type) {
+	case string:
+		value := strings.TrimSpace(typed)
+		if value == "" {
+			return nil
+		}
+		return &value
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil || parsed <= 0 {
+			return nil
+		}
+		value := typed.String()
+		return &value
+	case int:
+		if typed <= 0 {
+			return nil
+		}
+		value := strconv.Itoa(typed)
+		return &value
+	case int64:
+		if typed <= 0 {
+			return nil
+		}
+		value := strconv.FormatInt(typed, 10)
+		return &value
+	default:
+		return nil
+	}
 }
 
 func asInt(value any) int {
@@ -1391,7 +1453,15 @@ func asInt64(value any) int64 {
 			return int64(typed)
 		}
 	case json.Number:
-		if parsed, err := typed.Int64(); err == nil && parsed > 0 {
+		parsed, err := typed.Int64()
+		if err != nil {
+			parsedFloat, floatErr := typed.Float64()
+			if floatErr != nil {
+				return 0
+			}
+			parsed = int64(parsedFloat)
+		}
+		if parsed > 0 {
 			return parsed
 		}
 	case string:

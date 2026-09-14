@@ -177,7 +177,7 @@ docker compose up -d
 
 | 平台 | 推荐凭据 | Access Token 处填什么 | 额外字段 |
 |------|---------|----------------------|---------|
-| **New API 类** | Access Token | 站点的**「系统访问令牌」**（不是登录密码！） | 必填 **Platform User ID**（站点里的用户 ID） |
+| **New API 类** | Access Token | 站点的**「系统访问令牌」**（不是登录密码！） | 选填 **Platform User ID**（支持字母或数字；部分上游操作可能需要） |
 | **AnyRouter（any）** | Access Token | **cookie**，格式 `session=MTc1234567890` | — |
 | **Sub2API** | Access Token | 站点的 access token | 建议同时填 `refresh_token` 与 `token_expires_at`（F12 拿，401 会自动续期）|
 | **Cloudflare Workers AI** | Access Token | Cloudflare Workers AI API Token（需 `Workers AI Read` 或 `Workers AI Edit` 权限） | Account ID 已包含在站点地址中 |
@@ -187,7 +187,7 @@ docker compose up -d
 > 登录中转站 → 个人设置 → 账户管理 → 安全设置 → **系统访问令牌**，生成的那串就是 Access Token。
 > **强烈不建议用"账号密码"登录**——很多站点登录后不返回 Access Token，会报 `站点登录成功但未返回 Access Token`。
 >
-> 🔎 **Platform User ID 是什么？** New API 同步令牌、分组、签到都需要它（就是你在中转站里的用户 ID，例如 `11494`）。用导入功能导入时会尽量自动填好。
+> 🔎 **Platform User ID 是什么？** 就是你在中转站里的用户 ID，支持字母或数字。在 Octopus 中可选填，但部分上游站点同步令牌、分组或签到时可能需要它。用导入功能导入时会尽量自动填好。
 
 账号上还有几个开关：
 
@@ -502,7 +502,7 @@ Octopus 支持 **OpenAI Chat / OpenAI Responses / Anthropic** 三种格式互相
 - 中转站里那个分组**压根没建 Key** → 先去站点建 Key，或在 octopus 里"快捷创建 Key"。
 
 ### Q4. Access Token 到底填什么？
-- **New API 类**：填站点「个人设置 → 账户管理 → 安全设置 → **系统访问令牌**」生成的那串，**不要用账号密码登录**；并且 New API 还要填 **Platform User ID**。
+- **New API 类**：填站点「个人设置 → 账户管理 → 安全设置 → **系统访问令牌**」生成的那串，**不要用账号密码登录**；**Platform User ID** 可选填并支持字母或数字，但部分上游操作可能需要。
 - **any（AnyRouter）**：填 **cookie**，格式 `session=MTc1234567890`，平台类型记得选 **AnyRouter** 而不是 New API。
 - **API 直连（OpenAI/Claude/Gemini）**：填对应的 API Key，并选择正确的**默认协议**。
 - **Cloudflare Workers AI**：填 Workers AI API Token；站点地址需包含 Account ID，例如 `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai`。
