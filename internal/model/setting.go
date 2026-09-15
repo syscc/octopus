@@ -1,10 +1,13 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/robfig/cron/v3"
 )
@@ -33,6 +36,7 @@ const (
 	SettingKeySSEPreStreamHeartbeatDelay       SettingKey = "sse_pre_stream_heartbeat_delay"       // SSE 上游流建立前心跳首次延迟（秒），0 表示禁用
 	SettingKeyGroupHealthEnabled               SettingKey = "group_health_enabled"                 // 是否启用分组健康检查功能
 	SettingKeyProjectedChannelAutoGroupEnabled SettingKey = "projected_channel_auto_group_enabled" // 全局站点投影渠道自动分组模式（0关闭/1模糊/2精确/3正则，兼容旧 true/false）
+	SettingKeyGlobalAutoGroupModelFilter       SettingKey = "global_auto_group_model_filter"       // 自动分组模型全局黑白名单(JSON)
 	SettingKeyJWTSecret                        SettingKey = "jwt_secret"                           // JWT 签名密钥（自动生成）
 	SettingKeyStatsSiteModelBackfilled         SettingKey = "stats_site_model_backfilled"          // 站点渠道小时聚合是否已回填历史日志
 	SettingKeyOutlierRetireEnabled             SettingKey = "outlier_retire_enabled"               // 被动离群退役(POR)总开关
@@ -60,8 +64,120 @@ type Setting struct {
 	Value string     `json:"value" gorm:"not null"`
 }
 
+type GlobalAutoGroupModelFilterMode string
+
+const (
+	GlobalAutoGroupModelFilterModeOff       GlobalAutoGroupModelFilterMode = "off"
+	GlobalAutoGroupModelFilterModeWhitelist GlobalAutoGroupModelFilterMode = "whitelist"
+	GlobalAutoGroupModelFilterModeBlacklist GlobalAutoGroupModelFilterMode = "blacklist"
+)
+
+type GlobalAutoGroupModelFilter struct {
+	Mode     GlobalAutoGroupModelFilterMode `json:"mode"`
+	Keywords []string                       `json:"keywords"`
+}
+
+// ParseGlobalAutoGroupModelFilter validates the JSON contract and normalizes keywords.
+func ParseGlobalAutoGroupModelFilter(value string) (GlobalAutoGroupModelFilter, error) {
+	var filter GlobalAutoGroupModelFilter
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(value), &fields); err != nil {
+		return filter, fmt.Errorf("invalid auto-group model filter JSON: %w", err)
+	}
+	if fields == nil || len(fields["mode"]) == 0 || len(fields["keywords"]) == 0 ||
+		string(fields["mode"]) == "null" || string(fields["keywords"]) == "null" {
+		return filter, fmt.Errorf("auto-group model filter requires mode and keywords")
+	}
+	for key := range fields {
+		if key != "mode" && key != "keywords" {
+			return filter, fmt.Errorf("unknown auto-group model filter field: %s", key)
+		}
+	}
+	if err := json.Unmarshal([]byte(value), &filter); err != nil {
+		return filter, fmt.Errorf("invalid auto-group model filter: %w", err)
+	}
+	switch filter.Mode {
+	case GlobalAutoGroupModelFilterModeOff, GlobalAutoGroupModelFilterModeWhitelist, GlobalAutoGroupModelFilterModeBlacklist:
+	default:
+		return filter, fmt.Errorf("auto-group model filter mode must be off, whitelist, or blacklist")
+	}
+	// Decode each element explicitly because encoding/json accepts null as a string.
+	var rawKeywords []json.RawMessage
+	if err := json.Unmarshal(fields["keywords"], &rawKeywords); err != nil {
+		return filter, fmt.Errorf("auto-group model filter keywords must be a string array")
+	}
+	seen := make(map[string]struct{}, len(filter.Keywords))
+	keywords := make([]string, 0, len(filter.Keywords))
+	for i, keyword := range filter.Keywords {
+		if string(rawKeywords[i]) == "null" {
+			return filter, fmt.Errorf("auto-group model filter keywords must be strings")
+		}
+		if strings.ContainsAny(keyword, ",，\r\n") {
+			return filter, fmt.Errorf("auto-group model filter keywords must not contain separators")
+		}
+		keyword = trimGlobalAutoGroupFilterSpace(keyword)
+		if keyword == "" {
+			continue
+		}
+		if utf8.RuneCountInString(keyword) > 200 {
+			return filter, fmt.Errorf("auto-group model filter keyword must not exceed 200 characters")
+		}
+		key := foldGlobalAutoGroupFilterASCII(keyword)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keywords = append(keywords, keyword)
+	}
+	if len(keywords) > 100 {
+		return filter, fmt.Errorf("auto-group model filter must not exceed 100 keywords")
+	}
+	filter.Keywords = keywords
+	return filter, nil
+}
+
+// Allows matches each field independently using literal substrings, folding only ASCII A-Z.
+// An empty whitelist rejects all models; an empty blacklist allows all models.
+func (f GlobalAutoGroupModelFilter) Allows(channelName, modelName string) bool {
+	if f.Mode == GlobalAutoGroupModelFilterModeOff {
+		return true
+	}
+	matched := false
+	channelName = foldGlobalAutoGroupFilterASCII(channelName)
+	modelName = foldGlobalAutoGroupFilterASCII(modelName)
+	for _, keyword := range f.Keywords {
+		keyword = foldGlobalAutoGroupFilterASCII(keyword)
+		if strings.Contains(channelName, keyword) || strings.Contains(modelName, keyword) {
+			matched = true
+			break
+		}
+	}
+	if f.Mode == GlobalAutoGroupModelFilterModeWhitelist {
+		return matched
+	}
+	return f.Mode == GlobalAutoGroupModelFilterModeBlacklist && !matched
+}
+
+func foldGlobalAutoGroupFilterASCII(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, value)
+}
+
+func trimGlobalAutoGroupFilterSpace(value string) string {
+	return strings.TrimFunc(value, func(r rune) bool {
+		return r == '\uFEFF' || unicode.IsSpace(r)
+	})
+}
+
 func DefaultSettings() []Setting {
 	return []Setting{
+		// 默认不限制自动分组模型。
+		{Key: SettingKeyGlobalAutoGroupModelFilter, Value: `{"mode":"off","keywords":[]}`},
+
 		{Key: SettingKeyProxyURL, Value: ""},
 		{Key: SettingKeyStatsSaveInterval, Value: "10"},               // 默认10分钟保存一次统计信息
 		{Key: SettingKeyCORSAllowOrigins, Value: ""},                  // CORS 默认不允许跨域，设置为 "*" 才允许所有来源
@@ -117,6 +233,9 @@ func ParseSiteCheckinCron(value string) (cron.Schedule, error) {
 
 func (s *Setting) Validate() error {
 	switch s.Key {
+	case SettingKeyGlobalAutoGroupModelFilter:
+		_, err := ParseGlobalAutoGroupModelFilter(s.Value)
+		return err
 	case SettingKeyModelInfoUpdateInterval, SettingKeySyncLLMInterval, SettingKeySiteSyncInterval,
 		SettingKeySiteCheckinInterval, SettingKeyRelayLogKeepPeriod,
 		SettingKeyCircuitBreakerThreshold, SettingKeyCircuitBreakerCooldown, SettingKeyCircuitBreakerMaxCooldown:

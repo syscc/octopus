@@ -652,6 +652,43 @@
             "noHttpStatus": "無 HTTP 狀態"
         },
         "empty": "暫無分組，點擊左上角按鈕建立",
+        "globalModelFilter": {
+            "title": "全域黑白名單",
+            "description": "對所有分組的「自動新增」和背景自動分組生效。",
+            "matchDescription": "在模型名稱或供應源名稱（含站點來源路徑）中比對文字關鍵字：名稱包含關鍵字即命中，忽略英文字母大小寫，任意關鍵字命中任一名稱即可（OR）。不支援正規表示式或萬用字元。",
+            "notice": "不影響手動新增，也不會刪除已有分組成員。",
+            "loading": "正在載入全域黑白名單…",
+            "loadFailed": "載入全域黑白名單失敗。",
+            "invalidConfig": "已儲存的全域黑白名單設定無效，自動新增已暫停。",
+            "repairHint": "請明確選擇一種模式，視需要重新填寫關鍵字後儲存，以修復設定。",
+            "retry": "重試",
+            "unsupported": "目前後端尚不支援全域黑白名單，請更新後端後再儲存。",
+            "activeBlacklist": "全域黑名單已啟用",
+            "activeWhitelist": "全域白名單已啟用",
+            "modeLabel": "模式",
+            "mode": {
+                "off": "關閉",
+                "blacklist": "黑名單",
+                "whitelist": "白名單"
+            },
+            "modeHint": {
+                "off": "關閉：自動新增不依關鍵字過濾。",
+                "blacklist": "黑名單：排除命中的項目。關鍵字清單為空時，此篩選器放行所有項目。",
+                "whitelist": "白名單：只有命中的項目才允許自動新增。"
+            },
+            "keywordsLabel": "關鍵字",
+            "keywordsPlaceholder": "模型關鍵字\n供應源或站點來源關鍵字",
+            "keywordsHint": "每行一個，也可用半形或中文逗號分隔。儲存時去除頭尾空白、空項目，並忽略英文字母大小寫去重。最多 100 個關鍵字，每詞最多 200 個 Unicode 字元。",
+            "tooManyKeywords": "去重後最多允許 100 個關鍵字。",
+            "keywordTooLong": "每個關鍵字最多允許 200 個 Unicode 字元。",
+            "whitelistEmptyWarning": "白名單為空：「自動新增」和背景自動分組將不會新增任何項目。",
+            "save": "儲存",
+            "saving": "儲存中…",
+            "cancel": "取消",
+            "close": "關閉",
+            "saved": "全域黑白名單已儲存",
+            "saveFailed": "儲存失敗，目前對話框中的修改已保留，請重試。"
+        },
         "autoGroup": {
             "title": "自動分組配置",
             "description": "將供應源或站點分組加入列表後，系統會按模型組名稱或正規自動把模型加入匹配的模型組。",

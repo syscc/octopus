@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
     ArrowDownWideNarrow,
     ArrowDownZA,
@@ -14,6 +14,7 @@ import {
     Plus,
     RefreshCw,
     Search,
+    ShieldCheck,
     SlidersHorizontal,
     WandSparkles,
     X
@@ -32,6 +33,7 @@ import { useNavStore, type NavItem } from '@/components/modules/navbar';
 import { CreateDialogContent as ChannelCreateContent } from '@/components/modules/channel/Create';
 import { CreateDialogContent as GroupCreateContent } from '@/components/modules/group/Create';
 import { GroupAutoGroupDialogContent } from '@/components/modules/group/AutoGroupDialog';
+import { GlobalModelFilterDialogContent } from '@/components/modules/group/GlobalModelFilterDialog';
 import { CreateDialogContent as ModelCreateContent } from '@/components/modules/model/Create';
 import { useSiteUIStore } from '@/components/modules/site/ui-store';
 import { useLogUIStore } from '@/components/modules/log/ui-store';
@@ -93,6 +95,7 @@ function CreateDialogContent({ activeItem }: { activeItem: ToolbarPage }) {
 export function Toolbar() {
     const t = useTranslations('toolbar');
     const tProxyPool = useTranslations('proxyPool');
+    const tGlobalModelFilter = useTranslations('group.globalModelFilter');
     const { activeItem } = useNavStore();
     const toolbarItem = isToolbarPage(activeItem) ? activeItem : null;
     const searchTerm = useSearchStore((s) => (toolbarItem ? s.searchTerms[toolbarItem] || '' : ''));
@@ -129,6 +132,11 @@ export function Toolbar() {
     const [viewOptionsOpen, setViewOptionsOpen] = useState(false);
     const [createDialogOpen, setCreateDialogOpen] = useState(false);
     const [autoGroupDialogOpen, setAutoGroupDialogOpen] = useState(false);
+    const [globalModelFilterDialogOpen, setGlobalModelFilterDialogOpen] = useState(false);
+    const globalModelFilterSavingRef = useRef(false);
+    const setGlobalModelFilterSaving = useCallback((saving: boolean) => {
+        globalModelFilterSavingRef.current = saving;
+    }, []);
 
     const searchExpanded = expandedSearchItem === toolbarItem;
 
@@ -189,6 +197,13 @@ export function Toolbar() {
         if (toolbarItem === 'group') {
             result.push(
                 {
+                    id: 'global-model-filter',
+                    icon: <ShieldCheck className="size-4" />,
+                    label: tGlobalModelFilter('title'),
+                    onClick: () => setGlobalModelFilterDialogOpen(true),
+                    priority: 'always',
+                },
+                {
                     id: 'auto-group',
                     icon: <WandSparkles className="size-4" />,
                     label: '自动分组',
@@ -239,6 +254,7 @@ export function Toolbar() {
         openCompletionDialog,
         requestLogRefresh,
         tProxyPool,
+        tGlobalModelFilter,
     ]);
 
     if (!toolbarItem) return null;
@@ -555,6 +571,25 @@ export function Toolbar() {
                         <MorphingDialogContainer>
                             <MorphingDialogContent className="w-fit max-w-full bg-card text-card-foreground px-6 py-4 rounded-3xl custom-shadow max-h-[calc(100vh-2rem)] flex flex-col overflow-hidden">
                                 <GroupAutoGroupDialogContent />
+                            </MorphingDialogContent>
+                        </MorphingDialogContainer>
+                    </MorphingDialog>
+                )}
+                {/* 全局黑白名单对话框 */}
+                {toolbarItem === 'group' && (
+                    <MorphingDialog
+                        open={globalModelFilterDialogOpen}
+                        onOpenChange={(open) => {
+                            if (!open && globalModelFilterSavingRef.current) return;
+                            setGlobalModelFilterDialogOpen(open);
+                        }}
+                    >
+                        <MorphingDialogTrigger aria-label={tGlobalModelFilter('title')}>
+                            <span className="hidden">{tGlobalModelFilter('title')}</span>
+                        </MorphingDialogTrigger>
+                        <MorphingDialogContainer>
+                            <MorphingDialogContent className="flex max-h-[calc(100dvh-2rem)] w-[560px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-3xl bg-card px-4 py-4 text-card-foreground custom-shadow sm:px-6">
+                                <GlobalModelFilterDialogContent onSavingChange={setGlobalModelFilterSaving} />
                             </MorphingDialogContent>
                         </MorphingDialogContainer>
                     </MorphingDialog>

@@ -28,6 +28,14 @@ func ProjectedChannelGlobalAutoGroupEnabled() bool {
 	return ProjectedChannelGlobalAutoGroupMode() != model.AutoGroupTypeNone
 }
 
+func GlobalAutoGroupModelFilter() (model.GlobalAutoGroupModelFilter, error) {
+	value, err := SettingGetString(model.SettingKeyGlobalAutoGroupModelFilter)
+	if err != nil {
+		return model.GlobalAutoGroupModelFilter{Mode: model.GlobalAutoGroupModelFilterModeOff, Keywords: []string{}}, nil
+	}
+	return model.ParseGlobalAutoGroupModelFilter(value)
+}
+
 func EffectiveProjectedChannelAutoGroup(channel model.Channel) model.AutoGroupType {
 	if mode := ProjectedChannelGlobalAutoGroupMode(); mode != model.AutoGroupTypeNone {
 		return mode
@@ -46,6 +54,18 @@ func ChannelAutoGroupWithMode(channel *model.Channel, autoGroup model.AutoGroupT
 	}
 
 	channelModelNames := splitChannelModelNames(channel.Model, channel.CustomModel)
+	filter, err := GlobalAutoGroupModelFilter()
+	if err != nil {
+		log.Warnf("invalid global auto-group model filter (channel=%d): %v", channel.ID, err)
+		return
+	}
+	filteredModelNames := make([]string, 0, len(channelModelNames))
+	for _, modelName := range channelModelNames {
+		if filter.Allows(channel.Name, modelName) {
+			filteredModelNames = append(filteredModelNames, modelName)
+		}
+	}
+	channelModelNames = filteredModelNames
 	if len(channelModelNames) == 0 {
 		return
 	}

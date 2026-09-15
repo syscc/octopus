@@ -5,6 +5,8 @@ import { Check, ChevronDownIcon, Plus, Search, Sparkles, Trash2 } from 'lucide-r
 import { useTranslations } from 'next-intl';
 import * as AccordionPrimitive from '@radix-ui/react-accordion';
 import { useModelChannelList, type LLMChannel } from '@/api/endpoints/model';
+import { useGlobalAutoGroupModelFilter } from '@/api/endpoints/group-model-filter';
+import { filterAutoGroupCandidates } from '@/lib/group-model-filter';
 import { Button } from '@/components/ui/button';
 import { Field, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
@@ -38,12 +40,16 @@ function ModelPickerSection({
     onAdd,
     onAutoAdd,
     autoAddDisabled,
+    autoAddNotice,
+    onRetryFilter,
 }: {
     modelChannels: LLMChannel[];
     selectedMembers: SelectedMember[];
     onAdd: (channel: LLMChannel) => void;
     onAutoAdd: () => void;
     autoAddDisabled: boolean;
+    autoAddNotice?: string;
+    onRetryFilter?: () => void;
 }) {
     const t = useTranslations('group');
     const [searchKeyword, setSearchKeyword] = useState('');
@@ -85,6 +91,16 @@ function ModelPickerSection({
 
     return (
         <div className="rounded-xl border border-border/50 bg-muted/30 flex flex-col min-h-0">
+            {autoAddNotice && (
+                <div className="flex items-center gap-2 border-b border-border/30 px-3 py-2 text-xs text-muted-foreground" role={onRetryFilter ? 'alert' : 'status'}>
+                    <span className="min-w-0 flex-1">{autoAddNotice}</span>
+                    {onRetryFilter && (
+                        <Button type="button" variant="ghost" size="sm" onClick={onRetryFilter}>
+                            {t('globalModelFilter.retry')}
+                        </Button>
+                    )}
+                </div>
+            )}
             <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 px-3 py-2 border-b border-border/30 bg-muted/50">
                 <span className="min-w-0 justify-self-start text-sm font-medium text-foreground">
                     {t('form.addItem')}
@@ -269,6 +285,7 @@ export function GroupEditor({
 }) {
     const t = useTranslations('group');
     const { data: modelChannels = [] } = useModelChannelList();
+    const filterQuery = useGlobalAutoGroupModelFilter();
     const selectableModelChannels = useMemo(
         () => modelChannels.filter((channel) => channel.enabled !== false),
         [modelChannels],
@@ -319,22 +336,46 @@ export function GroupEditor({
         });
     }, []);
 
+    const filterReady =
+        filterQuery.isSuccess &&
+        !filterQuery.isError &&
+        filterQuery.supported &&
+        filterQuery.filter !== null;
+    const autoAddModelChannels = useMemo(
+        () => filterAutoGroupCandidates(matchedModelChannels, filterReady ? filterQuery.filter : null),
+        [matchedModelChannels, filterReady, filterQuery.filter],
+    );
+    const filterFailed = filterQuery.isError || (filterQuery.isSuccess && filterQuery.filter === null);
+    const autoAddNotice = filterQuery.isPending
+        ? t('globalModelFilter.loading')
+        : filterQuery.isError
+            ? t('globalModelFilter.loadFailed')
+            : !filterQuery.supported
+                ? t('globalModelFilter.unsupported')
+                : filterQuery.filter === null
+                    ? t('globalModelFilter.invalidConfig')
+                    : filterQuery.filter.mode === 'blacklist'
+                        ? t('globalModelFilter.activeBlacklist')
+                        : filterQuery.filter.mode === 'whitelist'
+                            ? t('globalModelFilter.activeWhitelist')
+                            : undefined;
+
     const autoAddDisabled = useMemo(() => {
-        if ((!regexKey && !groupKey) || regexError || matchedModelChannels.length === 0) return true;
+        if (!filterReady || (!regexKey && !groupKey) || regexError || autoAddModelChannels.length === 0) return true;
         const existing = new Set(selectedMembers.map((m) => m.id));
-        return matchedModelChannels.every((mc) => existing.has(memberKey(mc)));
-    }, [groupKey, regexKey, regexError, matchedModelChannels, selectedMembers]);
+        return autoAddModelChannels.every((mc) => existing.has(memberKey(mc)));
+    }, [filterReady, groupKey, regexKey, regexError, autoAddModelChannels, selectedMembers]);
 
     const handleAutoAdd = useCallback(() => {
-        if (matchedModelChannels.length === 0) return;
+        if (autoAddDisabled) return;
         setSelectedMembers((prev) => {
             const existing = new Set(prev.map((m) => m.id));
-            const toAdd = matchedModelChannels
+            const toAdd = autoAddModelChannels
                 .filter((mc) => !existing.has(memberKey(mc)))
                 .map((mc) => ({ ...mc, id: memberKey(mc), weight: 1 }));
             return toAdd.length ? [...prev, ...toAdd] : prev;
         });
-    }, [matchedModelChannels]);
+    }, [autoAddDisabled, autoAddModelChannels]);
 
     const handleWeightChange = useCallback((id: string, weight: number) => {
         setSelectedMembers((prev) => prev.map((m) => m.id === id ? { ...m, weight } : m));
@@ -541,6 +582,8 @@ export function GroupEditor({
                                 onAdd={handleAddMember}
                                 onAutoAdd={handleAutoAdd}
                                 autoAddDisabled={autoAddDisabled}
+                                autoAddNotice={autoAddNotice}
+                                onRetryFilter={filterFailed ? () => { void filterQuery.refetch(); } : undefined}
                             />
                             <SortSection
                                 members={selectedMembers}

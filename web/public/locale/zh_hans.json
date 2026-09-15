@@ -652,6 +652,43 @@
             "noHttpStatus": "无 HTTP 状态"
         },
         "empty": "暂无分组，点击左上角按钮创建",
+        "globalModelFilter": {
+            "title": "全局黑白名单",
+            "description": "对所有分组的“自动添加”和后台自动分组生效。",
+            "matchDescription": "在模型名或渠道名（含站点来源路径）中匹配文字关键词：名称包含关键词即命中，忽略英文字母大小写，任意关键词命中任一名称即可（OR）。不支持正则表达式或通配符。",
+            "notice": "不影响手动添加，也不会删除已有分组成员。",
+            "loading": "正在加载全局黑白名单…",
+            "loadFailed": "加载全局黑白名单失败。",
+            "invalidConfig": "已保存的全局黑白名单配置无效，自动添加已暂停。",
+            "repairHint": "请明确选择一种模式，按需重新填写关键词后保存，以修复配置。",
+            "retry": "重试",
+            "unsupported": "当前后端尚不支持全局黑白名单，请更新后端后再保存。",
+            "activeBlacklist": "全局黑名单已启用",
+            "activeWhitelist": "全局白名单已启用",
+            "modeLabel": "模式",
+            "mode": {
+                "off": "关闭",
+                "blacklist": "黑名单",
+                "whitelist": "白名单"
+            },
+            "modeHint": {
+                "off": "关闭：自动添加不按关键词过滤。",
+                "blacklist": "黑名单：排除命中的项。关键词列表为空时，此过滤器放行所有项。",
+                "whitelist": "白名单：只有命中的项才允许自动添加。"
+            },
+            "keywordsLabel": "关键词",
+            "keywordsPlaceholder": "模型关键词\n渠道或站点来源关键词",
+            "keywordsHint": "每行一个，也可用半角或中文逗号分隔。保存时去除首尾空白、空项，并忽略英文字母大小写去重。最多 100 个关键词，每词最多 200 个 Unicode 字符。",
+            "tooManyKeywords": "去重后最多允许 100 个关键词。",
+            "keywordTooLong": "每个关键词最多允许 200 个 Unicode 字符。",
+            "whitelistEmptyWarning": "白名单为空：“自动添加”和后台自动分组将不会添加任何项。",
+            "save": "保存",
+            "saving": "保存中…",
+            "cancel": "取消",
+            "close": "关闭",
+            "saved": "全局黑白名单已保存",
+            "saveFailed": "保存失败，当前弹窗中的修改已保留，请重试。"
+        },
         "autoGroup": {
             "title": "自动分组配置",
             "description": "将渠道或站点分组加入列表后，系统会按模型组名称或正则自动把模型加入匹配的模型组。",

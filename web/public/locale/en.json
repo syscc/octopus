@@ -652,6 +652,43 @@
             "noHttpStatus": "No HTTP status"
         },
         "empty": "No groups yet, click the button above to create one",
+        "globalModelFilter": {
+            "title": "Global Blacklist / Whitelist",
+            "description": "Applies to Auto Add and background auto grouping across all groups.",
+            "matchDescription": "Matches plain-text keywords anywhere in model names or channel names (including site source paths). Matching is ASCII case-insensitive; any keyword matching either name is a match (OR). Regular expressions and wildcards are not supported.",
+            "notice": "Manual additions are not filtered. Existing group members will not be removed.",
+            "loading": "Loading global blacklist / whitelist…",
+            "loadFailed": "Failed to load the global blacklist / whitelist.",
+            "invalidConfig": "The saved global blacklist / whitelist is invalid. Automatic additions are blocked.",
+            "repairHint": "Select a mode explicitly and re-enter keywords if needed, then save to repair the configuration.",
+            "retry": "Retry",
+            "unsupported": "This backend does not support the global blacklist / whitelist yet. Update the backend before saving.",
+            "activeBlacklist": "Global blacklist is active",
+            "activeWhitelist": "Global whitelist is active",
+            "modeLabel": "Mode",
+            "mode": {
+                "off": "Off",
+                "blacklist": "Blacklist",
+                "whitelist": "Whitelist"
+            },
+            "modeHint": {
+                "off": "Off: no keyword filtering is applied to automatic additions.",
+                "blacklist": "Blacklist: exclude matching items. An empty keyword list allows all items through this filter.",
+                "whitelist": "Whitelist: only matching items can be added automatically."
+            },
+            "keywordsLabel": "Keywords",
+            "keywordsPlaceholder": "Model keyword\nChannel or site source keyword",
+            "keywordsHint": "One keyword per line, or separate with commas (including Chinese commas). Saving trims whitespace, removes empty entries and deduplicates ignoring ASCII letter case. Maximum 100 keywords, 200 Unicode characters each.",
+            "tooManyKeywords": "Use no more than 100 keywords after deduplication.",
+            "keywordTooLong": "Each keyword must contain no more than 200 Unicode characters.",
+            "whitelistEmptyWarning": "The whitelist is empty: no items will be added by Auto Add or background auto grouping.",
+            "save": "Save",
+            "saving": "Saving…",
+            "cancel": "Cancel",
+            "close": "Close",
+            "saved": "Global blacklist / whitelist saved",
+            "saveFailed": "Failed to save. Your changes are still in this dialog; please try again."
+        },
         "autoGroup": {
             "title": "Auto Group Configuration",
             "description": "Add channels or site groups to the list, and the system will automatically add models to matching model groups by group name or regex.",

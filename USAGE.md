@@ -311,6 +311,17 @@ In the "Add Models" area:
 
 > Example: A group named `gpt-5.5` — click "Auto Add" to pull in all models matching `gpt-5.5` from various channels. In weighted mode, you can also set weights for each member.
 
+#### Global Blacklist / Whitelist
+
+Open **Global Blacklist / Whitelist** in the top-right group toolbar to apply one policy to all groups:
+
+- **Off**: keep the existing group-name / regex matching without extra filtering.
+- **Blocklist**: do not automatically add candidates whose model name or channel name contains any keyword.
+- **Allowlist**: only automatically add candidates whose model name or channel name contains at least one keyword; the group's existing matching rules must still match.
+- Enter multiple keywords, one per line or separated by commas (including Chinese commas). Commas and line breaks are separators, not part of a keyword. Matching ignores ASCII letter case and trims whitespace; duplicates are removed. Keywords are literal substrings, not regular expressions or wildcards. A name prefix matches all model names containing that prefix.
+- Up to 100 keywords, with at most 200 characters each. An empty blocklist adds no restriction; **an empty allowlist allows no automatic additions**.
+- The same policy applies to **Auto Add** in group creation, group editing, and preset editing, and to background **Auto Group**. **Existing members, manual additions, preset activation, and ordinary saves are not restricted or removed**.
+
 ### 7.3 Auto-Group Configuration (Auto-Classify Newly Added Upstream Models)
 
 Relay sites may add new models over time. In the **"Auto-Group Configuration"** on the Groups page, you can have new models automatically assigned to matching groups:
