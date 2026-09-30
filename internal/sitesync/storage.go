@@ -145,7 +145,9 @@ func persistSyncSnapshot(ctx context.Context, accountID int, snapshot *syncSnaps
 			"balance_used":      snapshot.balanceUsed,
 			"today_income":      snapshot.todayIncome,
 		}
-		if strings.TrimSpace(snapshot.accessToken) != "" {
+		// Sub2API session refresh persists rotated credentials independently of sync.
+		// A concurrent sync may still hold the previous access token in its snapshot.
+		if accountSite.Platform != model.SitePlatformSub2API && strings.TrimSpace(snapshot.accessToken) != "" {
 			updatePayload["access_token"] = strings.TrimSpace(snapshot.accessToken)
 		}
 		if err := tx.Model(&model.SiteAccount{}).Where("id = ?", accountID).Updates(updatePayload).Error; err != nil {

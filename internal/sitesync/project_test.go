@@ -794,6 +794,64 @@ func TestProjectAccountNormalizesProjectedChannelKeys(t *testing.T) {
 	}
 }
 
+func TestProjectAccountProjectsNewAPIAutoGroupModels(t *testing.T) {
+	ctx := setupProjectTestDB(t)
+	_, account := createProjectionFixture(t, ctx)
+
+	autoGroup := model.SiteUserGroup{
+		SiteAccountID:          account.ID,
+		GroupKey:               "auto",
+		Name:                   "auto",
+		ModelSyncStatus:        model.SiteGroupModelSyncStatusSynced,
+		ModelSyncAuthoritative: true,
+	}
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&autoGroup).Error; err != nil {
+		t.Fatalf("create auto group failed: %v", err)
+	}
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&model.SiteToken{
+		SiteAccountID: account.ID,
+		Name:          "auto-key",
+		Token:         "auto-key",
+		GroupKey:      "auto",
+		GroupName:     "auto",
+		Enabled:       true,
+	}).Error; err != nil {
+		t.Fatalf("create auto token failed: %v", err)
+	}
+	metadata := model.SiteModelRouteMetadata{
+		Source:         "/api/pricing",
+		RouteSupported: true,
+		RouteType:      model.SiteModelRouteTypeOpenAIChat,
+		EnableGroups:   []string{"default"},
+	}.Marshal()
+	if err := dbpkg.GetDB().WithContext(ctx).Create(&model.SiteModel{
+		SiteAccountID:   account.ID,
+		GroupKey:        "auto",
+		ModelName:       "auto-model",
+		Source:          "sync",
+		RouteType:       model.SiteModelRouteTypeOpenAIChat,
+		RouteSource:     model.SiteModelRouteSourceSyncInferred,
+		RouteRawPayload: metadata,
+	}).Error; err != nil {
+		t.Fatalf("create auto model failed: %v", err)
+	}
+
+	if _, err := ProjectAccount(ctx, account.ID); err != nil {
+		t.Fatalf("ProjectAccount failed: %v", err)
+	}
+	channelsByGroup := loadProjectedChannelsByGroupKey(t, ctx, account.ID)
+	autoChannel, ok := channelsByGroup["auto"]
+	if !ok {
+		t.Fatalf("expected projected auto channel, got %#v", channelsByGroup)
+	}
+	if autoChannel.Model != "auto-model" {
+		t.Fatalf("expected auto channel to contain auto model, got %q", autoChannel.Model)
+	}
+	if autoChannel.Name != "Projection Site/Primary Account/auto-Chat" {
+		t.Fatalf("expected projected auto channel name, got %q", autoChannel.Name)
+	}
+}
+
 func TestProjectAccountSkipsMaskedPendingTokens(t *testing.T) {
 	ctx := setupProjectTestDB(t)
 	_, account := createProjectionFixture(t, ctx)

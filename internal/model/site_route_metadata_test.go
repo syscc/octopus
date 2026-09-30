@@ -63,3 +63,27 @@ func TestParseSiteModelRouteMetadataRejectsArbitraryPayload(t *testing.T) {
 		t.Fatalf("expected foreign metadata payload to be rejected")
 	}
 }
+
+func TestSiteModelBelongsToGroupTreatsNewAPIAutoAsVirtualGroup(t *testing.T) {
+	payload := SiteModelRouteMetadata{
+		Source:         "/api/pricing",
+		RouteSupported: true,
+		RouteType:      SiteModelRouteTypeOpenAIChat,
+		EnableGroups:   []string{"low-cost"},
+	}.Marshal()
+	item := SiteModel{GroupKey: "auto", RouteRawPayload: payload}
+
+	if !SiteModelBelongsToGroup(item, "auto", SitePlatformNewAPI) {
+		t.Fatal("expected New API auto group to include the model")
+	}
+	if SiteModelBelongsToGroup(item, "default", SitePlatformNewAPI) {
+		t.Fatal("expected an unmatched regular group to exclude the model")
+	}
+	if SiteModelBelongsToGroup(item, "auto", SitePlatformOneAPI) {
+		t.Fatal("expected non-New API auto group to keep explicit-group filtering")
+	}
+	item.GroupKey = "cline"
+	if SiteModelBelongsToGroup(item, "auto", SitePlatformNewAPI) {
+		t.Fatal("expected a regular group's model not to leak into New API auto")
+	}
+}

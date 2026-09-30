@@ -48,6 +48,11 @@ export function translateApiErrorCode(
     fallback: string,
     values?: ErrorValues,
 ): string {
+    const refreshFailure = values?.sub2apiRefreshFailure;
+    if (typeof refreshFailure === 'string' && refreshFailure.trim() !== '') {
+        return refreshFailure;
+    }
+
     const normalizedCode = typeof errorCode === 'string' ? errorCode.trim() : '';
     if (!normalizedCode) return fallback;
 

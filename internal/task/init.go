@@ -21,6 +21,7 @@ const (
 	TaskCleanLLM                        = "clean_llm"
 	TaskBaseUrlDelay                    = "base_url_delay"
 	TaskSiteSync                        = "site_sync"
+	TaskSub2APISessionRefresh           = "sub2api_session_refresh"
 	TaskSiteCheckin                     = "site_checkin"
 	TaskSiteCheckinRandom               = "site_checkin_random_due"
 	TaskWSAffinityCleanup               = "ws_affinity_cleanup"
@@ -125,6 +126,7 @@ func Init() {
 
 	// 注册基础URL延迟任务
 	Register(TaskBaseUrlDelay, 24*time.Hour, true, ChannelBaseUrlDelayTask)
+	Register(TaskSub2APISessionRefresh, time.Minute, true, Sub2APISessionRefreshTask)
 
 	priceUpdateIntervalHours, err := op.SettingGetInt(model.SettingKeyModelInfoUpdateInterval)
 	if err != nil {

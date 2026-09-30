@@ -265,6 +265,9 @@ func syncSub2APIWithCreatedToken(ctx context.Context, siteRecord *model.Site, ac
 
 	accessToken, err := ensureFreshSub2APIAccessToken(ctx, siteRecord, account, false)
 	if err != nil {
+		if strings.TrimSpace(account.RefreshToken) != "" {
+			return nil, wrapSub2APIRefreshFailure(nil, err)
+		}
 		return nil, err
 	}
 	snapshot, err := syncSub2APIWithAccessToken(ctx, siteRecord, account, accessToken, createdToken)
@@ -272,6 +275,9 @@ func syncSub2APIWithCreatedToken(ctx context.Context, siteRecord *model.Site, ac
 		refreshedToken, refreshErr := ensureFreshSub2APIAccessToken(ctx, siteRecord, account, true)
 		if refreshErr == nil && stripBearerPrefix(refreshedToken) != stripBearerPrefix(accessToken) {
 			return syncSub2APIWithAccessToken(ctx, siteRecord, account, refreshedToken, createdToken)
+		}
+		if refreshErr != nil {
+			return snapshot, wrapSub2APIRefreshFailure(err, refreshErr)
 		}
 	}
 	return snapshot, err

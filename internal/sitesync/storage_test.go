@@ -10,6 +10,42 @@ import (
 	"github.com/bestruirui/octopus/internal/op"
 )
 
+func TestPersistSyncSnapshotKeepsRotatedSub2APISession(t *testing.T) {
+	ctx := setupProjectTestDB(t)
+	site := &model.Site{Name: "sub2api-snapshot-site", Platform: model.SitePlatformSub2API, BaseURL: "https://example.com", Enabled: true}
+	if err := op.SiteCreate(site, ctx); err != nil {
+		t.Fatal(err)
+	}
+	account := &model.SiteAccount{
+		SiteID:         site.ID,
+		Name:           "snapshot-account",
+		CredentialType: model.SiteCredentialTypeAccessToken,
+		AccessToken:    "old-access",
+		RefreshToken:   "old-refresh",
+		TokenExpiresAt: 1,
+		Enabled:        true,
+	}
+	if err := op.SiteAccountCreate(account, ctx); err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := time.Now().Add(time.Hour).UnixMilli()
+	if err := dbpkg.GetDB().WithContext(ctx).Model(&model.SiteAccount{}).Where("id = ?", account.ID).Updates(map[string]any{
+		"access_token": "rotated-access", "refresh_token": "rotated-refresh", "token_expires_at": expiresAt,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := persistSyncSnapshot(ctx, account.ID, &syncSnapshot{accessToken: "old-access", status: model.SiteExecutionStatusSuccess, message: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	var persisted model.SiteAccount
+	if err := dbpkg.GetDB().WithContext(ctx).First(&persisted, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.AccessToken != "rotated-access" || persisted.RefreshToken != "rotated-refresh" || persisted.TokenExpiresAt != expiresAt {
+		t.Fatal("sync snapshot overwrote the rotated Sub2API credentials")
+	}
+}
+
 func TestSiteMaskedTokenMatchesIgnoresOptionalSKPrefix(t *testing.T) {
 	tests := []struct {
 		name      string

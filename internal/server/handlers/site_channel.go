@@ -108,7 +108,7 @@ func createSiteChannelKey(c *gin.Context) {
 	}
 	if _, err := sitesvc.CreateAccountToken(c.Request.Context(), siteID, accountID, req); err != nil {
 		status := siteChannelMutationErrorStatus(err)
-		resp.ErrorWithAppError(c, status, apperror.Wrap(op.CodeSiteChannelKeyCreateFailed, "site channel key create failed", err).WithStatus(status))
+		resp.ErrorWithAppError(c, status, wrapSiteChannelKeyError(err, status))
 		return
 	}
 	data, err := op.SiteChannelAccountGet(siteID, accountID, c.Request.Context())
@@ -117,6 +117,18 @@ func createSiteChannelKey(c *gin.Context) {
 		return
 	}
 	resp.Success(c, data)
+}
+
+func wrapSiteChannelKeyError(err error, status int) *apperror.Error {
+	wrapped := apperror.Wrap(op.CodeSiteChannelKeyCreateFailed, "site channel key create failed", err).WithStatus(status)
+	if params := apperror.Params(err); len(params) > 0 {
+		copiedParams := make(map[string]any, len(params))
+		for key, value := range params {
+			copiedParams[key] = value
+		}
+		wrapped.WithParams(copiedParams)
+	}
+	return wrapped
 }
 
 func updateSiteSourceKeys(c *gin.Context) {

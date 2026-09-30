@@ -326,20 +326,7 @@ func buildSiteChannelGroups(ctx context.Context, site model.Site, account model.
 }
 
 func siteModelBelongsToGroup(item model.SiteModel, groupKey string, platform model.SitePlatform) bool {
-	if platform == model.SitePlatformCloudflare {
-		return true
-	}
-	metadata, ok := model.ParseSiteModelRouteMetadata(item.RouteRawPayload)
-	if !ok || len(metadata.EnableGroups) == 0 {
-		return true
-	}
-	targetGroupKey := model.NormalizeSiteGroupKey(groupKey)
-	for _, explicitGroupKey := range metadata.EnableGroups {
-		if model.NormalizeSiteGroupKey(explicitGroupKey) == targetGroupKey {
-			return true
-		}
-	}
-	return false
+	return model.SiteModelBelongsToGroup(item, groupKey, platform)
 }
 
 func maskProjectedChannelKey(value string) string {

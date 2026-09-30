@@ -19,6 +19,17 @@ func SiteSyncTask() {
 	site.SyncAll(ctx)
 }
 
+func Sub2APISessionRefreshTask() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	refreshed, err := site.RefreshDueSub2APISessions(ctx)
+	if err != nil {
+		log.Warnf("sub2api session refresh task failed: %v", err)
+	} else if refreshed > 0 {
+		log.Infof("sub2api session refresh task updated %d account(s)", refreshed)
+	}
+}
+
 func SiteCheckinTask() {
 	log.Debugf("site checkin task started")
 	startTime := time.Now()

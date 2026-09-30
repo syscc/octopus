@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bestruirui/octopus/internal/db"
@@ -11,6 +12,31 @@ import (
 )
 
 const sub2APIAccessTokenRefreshLead = 5 * time.Minute
+
+var sub2APIRefreshLocks sync.Map
+
+type sub2APIRefreshLock struct {
+	permit chan struct{}
+}
+
+func newSub2APIRefreshLock() *sub2APIRefreshLock {
+	lock := &sub2APIRefreshLock{permit: make(chan struct{}, 1)}
+	lock.permit <- struct{}{}
+	return lock
+}
+
+func (lock *sub2APIRefreshLock) acquire(ctx context.Context) error {
+	select {
+	case <-lock.permit:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (lock *sub2APIRefreshLock) release() {
+	lock.permit <- struct{}{}
+}
 
 type sub2APIRefreshedCredentials struct {
 	AccessToken    string
@@ -24,19 +50,43 @@ func ensureFreshSub2APIAccessToken(ctx context.Context, siteRecord *model.Site, 
 	}
 
 	accessToken := stripBearerPrefix(account.AccessToken)
-	if accessToken == "" {
+	refreshToken := strings.TrimSpace(account.RefreshToken)
+	if accessToken == "" && refreshToken == "" {
 		return "", newAccessTokenRequiredError()
 	}
-	if !forceRefresh && !shouldProactivelyRefreshSub2API(account) {
+	if refreshToken == "" {
 		return accessToken, nil
 	}
-	if strings.TrimSpace(account.RefreshToken) == "" {
+	if !forceRefresh && accessToken != "" && !shouldProactivelyRefreshSub2API(account) {
 		return accessToken, nil
 	}
 
-	refreshed, err := refreshSub2APIManagedSession(ctx, siteRecord, account, accessToken)
+	if account.ID > 0 {
+		lock, _ := sub2APIRefreshLocks.LoadOrStore(account.ID, newSub2APIRefreshLock())
+		refreshLock := lock.(*sub2APIRefreshLock)
+		if err := refreshLock.acquire(ctx); err != nil {
+			return "", err
+		}
+		defer refreshLock.release()
+
+		var persisted model.SiteAccount
+		if err := db.GetDB().WithContext(ctx).Select("id", "access_token", "refresh_token", "token_expires_at").First(&persisted, account.ID).Error; err != nil {
+			return "", fmt.Errorf("failed to load sub2api session: %w", err)
+		}
+		if persisted.AccessToken != account.AccessToken || persisted.RefreshToken != refreshToken || persisted.TokenExpiresAt != account.TokenExpiresAt {
+			account.AccessToken = persisted.AccessToken
+			account.RefreshToken = persisted.RefreshToken
+			account.TokenExpiresAt = persisted.TokenExpiresAt
+			if persistedAccessToken := stripBearerPrefix(persisted.AccessToken); persistedAccessToken != "" {
+				return persistedAccessToken, nil
+			}
+			return "", newAccessTokenRequiredError()
+		}
+	}
+
+	refreshed, err := refreshSub2APIManagedSession(ctx, siteRecord, account)
 	if err != nil {
-		if forceRefresh {
+		if forceRefresh || accessToken == "" || (account.TokenExpiresAt > 0 && account.TokenExpiresAt <= time.Now().UnixMilli()) {
 			return "", err
 		}
 		return accessToken, nil
@@ -74,7 +124,7 @@ func shouldRetrySub2APIAfterRefresh(err error, account *model.SiteAccount) bool 
 		strings.Contains(text, "access token")
 }
 
-func refreshSub2APIManagedSession(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount, currentAccessToken string) (string, error) {
+func refreshSub2APIManagedSession(ctx context.Context, siteRecord *model.Site, account *model.SiteAccount) (string, error) {
 	if siteRecord == nil || account == nil {
 		return "", fmt.Errorf("site or account is nil")
 	}
@@ -87,13 +137,18 @@ func refreshSub2APIManagedSession(ctx context.Context, siteRecord *model.Site, a
 		"Content-Type":             "application/json",
 		sub2APIUserUIRequestHeader: "1",
 	}
-	if currentAccessToken = stripBearerPrefix(currentAccessToken); currentAccessToken != "" {
-		headers["Authorization"] = ensureBearer(currentAccessToken)
+	// The public refresh endpoint authenticates using the refresh_token body only.
+	refreshSite := *siteRecord
+	refreshSite.CustomHeader = nil
+	for _, header := range siteRecord.CustomHeader {
+		if !strings.EqualFold(strings.TrimSpace(header.HeaderKey), "Authorization") {
+			refreshSite.CustomHeader = append(refreshSite.CustomHeader, header)
+		}
 	}
 
 	payload, err := requestJSON(
 		ctx,
-		siteRecord,
+		&refreshSite,
 		"POST",
 		buildSiteURL(siteRecord.BaseURL, "/api/v1/auth/refresh"),
 		map[string]any{"refresh_token": refreshToken},
@@ -103,28 +158,52 @@ func refreshSub2APIManagedSession(ctx context.Context, siteRecord *model.Site, a
 	if err != nil {
 		return "", fmt.Errorf("sub2api token refresh request failed: %w", err)
 	}
+	if _, err := unwrapSub2APIData(payload, "/api/v1/auth/refresh"); err != nil {
+		return "", fmt.Errorf("sub2api token refresh failed: %w", err)
+	}
 
 	refreshed, ok := parseSub2APIRefreshPayload(payload)
 	if !ok {
 		return "", fmt.Errorf("sub2api token refresh failed")
 	}
 
-	account.AccessToken = refreshed.AccessToken
-	account.RefreshToken = refreshed.RefreshToken
-	account.TokenExpiresAt = refreshed.TokenExpiresAt
-
 	if account.ID > 0 {
-		if err := db.GetDB().WithContext(ctx).
+		result := db.GetDB().WithContext(ctx).
 			Model(&model.SiteAccount{}).
-			Where("id = ?", account.ID).
+			Where("id = ? AND access_token = ? AND refresh_token = ? AND token_expires_at = ?", account.ID, account.AccessToken, refreshToken, account.TokenExpiresAt).
 			Updates(map[string]any{
 				"access_token":     refreshed.AccessToken,
 				"refresh_token":    refreshed.RefreshToken,
 				"token_expires_at": refreshed.TokenExpiresAt,
-			}).Error; err != nil {
-			return "", fmt.Errorf("failed to persist sub2api refreshed session: %w", err)
+			})
+		if result.Error != nil {
+			return "", fmt.Errorf("failed to persist sub2api refreshed session: %w", result.Error)
+		}
+		if result.RowsAffected != 1 {
+			// Preserve concurrent access/expiry edits. The consumed refresh token
+			// must still be rotated unless another writer already replaced it.
+			if err := db.GetDB().WithContext(ctx).
+				Model(&model.SiteAccount{}).
+				Where("id = ? AND refresh_token = ?", account.ID, refreshToken).
+				Update("refresh_token", refreshed.RefreshToken).Error; err != nil {
+				return "", fmt.Errorf("failed to persist sub2api refreshed session: %w", err)
+			}
+			var current model.SiteAccount
+			if err := db.GetDB().WithContext(ctx).Select("id", "access_token", "refresh_token", "token_expires_at").First(&current, account.ID).Error; err != nil {
+				return "", fmt.Errorf("failed to load sub2api refreshed session: %w", err)
+			}
+			account.AccessToken = current.AccessToken
+			account.RefreshToken = current.RefreshToken
+			account.TokenExpiresAt = current.TokenExpiresAt
+			if accessToken := stripBearerPrefix(current.AccessToken); accessToken != "" {
+				return accessToken, nil
+			}
+			return "", newAccessTokenRequiredError()
 		}
 	}
+	account.AccessToken = refreshed.AccessToken
+	account.RefreshToken = refreshed.RefreshToken
+	account.TokenExpiresAt = refreshed.TokenExpiresAt
 
 	return refreshed.AccessToken, nil
 }

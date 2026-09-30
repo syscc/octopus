@@ -109,6 +109,32 @@ func NormalizeSiteModelRouteMetadataGroupKeys(values []string) []string {
 	return result
 }
 
+// SiteModelBelongsToGroup reports whether a synchronized model should be
+// presented/projected under groupKey. New API's auto group is a virtual group:
+// its model list is resolved by the upstream from the other groups, so the
+// pricing metadata's explicit group list must not exclude the auto view.
+func SiteModelBelongsToGroup(item SiteModel, groupKey string, platform SitePlatform) bool {
+	if platform == SitePlatformCloudflare {
+		return true
+	}
+	targetGroupKey := NormalizeSiteGroupKey(groupKey)
+	if platform == SitePlatformNewAPI &&
+		strings.EqualFold(targetGroupKey, "auto") &&
+		strings.EqualFold(NormalizeSiteGroupKey(item.GroupKey), "auto") {
+		return true
+	}
+	metadata, ok := ParseSiteModelRouteMetadata(item.RouteRawPayload)
+	if !ok || len(metadata.EnableGroups) == 0 {
+		return true
+	}
+	for _, explicitGroupKey := range metadata.EnableGroups {
+		if NormalizeSiteGroupKey(explicitGroupKey) == targetGroupKey {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeRouteMetadataStrings(values []string) []string {
 	if len(values) == 0 {
 		return nil

@@ -28,6 +28,10 @@ func SyncAll(ctx context.Context) {
 	sitesync.SyncAll(ctx)
 }
 
+func RefreshDueSub2APISessions(ctx context.Context) (int, error) {
+	return sitesync.RefreshDueSub2APISessions(ctx)
+}
+
 func SyncAllWithOptions(ctx context.Context, opts sitesync.SiteBatchOptions) sitesync.SiteBatchSummary {
 	return sitesync.SyncAllWithOptions(ctx, opts)
 }

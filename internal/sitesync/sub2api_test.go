@@ -2,13 +2,261 @@ package sitesync
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/bestruirui/octopus/internal/db"
 	"github.com/bestruirui/octopus/internal/model"
 )
+
+func TestSub2APIRefreshPersistsRotatedSessionWithoutOldBearer(t *testing.T) {
+	ctx := setupProjectTestDB(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/auth/refresh" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "" || r.Header.Get(sub2APIUserUIRequestHeader) != "1" || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("X-Site-Test") != "preserved" {
+			t.Errorf("unexpected refresh headers: %v", r.Header)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["refresh_token"] != "old-refresh" {
+			t.Errorf("unexpected refresh body: %v, %v", body, err)
+		}
+		_, _ = w.Write([]byte(`{"code":0,"data":{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}}`))
+	}))
+	defer server.Close()
+	site := &model.Site{Name: "refresh-test-site", Platform: model.SitePlatformSub2API, BaseURL: server.URL}
+	if err := db.GetDB().Create(site).Error; err != nil {
+		t.Fatal(err)
+	}
+	account := &model.SiteAccount{SiteID: site.ID, Name: "refresh-test", CredentialType: model.SiteCredentialTypeAccessToken, AccessToken: "old-access", RefreshToken: "old-refresh", TokenExpiresAt: 1}
+	if err := db.GetDB().Create(account).Error; err != nil {
+		t.Fatal(err)
+	}
+	refreshSite := &model.Site{BaseURL: server.URL, CustomHeader: []model.CustomHeader{
+		{HeaderKey: " authorization ", HeaderValue: "Bearer obsolete-access"},
+		{HeaderKey: "X-Site-Test", HeaderValue: "preserved"},
+	}}
+	token, err := ensureFreshSub2APIAccessToken(ctx, refreshSite, account, false)
+	if err != nil || token != "new-access" {
+		t.Fatalf("refresh: token=%q err=%v", token, err)
+	}
+	var persisted model.SiteAccount
+	if err := db.GetDB().First(&persisted, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.AccessToken != token || persisted.RefreshToken != "new-refresh" || persisted.TokenExpiresAt <= 1 {
+		t.Fatalf("session not persisted together: %+v", persisted)
+	}
+	if len(refreshSite.CustomHeader) != 2 {
+		t.Fatalf("refresh changed original site custom headers: %+v", refreshSite.CustomHeader)
+	}
+}
+
+func TestSub2APIUsesPersistedSessionAfterConcurrentRotation(t *testing.T) {
+	ctx := setupProjectTestDB(t)
+	refreshCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls++
+		t.Errorf("stale credentials were refreshed after the DB session changed: %s", r.URL.Path)
+	}))
+	defer server.Close()
+
+	site := &model.Site{Name: "concurrent-refresh-site", Platform: model.SitePlatformSub2API, BaseURL: server.URL}
+	if err := db.GetDB().Create(site).Error; err != nil {
+		t.Fatal(err)
+	}
+	account := &model.SiteAccount{
+		SiteID:         site.ID,
+		Name:           "concurrent-refresh",
+		CredentialType: model.SiteCredentialTypeAccessToken,
+		AccessToken:    "old-access",
+		RefreshToken:   "old-refresh",
+		TokenExpiresAt: 1,
+	}
+	if err := db.GetDB().Create(account).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	latestExpiresAt := time.Now().Add(time.Hour).UnixMilli()
+	if err := db.GetDB().Model(&model.SiteAccount{}).Where("id = ?", account.ID).Updates(map[string]any{
+		"access_token":     "latest-access",
+		"refresh_token":    "latest-refresh",
+		"token_expires_at": latestExpiresAt,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	token, err := ensureFreshSub2APIAccessToken(ctx, &model.Site{BaseURL: server.URL}, account, true)
+	if err != nil {
+		t.Fatalf("use persisted session: %v", err)
+	}
+	if token != "latest-access" || account.AccessToken != "latest-access" || account.RefreshToken != "latest-refresh" || account.TokenExpiresAt != latestExpiresAt {
+		t.Fatalf("latest persisted session was not adopted: token=%q account=%+v", token, account)
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("expected no upstream refresh with stale credentials, got %d calls", refreshCalls)
+	}
+}
+
+func TestSub2APIRefreshDoesNotOverwriteManualAccessTokenDuringRequest(t *testing.T) {
+	ctx := setupProjectTestDB(t)
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	release := func() {
+		select {
+		case <-releaseRefresh:
+		default:
+			close(releaseRefresh)
+		}
+	}
+	refreshCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/auth/refresh" {
+			http.NotFound(w, r)
+			return
+		}
+		refreshCalls++
+		if r.Header.Get("Authorization") != "" {
+			t.Errorf("refresh request leaked the old bearer: %q", r.Header.Get("Authorization"))
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["refresh_token"] != "stable-refresh" {
+			t.Errorf("unexpected refresh payload: %+v, %v", body, err)
+		}
+		close(refreshStarted)
+		<-releaseRefresh
+		_, _ = w.Write([]byte(`{"code":0,"data":{"access_token":"old-refresh-response-access","refresh_token":"rotated-refresh","expires_in":3600}}`))
+	}))
+	defer func() {
+		release()
+		server.Close()
+	}()
+
+	site := &model.Site{Name: "manual-access-during-refresh", Platform: model.SitePlatformSub2API, BaseURL: server.URL}
+	if err := db.GetDB().Create(site).Error; err != nil {
+		t.Fatal(err)
+	}
+	account := &model.SiteAccount{
+		SiteID:         site.ID,
+		Name:           "manual-access-during-refresh",
+		CredentialType: model.SiteCredentialTypeAccessToken,
+		AccessToken:    "old-access",
+		RefreshToken:   "stable-refresh",
+		TokenExpiresAt: 1,
+	}
+	if err := db.GetDB().Create(account).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	type refreshResult struct {
+		token string
+		err   error
+	}
+	result := make(chan refreshResult, 1)
+	go func() {
+		token, err := ensureFreshSub2APIAccessToken(ctx, &model.Site{BaseURL: server.URL}, account, true)
+		result <- refreshResult{token: token, err: err}
+	}()
+
+	select {
+	case <-refreshStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the refresh request")
+	}
+	if err := db.GetDB().WithContext(ctx).Model(&model.SiteAccount{}).Where("id = ?", account.ID).Update("access_token", "manual-access").Error; err != nil {
+		t.Fatal(err)
+	}
+	release()
+
+	select {
+	case refreshed := <-result:
+		if refreshed.err != nil {
+			t.Fatalf("refresh: %v", refreshed.err)
+		}
+		if refreshed.token != "manual-access" {
+			t.Fatalf("expected manually updated access token, got %q", refreshed.token)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for refresh completion")
+	}
+	var persisted model.SiteAccount
+	if err := db.GetDB().WithContext(ctx).First(&persisted, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.AccessToken != "manual-access" || persisted.RefreshToken != "rotated-refresh" {
+		t.Fatalf("manual credentials were overwritten by stale refresh response: %+v", persisted)
+	}
+	if persisted.TokenExpiresAt != 1 || account.TokenExpiresAt != 1 {
+		t.Fatal("manual access token was assigned the discarded access token's expiry")
+	}
+	if account.AccessToken != "manual-access" || account.RefreshToken != "rotated-refresh" {
+		t.Fatalf("in-memory credentials did not preserve the manual access token and rotated refresh token: %+v", account)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("expected exactly one upstream refresh request, got %d", refreshCalls)
+	}
+}
+
+func TestSub2APIRefreshReportsNonZeroCodeMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/auth/refresh" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":401,"message":"refresh token expired","data":null}`))
+	}))
+	defer server.Close()
+
+	_, err := refreshSub2APIManagedSession(context.Background(), &model.Site{BaseURL: server.URL}, &model.SiteAccount{
+		CredentialType: model.SiteCredentialTypeAccessToken,
+		RefreshToken:   "expired-refresh",
+	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "refresh token expired") {
+		t.Fatalf("expected non-zero refresh code reason, got %v", err)
+	}
+}
+
+func TestSyncSub2APIReportsRefreshFailure(t *testing.T) {
+	accessRequests := 0
+	refreshCalls := 0
+	requests := make([]string, 0, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		requests = append(requests, r.URL.Path)
+		if r.URL.Path == "/api/v1/auth/refresh" {
+			refreshCalls++
+			if r.Header.Get("Authorization") != "" {
+				t.Errorf("fallback refresh must not use the old access token")
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"refresh token expired"}`))
+			return
+		}
+		accessRequests++
+		if r.Header.Get("Authorization") != "Bearer old-access" {
+			t.Errorf("initial sync must use the existing access token, got %q", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"access token expired"}`))
+	}))
+	defer server.Close()
+	_, err := syncSub2API(context.Background(), &model.Site{BaseURL: server.URL}, &model.SiteAccount{CredentialType: model.SiteCredentialTypeAccessToken, AccessToken: "old-access", RefreshToken: "old-refresh"})
+	if err == nil || !strings.Contains(err.Error(), "refresh token expired") || !strings.Contains(err.Error(), "access token expired") {
+		t.Fatalf("expected both original and refresh errors, got %v", err)
+	}
+	if len(requests) == 0 || requests[0] == "/api/v1/auth/refresh" {
+		t.Fatalf("expected the initial sync request before fallback refresh, requests=%v", requests)
+	}
+	if accessRequests == 0 || refreshCalls != 1 {
+		t.Fatalf("expected initial 401 path and one fallback refresh, access=%d refresh=%d requests=%v", accessRequests, refreshCalls, requests)
+	}
+}
 
 func TestSyncSub2APIUsesManagedKeyAndAPIModelEndpoint(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

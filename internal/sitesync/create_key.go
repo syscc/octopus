@@ -161,6 +161,9 @@ func createSub2APIToken(ctx context.Context, siteRecord *model.Site, account *mo
 	accessToken := strings.TrimSpace(account.AccessToken)
 	accessToken, err := ensureFreshSub2APIAccessToken(ctx, siteRecord, account, false)
 	if err != nil {
+		if strings.TrimSpace(account.RefreshToken) != "" {
+			return nil, wrapSub2APIRefreshFailure(nil, err)
+		}
 		return nil, err
 	}
 
@@ -182,6 +185,9 @@ func createSub2APIToken(ctx context.Context, siteRecord *model.Site, account *mo
 		if err != nil {
 			if shouldRetrySub2APIAfterRefresh(err, account) {
 				refreshedToken, refreshErr := ensureFreshSub2APIAccessToken(ctx, siteRecord, account, true)
+				if refreshErr != nil {
+					return nil, wrapSub2APIRefreshFailure(err, refreshErr)
+				}
 				if refreshErr == nil && stripBearerPrefix(refreshedToken) != stripBearerPrefix(accessToken) {
 					headers = sub2APIUserHeaders(refreshedToken)
 					payload, err = requestJSON(
