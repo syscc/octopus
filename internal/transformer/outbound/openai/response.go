@@ -401,7 +401,7 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 	case "response.output_text.delta":
 		o.mergeOutputTextDelta(streamEvent)
 		if streamEvent.Delta != "" {
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindTextDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Text: streamEvent.Delta}})
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindTextDelta, ID: base.ID, Model: base.Model, Index: base.Index, OutputIndex: lo.ToPtr(streamEvent.OutputIndex), Delta: &model.StreamDelta{Text: streamEvent.Delta}, ContentBlock: &model.StreamContentBlock{Type: "message", ID: o.outputItems[streamEvent.OutputIndex].ID}})
 		}
 
 	case "response.function_call_arguments.delta":
@@ -415,8 +415,8 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 					Name: streamEvent.Name,
 				},
 			}
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStart, ID: base.ID, Model: base.Model, Index: base.Index, ToolCall: &toolCall, ContentBlock: &model.StreamContentBlock{Type: "function_call", ID: lo.FromPtr(streamEvent.ItemID)}})
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallDelta, ID: base.ID, Model: base.Model, Index: base.Index, ToolCall: &toolCall, Delta: &model.StreamDelta{Arguments: streamEvent.Delta}})
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStart, ID: base.ID, Model: base.Model, Index: base.Index, OutputIndex: lo.ToPtr(streamEvent.OutputIndex), ToolCall: &toolCall, ContentBlock: &model.StreamContentBlock{Type: "function_call", ID: lo.FromPtr(streamEvent.ItemID)}})
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallDelta, ID: base.ID, Model: base.Model, Index: base.Index, OutputIndex: lo.ToPtr(streamEvent.OutputIndex), ToolCall: &toolCall, Delta: &model.StreamDelta{Arguments: streamEvent.Delta}})
 		}
 
 	case "response.output_item.added":
@@ -430,18 +430,18 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 					Name: streamEvent.Item.Name,
 				},
 			}
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStart, ID: base.ID, Model: base.Model, Index: base.Index, ToolCall: &toolCall, ContentBlock: &model.StreamContentBlock{Type: "function_call", ID: streamEvent.Item.ID}})
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStart, ID: base.ID, Model: base.Model, Index: base.Index, OutputIndex: lo.ToPtr(streamEvent.OutputIndex), ToolCall: &toolCall, ContentBlock: &model.StreamContentBlock{Type: "function_call", ID: streamEvent.Item.ID}})
 		}
 
 	case "response.reasoning_summary_text.delta":
 		o.mergeReasoningDelta(streamEvent)
 		if streamEvent.Delta != "" {
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindThinkingDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Thinking: streamEvent.Delta}})
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindThinkingDelta, ID: base.ID, Model: base.Model, Index: base.Index, OutputIndex: lo.ToPtr(streamEvent.OutputIndex), Delta: &model.StreamDelta{Thinking: streamEvent.Delta}, ContentBlock: &model.StreamContentBlock{Type: "reasoning", ID: o.outputItems[streamEvent.OutputIndex].ID}})
 		}
 
 	case "response.refusal.delta":
 		if streamEvent.Delta != "" {
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindTextDelta, ID: base.ID, Model: base.Model, Index: base.Index, Delta: &model.StreamDelta{Refusal: streamEvent.Delta}})
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindTextDelta, ID: base.ID, Model: base.Model, Index: base.Index, OutputIndex: lo.ToPtr(streamEvent.OutputIndex), Delta: &model.StreamDelta{Refusal: streamEvent.Delta}, ContentBlock: &model.StreamContentBlock{Type: "message", ID: firstNonEmpty(lo.FromPtr(streamEvent.ItemID), o.outputItems[streamEvent.OutputIndex].ID)}})
 		}
 
 	case "response.refusal.done":
@@ -1791,6 +1791,7 @@ func (o *ResponseOutbound) mergeOutputTextDelta(event ResponsesStreamEvent) {
 	if item.Type != "message" {
 		return
 	}
+	item.ID = firstNonEmpty(lo.FromPtr(event.ItemID), item.ID)
 	if item.Content == nil {
 		item.Content = &ResponsesInput{}
 	}
@@ -1833,6 +1834,7 @@ func (o *ResponseOutbound) mergeReasoningDelta(event ResponsesStreamEvent) {
 	if item.Type != "reasoning" {
 		return
 	}
+	item.ID = firstNonEmpty(lo.FromPtr(event.ItemID), item.ID)
 	summaryIndex := 0
 	if event.SummaryIndex != nil && *event.SummaryIndex >= 0 {
 		summaryIndex = *event.SummaryIndex
@@ -1934,8 +1936,8 @@ func ensureResponsesReasoningSummary(item *ResponsesItem) {
 	}
 }
 
-// NormalizeResponsesRequestFunctionCallIDs repairs existing invalid function-call
-// IDs in native requests. Missing optional IDs and unrelated fields are preserved.
+// NormalizeResponsesRequestFunctionCallIDs repairs existing invalid message,
+// reasoning and function-call IDs. Missing optional IDs and unrelated fields are preserved.
 func NormalizeResponsesRequestFunctionCallIDs(raw []byte) ([]byte, error) {
 	spans, _, _, err := findTopLevelFieldSpans(raw, "input", false)
 	if err != nil {
@@ -1965,14 +1967,26 @@ func normalizeResponsesRawFunctionCallIDs(raw json.RawMessage, fillMissing bool)
 			continue
 		}
 		item := items[index]
-		if decodeRawString(item["type"]) != "function_call" {
+		itemType := decodeRawString(item["type"])
+		if _, hasType := item["type"]; !hasType && decodeRawString(item["role"]) != "" && len(item["content"]) > 0 {
+			itemType = "message"
+		}
+		prefix := ""
+		switch itemType {
+		case "function_call":
+			prefix = "fc_"
+		case "message":
+			prefix = "msg_"
+		case "reasoning":
+			prefix = "rs_"
+		default:
 			continue
 		}
 		oldID := decodeRawString(item["id"])
-		if strings.HasPrefix(oldID, "fc_") || (oldID == "" && (!fillMissing || decodeRawString(item["call_id"]) == "")) {
+		if strings.HasPrefix(oldID, prefix) || (oldID == "" && (itemType != "function_call" || !fillMissing || decodeRawString(item["call_id"]) == "")) {
 			continue
 		}
-		newID := generateResponsesItemID()
+		newID := prefix + strings.TrimPrefix(generateResponsesItemID(), "fc_")
 		item["id"], _ = json.Marshal(newID)
 		dirty[index] = true
 		if oldID != "" {

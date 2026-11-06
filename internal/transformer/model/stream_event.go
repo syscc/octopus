@@ -30,7 +30,10 @@ type StreamEvent struct {
 	Model   string `json:"model,omitempty"`
 	Created int64  `json:"created,omitempty"`
 	Index   int    `json:"index,omitempty"`
-	Role    string `json:"role,omitempty"`
+	// OutputIndex preserves native Responses item positions independently of
+	// the generic choice/tool index carried by Index.
+	OutputIndex *int   `json:"output_index,omitempty"`
+	Role        string `json:"role,omitempty"`
 
 	ContentBlock *StreamContentBlock `json:"content_block,omitempty"`
 	Delta        *StreamDelta        `json:"delta,omitempty"`

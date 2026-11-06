@@ -39,10 +39,15 @@ type ResponseInbound struct {
 	terminalProviderExtensions *model.ProviderExtensions
 
 	// Content tracking
-	outputIndex    int
-	contentIndex   int
-	sequenceNumber int
-	currentItemID  string
+	outputIndex            int
+	contentIndex           int
+	sequenceNumber         int
+	currentItemID          string
+	nextContentItemID      string
+	nextContentOutputIndex *int
+	contentOutputIndex     int
+	currentContentNative   bool
+	suspendedNativeContent map[string]*responseContentState
 
 	// messageContentOrder preserves the order content parts were emitted so
 	// closeMessageItem can rebuild the final ResponsesInput.Items array with
@@ -50,9 +55,9 @@ type ResponseInbound struct {
 	messageContentOrder []string
 
 	// Content accumulation
-	accumulatedText      strings.Builder
-	accumulatedReasoning strings.Builder
-	accumulatedRefusal   strings.Builder
+	accumulatedText      *strings.Builder
+	accumulatedReasoning *strings.Builder
+	accumulatedRefusal   *strings.Builder
 
 	// reasoningBlockSignatures preserves per-thinking-block signatures in
 	// arrival order. 0 → no encrypted_content, 1 → raw string (common case),
@@ -76,14 +81,67 @@ type ResponseInbound struct {
 	// completedOutputItemIndex retains assigned indices when items close in a
 	// different order; native passthrough arrays keep their own ordering.
 	completedOutputItemIndex map[string]int
-	// terminalToolItemIDs also includes IDs resolved for raw-only tool items so
+	// terminalResolvedItems also includes IDs resolved for raw-only items so
 	// replay storage can use exactly the IDs returned in the terminal event.
-	terminalToolItemIDs          map[string][]string
+	terminalResolvedItems        []ResponsesItem
+	terminalRawItemMatches       []int
 	preservePassthroughOutputIDs bool
+	passthroughOpenItems         []responsesRawOpenItem
 
 	streamAggregator model.StreamAggregator
 	// storedResponse stores the non-stream response
 	storedResponse *model.InternalLLMResponse
+}
+
+// responseContentState retains an open native item while another output item
+// receives deltas. Builders stay at stable addresses when the item is resumed.
+type responseContentState struct {
+	id                                                            string
+	outputIndex, contentIndex                                     int
+	messageStarted, reasoningStarted, textStarted, refusalStarted bool
+	text, reasoning, refusal                                      *strings.Builder
+	contentOrder, signatures                                      []string
+}
+
+func (i *ResponseInbound) ensureContentBuilders() {
+	if i.accumulatedText == nil {
+		i.accumulatedText = &strings.Builder{}
+		i.accumulatedReasoning = &strings.Builder{}
+		i.accumulatedRefusal = &strings.Builder{}
+	}
+}
+
+func (i *ResponseInbound) suspendNativeContentItem() {
+	if !i.currentContentNative || (!i.hasMessageItemStarted && !i.hasReasoningItemStarted) {
+		return
+	}
+	if i.suspendedNativeContent == nil {
+		i.suspendedNativeContent = make(map[string]*responseContentState)
+	}
+	i.suspendedNativeContent[i.currentItemID] = &responseContentState{
+		id: i.currentItemID, outputIndex: i.contentOutputIndex, contentIndex: i.contentIndex,
+		messageStarted: i.hasMessageItemStarted, reasoningStarted: i.hasReasoningItemStarted,
+		textStarted: i.hasContentPartStarted, refusalStarted: i.hasRefusalPartStarted,
+		text: i.accumulatedText, reasoning: i.accumulatedReasoning, refusal: i.accumulatedRefusal,
+		contentOrder: i.messageContentOrder, signatures: i.reasoningBlockSignatures,
+	}
+	i.hasMessageItemStarted, i.hasReasoningItemStarted = false, false
+	i.hasContentPartStarted, i.hasRefusalPartStarted = false, false
+	i.currentContentNative = false
+	i.currentItemID = ""
+	i.contentIndex = 0
+	i.accumulatedText, i.accumulatedReasoning, i.accumulatedRefusal = &strings.Builder{}, &strings.Builder{}, &strings.Builder{}
+	i.messageContentOrder, i.reasoningBlockSignatures = nil, nil
+}
+
+func (i *ResponseInbound) resumeNativeContentItem(state *responseContentState) {
+	delete(i.suspendedNativeContent, state.id)
+	i.currentItemID, i.contentOutputIndex, i.contentIndex = state.id, state.outputIndex, state.contentIndex
+	i.hasMessageItemStarted, i.hasReasoningItemStarted = state.messageStarted, state.reasoningStarted
+	i.hasContentPartStarted, i.hasRefusalPartStarted = state.textStarted, state.refusalStarted
+	i.accumulatedText, i.accumulatedReasoning, i.accumulatedRefusal = state.text, state.reasoning, state.refusal
+	i.messageContentOrder, i.reasoningBlockSignatures = state.contentOrder, state.signatures
+	i.currentContentNative = true
 }
 
 func (i *ResponseInbound) TransformRequest(ctx context.Context, body []byte) (*model.InternalLLMRequest, error) {
@@ -315,7 +373,7 @@ func (i *ResponseInbound) TransformResponse(ctx context.Context, response *model
 	}
 
 	// Convert to Responses API format
-	resp := convertToResponsesAPIResponse(response)
+	resp, rawItemMatches := convertToResponsesAPIResponseWithItemMatches(response)
 	if i.truncation != nil {
 		resp.Truncation = i.truncation
 	}
@@ -329,7 +387,7 @@ func (i *ResponseInbound) TransformResponse(ctx context.Context, response *model
 	// upstream response. Metrics-only passthrough keeps the upstream IDs.
 	storedResponse := *response
 	if !i.preservePassthroughOutputIDs {
-		storedResponse.RawResponsesOutputItems = alignRawFunctionCallItemIDs(response.RawResponsesOutputItems, responsesFunctionCallItemIDs(resp.Output))
+		storedResponse.RawResponsesOutputItems = alignRawResponseItemIDsWithMatches(response.RawResponsesOutputItems, resp.Output, rawItemMatches)
 	}
 	i.storedResponse = &storedResponse
 
@@ -369,6 +427,7 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 	if len(events) == 0 || i.responseCompleted {
 		return nil, nil
 	}
+	i.ensureContentBuilders()
 
 	// A provider frame can contain a valid prefix followed by an error and
 	// transport-only Done. Stop at the first wire terminal; a later real error
@@ -425,6 +484,13 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 			if event.Delta == nil {
 				continue
 			}
+			if event.Delta.Refusal != "" || event.Delta.Text != "" {
+				if event.ContentBlock != nil && event.ContentBlock.Type == "message" &&
+					(!i.hasMessageItemStarted || (validContentItemID("message", event.ContentBlock.ID) && event.ContentBlock.ID != i.currentItemID)) {
+					i.nextContentOutputIndex = event.OutputIndex
+				}
+				out = append(out, i.prepareNativeContentItem(event.ContentBlock, "message")...)
+			}
 			if event.Delta.Refusal != "" {
 				out = append(out, i.handleRefusalContent(event.Delta.Refusal)...)
 			} else if event.Delta.Text != "" {
@@ -433,20 +499,24 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 
 		case model.StreamEventKindThinkingDelta:
 			if event.Delta != nil && (event.Delta.Thinking != "" || event.Delta.Signature != "") {
+				if event.ContentBlock != nil && event.ContentBlock.Type == "reasoning" &&
+					(!i.hasReasoningItemStarted || (validContentItemID("reasoning", event.ContentBlock.ID) && event.ContentBlock.ID != i.currentItemID)) {
+					i.nextContentOutputIndex = event.OutputIndex
+				}
+				out = append(out, i.prepareNativeContentItem(event.ContentBlock, "reasoning")...)
+				out = append(out, i.ensureReasoningItemStarted()...)
 				if event.Delta.Signature != "" {
 					i.reasoningBlockSignatures = append(i.reasoningBlockSignatures, event.Delta.Signature)
 				}
 				if event.Delta.Thinking != "" {
 					out = append(out, i.handleReasoningContent(&event.Delta.Thinking)...)
-				} else {
-					out = append(out, i.ensureReasoningItemStarted()...)
 				}
 			}
 
 		case model.StreamEventKindSignatureDelta:
 			if event.Delta != nil && event.Delta.Signature != "" {
-				i.reasoningBlockSignatures = append(i.reasoningBlockSignatures, event.Delta.Signature)
 				out = append(out, i.ensureReasoningItemStarted()...)
+				i.reasoningBlockSignatures = append(i.reasoningBlockSignatures, event.Delta.Signature)
 			}
 
 		case model.StreamEventKindContentBlockStart:
@@ -456,6 +526,9 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 
 		case model.StreamEventKindToolCallStart, model.StreamEventKindToolCallDelta:
 			if event.ToolCall != nil {
+				if _, exists := i.toolCalls[event.ToolCall.Index]; !exists && event.OutputIndex != nil && *event.OutputIndex >= 0 {
+					i.toolCallOutputIndex[event.ToolCall.Index] = *event.OutputIndex
+				}
 				if _, exists := i.toolCalls[event.ToolCall.Index]; !exists && event.ContentBlock != nil && strings.HasPrefix(event.ContentBlock.ID, "fc_") {
 					i.toolCallItemID[event.ToolCall.Index] = event.ContentBlock.ID
 				}
@@ -471,7 +544,7 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 					i.terminalProviderExtensions = event.ProviderExtensions
 				}
 				out = append(out, i.closeCurrentContentPart()...)
-				out = append(out, i.closeCurrentOutputItem()...)
+				out = append(out, i.closeAllOutputItems()...)
 			}
 
 		case model.StreamEventKindUsageDelta:
@@ -605,7 +678,8 @@ func (i *ResponseInbound) finalizeIncomplete() []byte {
 
 	var events [][]byte
 	events = append(events, i.closeCurrentContentPart()...)
-	events = append(events, i.closeCurrentOutputItem()...)
+	events = append(events, i.closeAllOutputItems()...)
+	events = append(events, i.closePassthroughOpenItems()...)
 
 	if i.responseCompleted {
 		// closeCurrentOutputItem cannot emit a terminal, but guard against
@@ -682,7 +756,57 @@ func (i *ResponseInbound) FinalizeIncompleteStream(ctx context.Context, rawStrea
 	if i.createdAt == 0 {
 		i.createdAt = snapshot.createdAt
 	}
-	if len(snapshot.output) > 0 && !snapshot.openItemSeen {
+	if i.preservePassthroughOutputIDs || i.currentContentNative || len(i.suspendedNativeContent) > 0 {
+		// Added events reserve wire indices even when they produce no semantic
+		// delta. Restore those reservations without changing native identities.
+		for itemID, index := range snapshot.outputIndices {
+			if i.currentContentNative && i.currentItemID == itemID {
+				i.contentOutputIndex = index
+			}
+			if state := i.suspendedNativeContent[itemID]; state != nil {
+				state.outputIndex = index
+			}
+			for toolIndex, toolID := range i.toolCallItemID {
+				if toolID == itemID {
+					i.toolCallOutputIndex[toolIndex] = index
+				}
+			}
+			if _, recorded := i.completedOutputItemIndex[itemID]; recorded {
+				i.completedOutputItemIndex[itemID] = index
+			}
+			if i.outputIndex <= index {
+				i.outputIndex = index + 1
+			}
+		}
+		// Native sidecars track every open item independently. A single last-added
+		// snapshot cannot identify the current item after interleaved deltas.
+		// Adopt only items whose done events already reached the client, leaving
+		// the other native items open for their missing closing events.
+		for _, item := range snapshot.output {
+			if i.currentContentNative && i.currentItemID == item.ID {
+				i.suspendNativeContentItem()
+			}
+			index, knownIndex := snapshot.outputIndices[item.ID]
+			if state := i.suspendedNativeContent[item.ID]; !knownIndex && state != nil {
+				index, knownIndex = state.outputIndex, true
+			}
+			delete(i.suspendedNativeContent, item.ID)
+			for toolIndex, itemID := range i.toolCallItemID {
+				if itemID == item.ID {
+					i.toolCallItemStarted[toolIndex] = false
+					if !knownIndex {
+						index, knownIndex = i.toolCallOutputIndex[toolIndex], true
+					}
+				}
+			}
+			if knownIndex {
+				if _, recorded := i.completedOutputItemIndex[item.ID]; !recorded {
+					i.recordCompletedOutputItem(index, item)
+				}
+			}
+		}
+		i.passthroughOpenItems = append(i.passthroughOpenItems[:0], snapshot.openItems...)
+	} else if len(snapshot.output) > 0 && !snapshot.openItemSeen {
 		// Those done events were already passed through to the client. Adopt their
 		// authoritative item IDs/output and discard the sidecar's synthetic open
 		// item so finalization emits only the missing response.incomplete terminal.
@@ -692,7 +816,10 @@ func (i *ResponseInbound) FinalizeIncompleteStream(ctx context.Context, rawStrea
 		// the sidecar's synthetic state with the item identity already visible to
 		// the client before closing the partial item.
 		i.currentItemID = snapshot.openItemID
-		i.outputIndex = snapshot.openOutputIndex
+		i.contentOutputIndex = snapshot.openOutputIndex
+		if i.outputIndex <= snapshot.openOutputIndex {
+			i.outputIndex = snapshot.openOutputIndex + 1
+		}
 	}
 	// If sidecar decoding could not recognize any lifecycle event, the raw
 	// response metadata still proves that payload existed. Emit a terminal with
@@ -710,12 +837,20 @@ type responsesRawSnapshot struct {
 	model           string
 	createdAt       int64
 	output          []ResponsesItem
+	openItems       []responsesRawOpenItem
+	outputIndices   map[string]int
 	terminalSeen    bool
 	sequenceSeen    bool
 	maxSequence     int
 	openItemSeen    bool
 	openItemID      string
 	openOutputIndex int
+}
+
+type responsesRawOpenItem struct {
+	item           ResponsesItem
+	outputIndex    int
+	hasOutputIndex bool
 }
 
 // parseResponsesRawSnapshot walks raw SSE blocks and records response
@@ -771,19 +906,41 @@ func parseResponsesRawSnapshot(raw []byte) responsesRawSnapshot {
 		switch probe.Type {
 		case "response.output_item.added":
 			if probe.Item != nil {
+				openItem := responsesRawOpenItem{item: *probe.Item}
 				snapshot.openItemSeen = true
 				snapshot.openItemID = probe.Item.ID
 				if probe.OutputIndex != nil {
+					openItem.outputIndex = *probe.OutputIndex
+					openItem.hasOutputIndex = true
 					snapshot.openOutputIndex = *probe.OutputIndex
+					if snapshot.outputIndices == nil {
+						snapshot.outputIndices = make(map[string]int)
+					}
+					snapshot.outputIndices[probe.Item.ID] = *probe.OutputIndex
 				}
+				snapshot.openItems = append(snapshot.openItems, openItem)
 			}
 		case "response.output_item.done":
 			if probe.Item != nil {
 				snapshot.output = append(snapshot.output, *probe.Item)
+				if probe.OutputIndex != nil {
+					if snapshot.outputIndices == nil {
+						snapshot.outputIndices = make(map[string]int)
+					}
+					snapshot.outputIndices[probe.Item.ID] = *probe.OutputIndex
+				}
 				doneIndexMatches := probe.OutputIndex != nil && *probe.OutputIndex == snapshot.openOutputIndex
 				if snapshot.openItemSeen && (probe.Item.ID == snapshot.openItemID || doneIndexMatches) {
 					snapshot.openItemSeen = false
 					snapshot.openItemID = ""
+				}
+				for index := range snapshot.openItems {
+					open := snapshot.openItems[index]
+					if (probe.Item.ID != "" && open.item.ID == probe.Item.ID) ||
+						(probe.OutputIndex != nil && open.hasOutputIndex && open.outputIndex == *probe.OutputIndex) {
+						snapshot.openItems = append(snapshot.openItems[:index], snapshot.openItems[index+1:]...)
+						break
+					}
 				}
 			}
 		}
@@ -792,6 +949,9 @@ func parseResponsesRawSnapshot(raw []byte) responsesRawSnapshot {
 }
 
 func (i *ResponseInbound) adoptPassthroughCompletedOutput(items []ResponsesItem) {
+	i.ensureContentBuilders()
+	i.suspendedNativeContent = nil
+	i.currentContentNative = false
 	i.completedOutputItems = append([]ResponsesItem(nil), items...)
 	i.completedOutputItemIndex = nil
 	i.hasMessageItemStarted = false
@@ -897,7 +1057,7 @@ func (i *ResponseInbound) handleReasoningContent(content *string) [][]byte {
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:        "response.reasoning.delta",
 		ItemID:      &i.currentItemID,
-		OutputIndex: lo.ToPtr(i.outputIndex),
+		OutputIndex: lo.ToPtr(i.contentOutputIndex),
 		Delta:       *content,
 	}))
 
@@ -905,12 +1065,58 @@ func (i *ResponseInbound) handleReasoningContent(content *string) [][]byte {
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:         "response.reasoning_summary_text.delta",
 		ItemID:       &i.currentItemID,
-		OutputIndex:  lo.ToPtr(i.outputIndex),
+		OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 		SummaryIndex: lo.ToPtr(0),
 		Delta:        *content,
 	}))
 
 	return events
+}
+
+// prepareNativeContentItem uses native IDs as boundaries between consecutive
+// items of the same type. IDs already emitted are never replaced mid-item.
+func (i *ResponseInbound) prepareNativeContentItem(block *model.StreamContentBlock, itemType string) [][]byte {
+	if block == nil || block.Type != itemType || !validContentItemID(itemType, block.ID) {
+		return nil
+	}
+	var events [][]byte
+	sameType := (itemType == "message" && i.hasMessageItemStarted) || (itemType == "reasoning" && i.hasReasoningItemStarted)
+	if sameType && i.currentItemID == block.ID {
+		i.nextContentOutputIndex = nil
+		return nil
+	}
+	i.suspendNativeContentItem()
+	if i.hasMessageItemStarted {
+		events = append(events, i.closeMessageItem()...)
+	}
+	if i.hasReasoningItemStarted {
+		events = append(events, i.closeReasoningItem()...)
+	}
+	if state := i.suspendedNativeContent[block.ID]; state != nil {
+		i.nextContentOutputIndex = nil
+		i.resumeNativeContentItem(state)
+	} else {
+		i.nextContentItemID = block.ID
+	}
+	return events
+}
+
+func (i *ResponseInbound) startContentItemID(itemType string) string {
+	i.ensureContentBuilders()
+	i.currentContentNative = validContentItemID(itemType, i.nextContentItemID)
+	id := resolveContentItemID(itemType, i.nextContentItemID)
+	i.nextContentItemID = ""
+	if i.nextContentOutputIndex != nil && *i.nextContentOutputIndex >= 0 {
+		i.contentOutputIndex = *i.nextContentOutputIndex
+		i.nextContentOutputIndex = nil
+		if i.outputIndex <= i.contentOutputIndex {
+			i.outputIndex = i.contentOutputIndex + 1
+		}
+	} else {
+		i.contentOutputIndex = i.outputIndex
+		i.outputIndex++
+	}
+	return id
 }
 
 func (i *ResponseInbound) ensureReasoningItemStarted() [][]byte {
@@ -920,10 +1126,13 @@ func (i *ResponseInbound) ensureReasoningItemStarted() [][]byte {
 
 	var events [][]byte
 
-	events = append(events, i.closeCurrentOutputItem()...)
+	i.suspendNativeContentItem()
+	if i.nextContentItemID == "" {
+		events = append(events, i.closeCurrentOutputItem()...)
+	}
 
 	i.hasReasoningItemStarted = true
-	i.currentItemID = generateItemID()
+	i.currentItemID = i.startContentItemID("reasoning")
 
 	item := &ResponsesItem{
 		ID:      i.currentItemID,
@@ -934,14 +1143,14 @@ func (i *ResponseInbound) ensureReasoningItemStarted() [][]byte {
 
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:        "response.output_item.added",
-		OutputIndex: lo.ToPtr(i.outputIndex),
+		OutputIndex: lo.ToPtr(i.contentOutputIndex),
 		Item:        item,
 	}))
 
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:         "response.reasoning_summary_part.added",
 		ItemID:       &i.currentItemID,
-		OutputIndex:  lo.ToPtr(i.outputIndex),
+		OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 		SummaryIndex: lo.ToPtr(0),
 		Part:         &ResponsesContentPart{Type: "summary_text"},
 	}))
@@ -954,6 +1163,7 @@ func (i *ResponseInbound) handleTextContent(content *string) [][]byte {
 
 	// Close reasoning item if it was started
 	if i.hasReasoningItemStarted {
+		i.suspendNativeContentItem()
 		events = append(events, i.closeReasoningItem()...)
 	}
 
@@ -965,11 +1175,11 @@ func (i *ResponseInbound) handleTextContent(content *string) [][]byte {
 	// Start message output item if not started
 	if !i.hasMessageItemStarted {
 		i.hasMessageItemStarted = true
-		i.currentItemID = generateItemID()
+		i.currentItemID = i.startContentItemID("message")
 
 		events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 			Type:        "response.output_item.added",
-			OutputIndex: lo.ToPtr(i.outputIndex),
+			OutputIndex: lo.ToPtr(i.contentOutputIndex),
 			Item: &ResponsesItem{
 				ID:      i.currentItemID,
 				Type:    "message",
@@ -988,7 +1198,7 @@ func (i *ResponseInbound) handleTextContent(content *string) [][]byte {
 		events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 			Type:         "response.content_part.added",
 			ItemID:       &i.currentItemID,
-			OutputIndex:  lo.ToPtr(i.outputIndex),
+			OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 			ContentIndex: lo.ToPtr(i.contentIndex),
 			Part: &ResponsesContentPart{
 				Type: "output_text",
@@ -1004,7 +1214,7 @@ func (i *ResponseInbound) handleTextContent(content *string) [][]byte {
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:         "response.output_text.delta",
 		ItemID:       &i.currentItemID,
-		OutputIndex:  lo.ToPtr(i.outputIndex),
+		OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 		ContentIndex: lo.ToPtr(i.contentIndex),
 		Delta:        *content,
 	}))
@@ -1022,6 +1232,7 @@ func (i *ResponseInbound) handleRefusalContent(content string) [][]byte {
 
 	// Close reasoning item if it was started
 	if i.hasReasoningItemStarted {
+		i.suspendNativeContentItem()
 		events = append(events, i.closeReasoningItem()...)
 	}
 
@@ -1033,11 +1244,11 @@ func (i *ResponseInbound) handleRefusalContent(content string) [][]byte {
 	// Start message output item if not started
 	if !i.hasMessageItemStarted {
 		i.hasMessageItemStarted = true
-		i.currentItemID = generateItemID()
+		i.currentItemID = i.startContentItemID("message")
 
 		events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 			Type:        "response.output_item.added",
-			OutputIndex: lo.ToPtr(i.outputIndex),
+			OutputIndex: lo.ToPtr(i.contentOutputIndex),
 			Item: &ResponsesItem{
 				ID:      i.currentItemID,
 				Type:    "message",
@@ -1056,7 +1267,7 @@ func (i *ResponseInbound) handleRefusalContent(content string) [][]byte {
 		events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 			Type:         "response.content_part.added",
 			ItemID:       &i.currentItemID,
-			OutputIndex:  lo.ToPtr(i.outputIndex),
+			OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 			ContentIndex: lo.ToPtr(i.contentIndex),
 			Part: &ResponsesContentPart{
 				Type: "refusal",
@@ -1072,7 +1283,7 @@ func (i *ResponseInbound) handleRefusalContent(content string) [][]byte {
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:         "response.refusal.delta",
 		ItemID:       &i.currentItemID,
-		OutputIndex:  lo.ToPtr(i.outputIndex),
+		OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 		ContentIndex: lo.ToPtr(i.contentIndex),
 		Delta:        content,
 	}))
@@ -1082,6 +1293,7 @@ func (i *ResponseInbound) handleRefusalContent(content string) [][]byte {
 
 func (i *ResponseInbound) handleToolCalls(toolCalls []model.ToolCall) [][]byte {
 	var events [][]byte
+	i.suspendNativeContentItem()
 
 	// Close message item if it was started
 	if i.hasMessageItemStarted {
@@ -1120,18 +1332,24 @@ func (i *ResponseInbound) handleToolCalls(toolCalls []model.ToolCall) [][]byte {
 				CallID: tc.ID,
 				Name:   tc.Function.Name,
 			}
+			outputIndex, nativeIndex := i.toolCallOutputIndex[toolCallIndex]
+			if !nativeIndex {
+				outputIndex = i.outputIndex
+			}
 
 			events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 				Type:        "response.output_item.added",
-				OutputIndex: lo.ToPtr(i.outputIndex),
+				OutputIndex: lo.ToPtr(outputIndex),
 				Item:        item,
 			}))
 
 			i.toolCallItemStarted[toolCallIndex] = true
-			i.toolCallOutputIndex[toolCallIndex] = i.outputIndex
+			i.toolCallOutputIndex[toolCallIndex] = outputIndex
 			i.toolCallItemID[toolCallIndex] = itemID
 			i.currentItemID = itemID
-			i.outputIndex++
+			if i.outputIndex <= outputIndex {
+				i.outputIndex = outputIndex + 1
+			}
 		}
 
 		// Accumulate arguments
@@ -1161,13 +1379,14 @@ func (i *ResponseInbound) closeReasoningItem() [][]byte {
 
 	var events [][]byte
 	i.hasReasoningItemStarted = false
+	i.currentContentNative = false
 	fullReasoning := i.accumulatedReasoning.String()
 
 	// Emit reasoning_summary_text.done
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:         "response.reasoning_summary_text.done",
 		ItemID:       &i.currentItemID,
-		OutputIndex:  lo.ToPtr(i.outputIndex),
+		OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 		SummaryIndex: lo.ToPtr(0),
 		Text:         fullReasoning,
 	}))
@@ -1176,7 +1395,7 @@ func (i *ResponseInbound) closeReasoningItem() [][]byte {
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:         "response.reasoning_summary_part.done",
 		ItemID:       &i.currentItemID,
-		OutputIndex:  lo.ToPtr(i.outputIndex),
+		OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 		SummaryIndex: lo.ToPtr(0),
 		Part:         &ResponsesContentPart{Type: "summary_text", Text: &fullReasoning},
 	}))
@@ -1184,7 +1403,7 @@ func (i *ResponseInbound) closeReasoningItem() [][]byte {
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:        "response.reasoning.done",
 		ItemID:      &i.currentItemID,
-		OutputIndex: lo.ToPtr(i.outputIndex),
+		OutputIndex: lo.ToPtr(i.contentOutputIndex),
 		Text:        fullReasoning,
 	}))
 
@@ -1217,12 +1436,11 @@ func (i *ResponseInbound) closeReasoningItem() [][]byte {
 
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:        "response.output_item.done",
-		OutputIndex: lo.ToPtr(i.outputIndex),
+		OutputIndex: lo.ToPtr(i.contentOutputIndex),
 		Item:        &item,
 	}))
 
-	i.recordCompletedOutputItem(i.outputIndex, item)
-	i.outputIndex++
+	i.recordCompletedOutputItem(i.contentOutputIndex, item)
 	i.accumulatedReasoning.Reset()
 	i.reasoningBlockSignatures = nil
 
@@ -1236,6 +1454,7 @@ func (i *ResponseInbound) closeMessageItem() [][]byte {
 
 	var events [][]byte
 	i.hasMessageItemStarted = false
+	i.currentContentNative = false
 
 	// Close whichever content part (text or refusal) is still open
 	events = append(events, i.closeCurrentContentPart()...)
@@ -1285,12 +1504,11 @@ func (i *ResponseInbound) closeMessageItem() [][]byte {
 
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:        "response.output_item.done",
-		OutputIndex: lo.ToPtr(i.outputIndex),
+		OutputIndex: lo.ToPtr(i.contentOutputIndex),
 		Item:        &item,
 	}))
 
-	i.recordCompletedOutputItem(i.outputIndex, item)
-	i.outputIndex++
+	i.recordCompletedOutputItem(i.contentOutputIndex, item)
 	i.contentIndex = 0
 	i.accumulatedText.Reset()
 	i.accumulatedRefusal.Reset()
@@ -1314,7 +1532,7 @@ func (i *ResponseInbound) closeCurrentContentPart() [][]byte {
 		events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 			Type:         "response.output_text.done",
 			ItemID:       &i.currentItemID,
-			OutputIndex:  lo.ToPtr(i.outputIndex),
+			OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 			ContentIndex: lo.ToPtr(i.contentIndex),
 			Text:         fullText,
 		}))
@@ -1322,7 +1540,7 @@ func (i *ResponseInbound) closeCurrentContentPart() [][]byte {
 		events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 			Type:         "response.content_part.done",
 			ItemID:       &i.currentItemID,
-			OutputIndex:  lo.ToPtr(i.outputIndex),
+			OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 			ContentIndex: lo.ToPtr(i.contentIndex),
 			Part: &ResponsesContentPart{
 				Type: "output_text",
@@ -1339,7 +1557,7 @@ func (i *ResponseInbound) closeCurrentContentPart() [][]byte {
 		events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 			Type:         "response.refusal.done",
 			ItemID:       &i.currentItemID,
-			OutputIndex:  lo.ToPtr(i.outputIndex),
+			OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 			ContentIndex: lo.ToPtr(i.contentIndex),
 			Text:         fullRefusal,
 		}))
@@ -1347,7 +1565,7 @@ func (i *ResponseInbound) closeCurrentContentPart() [][]byte {
 		events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 			Type:         "response.content_part.done",
 			ItemID:       &i.currentItemID,
-			OutputIndex:  lo.ToPtr(i.outputIndex),
+			OutputIndex:  lo.ToPtr(i.contentOutputIndex),
 			ContentIndex: lo.ToPtr(i.contentIndex),
 			Part: &ResponsesContentPart{
 				Type: "refusal",
@@ -1358,6 +1576,49 @@ func (i *ResponseInbound) closeCurrentContentPart() [][]byte {
 		i.contentIndex++
 	}
 
+	return events
+}
+
+// closeAllOutputItems finalizes each native item only after all of its
+// interleaved deltas have arrived; the terminal array uses reserved indices.
+func (i *ResponseInbound) closeAllOutputItems() [][]byte {
+	events := i.closeCurrentOutputItem()
+	states := make([]*responseContentState, 0, len(i.suspendedNativeContent))
+	for _, state := range i.suspendedNativeContent {
+		states = append(states, state)
+	}
+	sort.Slice(states, func(a, b int) bool { return states[a].outputIndex < states[b].outputIndex })
+	for _, state := range states {
+		i.resumeNativeContentItem(state)
+		events = append(events, i.closeMessageItem()...)
+		events = append(events, i.closeReasoningItem()...)
+	}
+	return events
+}
+
+func (i *ResponseInbound) closePassthroughOpenItems() [][]byte {
+	var events [][]byte
+	for _, open := range i.passthroughOpenItems {
+		item := open.item
+		if _, alreadyClosed := i.completedOutputItemIndex[item.ID]; alreadyClosed {
+			continue
+		}
+		index := open.outputIndex
+		if !open.hasOutputIndex {
+			index = i.outputIndex
+			i.outputIndex++
+		} else if i.outputIndex <= index {
+			i.outputIndex = index + 1
+		}
+		item.Status = lo.ToPtr("completed")
+		events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
+			Type:        "response.output_item.done",
+			OutputIndex: lo.ToPtr(index),
+			Item:        &item,
+		}))
+		i.recordCompletedOutputItem(index, item)
+	}
+	i.passthroughOpenItems = nil
 	return events
 }
 
@@ -1422,11 +1683,12 @@ func (i *ResponseInbound) closeCurrentOutputItem() [][]byte {
 	return events
 }
 
-// terminalOutputItems preserves native output metadata while keeping tool item
+// terminalOutputItems preserves native output metadata while keeping item
 // IDs consistent with the IDs already emitted in this stream.
 func (i *ResponseInbound) terminalOutputItems() []ResponsesItem {
 	output := i.finalOutputItems()
-	i.terminalToolItemIDs = responsesFunctionCallItemIDs(output)
+	i.terminalResolvedItems = output
+	i.terminalRawItemMatches = nil
 	extensions := i.terminalProviderExtensions
 	if extensions == nil || extensions.OpenAI == nil || len(extensions.OpenAI.RawResponseItems) == 0 {
 		return output
@@ -1435,65 +1697,169 @@ func (i *ResponseInbound) terminalOutputItems() []ResponsesItem {
 	if err := json.Unmarshal(extensions.OpenAI.RawResponseItems, &items); err != nil {
 		return output
 	}
-	itemIDs := responsesFunctionCallItemIDs(output)
+	emitted := output
+	// The empty-message fallback was never emitted and must not replace a
+	// native raw-only item's ID.
+	if len(i.completedOutputItems) == 0 {
+		emitted = nil
+	}
+	matches := matchResponseOutputItems(items, emitted)
 	for index := range items {
 		item := &items[index]
-		if item.Type != "function_call" {
-			continue
-		}
-		if ids := itemIDs[item.CallID]; len(ids) > 0 {
-			item.ID = ids[0]
-			itemIDs[item.CallID] = ids[1:]
-		} else if !strings.HasPrefix(item.ID, "fc_") {
+		if matched := matches[index]; matched >= 0 {
+			item.ID = output[matched].ID
+		} else if item.Type == "message" || item.Type == "reasoning" {
+			item.ID = resolveContentItemID(item.Type, item.ID)
+		} else if item.Type == "function_call" && !strings.HasPrefix(item.ID, "fc_") {
 			item.ID = generateFunctionCallItemID()
 		}
 	}
-	i.terminalToolItemIDs = responsesFunctionCallItemIDs(items)
+	i.terminalResolvedItems = items
+	// Terminal items retain raw order. Cache must reuse this resolved order
+	// instead of matching again after synthesized IDs have been assigned.
+	i.terminalRawItemMatches = make([]int, len(items))
+	for index := range items {
+		i.terminalRawItemMatches[index] = index
+	}
 	return items
 }
 
-func responsesFunctionCallItemIDs(items []ResponsesItem) map[string][]string {
-	ids := make(map[string][]string)
-	for _, item := range items {
-		if item.Type == "function_call" {
-			ids[item.CallID] = append(ids[item.CallID], item.ID)
+// Match native identities and unique non-empty content first. Legacy content
+// items take priority when neither identifies a synthesized output item.
+func matchResponseOutputItems(items, output []ResponsesItem) []int {
+	matches := make([]int, len(items))
+	used := make([]bool, len(output))
+	for index := range matches {
+		matches[index] = -1
+	}
+	for index, item := range items {
+		if item.Type != "message" && item.Type != "reasoning" && item.Type != "function_call" {
+			continue
+		}
+		for candidate, emitted := range output {
+			if !used[candidate] && item.ID != "" && item.ID == emitted.ID && item.Type == emitted.Type && (item.Type != "function_call" || item.CallID == emitted.CallID) {
+				matches[index], used[candidate] = candidate, true
+				break
+			}
 		}
 	}
-	return ids
+	itemContent := make([]string, len(items))
+	outputContent := make([]string, len(output))
+	itemCounts, outputCounts := make(map[string]int), make(map[string]int)
+	for index, item := range items {
+		if matches[index] < 0 {
+			itemContent[index] = responseOutputContentKey(item)
+			itemCounts[itemContent[index]]++
+		}
+	}
+	for index, item := range output {
+		if !used[index] {
+			outputContent[index] = responseOutputContentKey(item)
+			outputCounts[outputContent[index]]++
+		}
+	}
+	for index, key := range itemContent {
+		if key == "" || itemCounts[key] != 1 || outputCounts[key] != 1 {
+			continue
+		}
+		for candidate, emittedKey := range outputContent {
+			if !used[candidate] && key == emittedKey {
+				matches[index], used[candidate] = candidate, true
+				break
+			}
+		}
+	}
+	for _, legacyFirst := range []bool{true, false} {
+		for index, item := range items {
+			if matches[index] >= 0 || (item.Type != "message" && item.Type != "reasoning" && item.Type != "function_call") {
+				continue
+			}
+			if legacyFirst && (item.Type == "message" || item.Type == "reasoning") && validContentItemID(item.Type, item.ID) {
+				continue
+			}
+			for candidate, emitted := range output {
+				if !used[candidate] && item.Type == emitted.Type && (item.Type != "function_call" || item.CallID == emitted.CallID) {
+					matches[index], used[candidate] = candidate, true
+					break
+				}
+			}
+		}
+	}
+	return matches
 }
 
-// alignRawFunctionCallItemIDs changes only tool item IDs. RawMessage values
-// preserve provider-specific fields and number precision for replay storage.
-func alignRawFunctionCallItemIDs(raw json.RawMessage, resolvedIDs map[string][]string) json.RawMessage {
-	if len(raw) == 0 || len(resolvedIDs) == 0 {
+// Content parts can be coalesced by the stream adapter. Compare accumulated
+// text/refusal or reasoning summary without provider metadata or part splits.
+func responseOutputContentKey(item ResponsesItem) string {
+	var text, refusal strings.Builder
+	switch item.Type {
+	case "message":
+		if item.Content != nil {
+			for _, part := range item.Content.Items {
+				if part.Type == "output_text" && part.Text != nil {
+					text.WriteString(*part.Text)
+				} else if part.Type == "refusal" && part.Refusal != nil {
+					refusal.WriteString(*part.Refusal)
+				}
+			}
+		}
+	case "reasoning":
+		for _, part := range item.Summary {
+			if part.Type == "summary_text" {
+				text.WriteString(part.Text)
+			}
+		}
+		if text.Len() == 0 && item.EncryptedContent != nil {
+			refusal.WriteString(*item.EncryptedContent)
+		}
+	default:
+		return ""
+	}
+	if text.Len() == 0 && refusal.Len() == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d:%s%s", item.Type, text.Len(), text.String(), refusal.String())
+}
+
+// alignRawResponseItemIDs changes only item IDs. RawMessage values preserve
+// provider-specific fields and number precision for replay storage.
+func alignRawResponseItemIDs(raw json.RawMessage, output []ResponsesItem) json.RawMessage {
+	if len(raw) == 0 || len(output) == 0 {
 		return raw
 	}
 	var items []map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return raw
 	}
-	itemIDs := make(map[string][]string, len(resolvedIDs))
-	for callID, ids := range resolvedIDs {
-		itemIDs[callID] = ids
+	identities := responseOutputItemIdentities(items)
+	matches := matchResponseOutputItems(identities, output)
+	return rewriteRawResponseItemIDs(raw, items, output, matches)
+}
+
+// alignRawResponseItemIDsWithMatches retains the first raw-index mapping even
+// when later ID assignment changes the result of identity/content matching.
+func alignRawResponseItemIDsWithMatches(raw json.RawMessage, output []ResponsesItem, matches []int) json.RawMessage {
+	if len(raw) == 0 || len(output) == 0 {
+		return raw
 	}
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil || len(items) != len(matches) {
+		return raw
+	}
+	return rewriteRawResponseItemIDs(raw, items, output, matches)
+}
+
+func rewriteRawResponseItemIDs(raw json.RawMessage, items []map[string]json.RawMessage, output []ResponsesItem, matches []int) json.RawMessage {
 	changed := false
-	for _, item := range items {
-		var itemType, callID, itemID string
-		if json.Unmarshal(item["type"], &itemType) != nil || itemType != "function_call" {
+	for index, matched := range matches {
+		if matched < 0 || matched >= len(output) || items[index] == nil {
 			continue
 		}
-		if len(item["call_id"]) > 0 && json.Unmarshal(item["call_id"], &callID) != nil {
+		var id string
+		if json.Unmarshal(items[index]["id"], &id) == nil && id == output[matched].ID {
 			continue
 		}
-		ids := itemIDs[callID]
-		if len(ids) == 0 {
-			continue
-		}
-		itemIDs[callID] = ids[1:]
-		if json.Unmarshal(item["id"], &itemID) == nil && itemID == ids[0] {
-			continue
-		}
-		item["id"], _ = json.Marshal(ids[0])
+		items[index]["id"], _ = json.Marshal(output[matched].ID)
 		changed = true
 	}
 	if changed {
@@ -1502,6 +1868,21 @@ func alignRawFunctionCallItemIDs(raw json.RawMessage, resolvedIDs map[string][]s
 		}
 	}
 	return raw
+}
+
+func responseOutputItemIdentities(items []map[string]json.RawMessage) []ResponsesItem {
+	identities := make([]ResponsesItem, len(items))
+	for index, item := range items {
+		_ = json.Unmarshal(item["type"], &identities[index].Type)
+		_ = json.Unmarshal(item["id"], &identities[index].ID)
+		_ = json.Unmarshal(item["content"], &identities[index].Content)
+		_ = json.Unmarshal(item["summary"], &identities[index].Summary)
+		_ = json.Unmarshal(item["encrypted_content"], &identities[index].EncryptedContent)
+		if len(item["call_id"]) > 0 && json.Unmarshal(item["call_id"], &identities[index].CallID) != nil {
+			identities[index].Type = ""
+		}
+	}
+	return identities
 }
 
 func (i *ResponseInbound) recordCompletedOutputItem(index int, item ResponsesItem) {
@@ -1534,7 +1915,7 @@ func (i *ResponseInbound) finalOutputItems() []ResponsesItem {
 	emptyText := ""
 	return []ResponsesItem{
 		{
-			ID:   generateItemID(),
+			ID:   resolveContentItemID("message", ""),
 			Type: "message",
 			Role: "assistant",
 			Content: &ResponsesInput{
@@ -1556,7 +1937,14 @@ func (i *ResponseInbound) GetInternalResponse(ctx context.Context) (*model.Inter
 	}
 	response := i.streamAggregator.BuildAndReset()
 	if response != nil && !i.preservePassthroughOutputIDs {
-		response.RawResponsesOutputItems = alignRawFunctionCallItemIDs(response.RawResponsesOutputItems, i.terminalToolItemIDs)
+		if i.terminalRawItemMatches != nil {
+			extensions := i.terminalProviderExtensions
+			if extensions != nil && extensions.OpenAI != nil && bytes.Equal(response.RawResponsesOutputItems, extensions.OpenAI.RawResponseItems) {
+				response.RawResponsesOutputItems = alignRawResponseItemIDsWithMatches(response.RawResponsesOutputItems, i.terminalResolvedItems, i.terminalRawItemMatches)
+			}
+		} else {
+			response.RawResponsesOutputItems = alignRawResponseItemIDs(response.RawResponsesOutputItems, i.terminalResolvedItems)
+		}
 	}
 	return response, nil
 }
@@ -2317,6 +2705,11 @@ func convertToolsToInternal(tools []ResponsesTool) ([]model.Tool, error) {
 }
 
 func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesResponse {
+	result, _ := convertToResponsesAPIResponseWithItemMatches(resp)
+	return result
+}
+
+func convertToResponsesAPIResponseWithItemMatches(resp *model.InternalLLMResponse) (*ResponsesResponse, []int) {
 	result := &ResponsesResponse{
 		Object:    "response",
 		ID:        resp.ID,
@@ -2346,7 +2739,7 @@ func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesRe
 		// Handle reasoning content
 		if message.ReasoningContent != nil && *message.ReasoningContent != "" {
 			result.Output = append(result.Output, ResponsesItem{
-				ID:     generateItemID(),
+				ID:     resolveContentItemID("reasoning", ""),
 				Type:   "reasoning",
 				Status: lo.ToPtr("completed"),
 				Summary: []ResponsesReasoningSummary{
@@ -2422,7 +2815,7 @@ func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesRe
 
 		if len(contentItems) > 0 {
 			result.Output = append(result.Output, ResponsesItem{
-				ID:      generateItemID(),
+				ID:      resolveContentItemID("message", ""),
 				Type:    "message",
 				Role:    "assistant",
 				Content: &ResponsesInput{Items: contentItems},
@@ -2442,7 +2835,7 @@ func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesRe
 		emptyText := ""
 		result.Output = []ResponsesItem{
 			{
-				ID:   generateItemID(),
+				ID:   resolveContentItemID("message", ""),
 				Type: "message",
 				Role: "assistant",
 				Content: &ResponsesInput{
@@ -2458,7 +2851,13 @@ func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesRe
 		}
 	}
 
-	return result
+	// Resolve native IDs after content is available so raw-only items cannot
+	// consume the identity belonging to a canonical content item.
+	nativeIDs, matches := nativeContentItemIDsWithMatches(resp.RawResponsesOutputItems, result.Output)
+	for index, id := range nativeIDs {
+		result.Output[index].ID = id
+	}
+	return result, matches
 }
 
 func convertUsageToResponses(usage *model.Usage) *ResponsesUsage {
@@ -2499,6 +2898,42 @@ func convertUsageToResponses(usage *model.Usage) *ResponsesUsage {
 
 func generateItemID() string {
 	return fmt.Sprintf("item_%s", lo.RandomString(16, lo.AlphanumericCharset))
+}
+
+func validContentItemID(itemType, id string) bool {
+	prefix := "msg_"
+	if itemType == "reasoning" {
+		prefix = "rs_"
+	}
+	return strings.HasPrefix(id, prefix)
+}
+
+func resolveContentItemID(itemType, id string) string {
+	if validContentItemID(itemType, id) {
+		return id
+	}
+	prefix := "msg_"
+	if itemType == "reasoning" {
+		prefix = "rs_"
+	}
+	return prefix + lo.RandomString(16, lo.AlphanumericCharset)
+}
+
+func nativeContentItemIDsWithMatches(raw json.RawMessage, output []ResponsesItem) (map[int]string, []int) {
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, nil
+	}
+	identities := responseOutputItemIdentities(items)
+	matches := matchResponseOutputItems(identities, output)
+	ids := make(map[int]string)
+	for index, matched := range matches {
+		item := identities[index]
+		if matched >= 0 && (item.Type == "message" || item.Type == "reasoning") && validContentItemID(item.Type, item.ID) {
+			ids[matched] = item.ID
+		}
+	}
+	return ids, matches
 }
 
 func generateFunctionCallItemID() string {
