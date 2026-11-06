@@ -1323,6 +1323,9 @@ func (ra *relayAttempt) handleResponsePassthrough(ctx context.Context, response 
 		Body:       io.NopCloser(bytes.NewReader(body)),
 	}
 	if internalResponse, err := ra.outAdapter.TransformResponse(ctx, sidecarResp); err == nil && internalResponse != nil {
+		if adapter, ok := ra.inAdapter.(interface{ PreservePassthroughOutputIDs() }); ok {
+			adapter.PreservePassthroughOutputIDs()
+		}
 		ra.inAdapter.TransformResponse(ctx, internalResponse)
 		if cfg.CollectMetrics {
 			ra.collectResponse()
@@ -1789,6 +1792,9 @@ func (ra *relayAttempt) collectPassthroughMetrics(ctx context.Context, rawStream
 	if len(rawStream) == 0 {
 		return
 	}
+	if adapter, ok := ra.inAdapter.(interface{ PreservePassthroughOutputIDs() }); ok {
+		adapter.PreservePassthroughOutputIDs()
+	}
 
 	// Try stream event adapter first (preferred)
 	outEventAdapter, outOk := ra.outAdapter.(model.OutboundStreamEventTransformer)
@@ -1970,6 +1976,9 @@ func (ra *relayAttempt) collectResponse() {
 func (ra *relayAttempt) collectOpenAIResponsesPassthroughMetrics(ctx context.Context, rawStream []byte) {
 	if len(rawStream) == 0 {
 		return
+	}
+	if adapter, ok := ra.inAdapter.(interface{ PreservePassthroughOutputIDs() }); ok {
+		adapter.PreservePassthroughOutputIDs()
 	}
 	outEventAdapter, outOk := ra.outAdapter.(model.OutboundStreamEventTransformer)
 	inEventAdapter, inOk := ra.inAdapter.(model.InboundStreamEventTransformer)

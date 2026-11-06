@@ -63,6 +63,7 @@ type ResponseInbound struct {
 	toolCalls           map[int]*model.ToolCall
 	toolCallItemStarted map[int]bool
 	toolCallOutputIndex map[int]int
+	toolCallItemID      map[int]string
 
 	// Usage tracking
 	usage *model.Usage
@@ -72,6 +73,13 @@ type ResponseInbound struct {
 	// event can echo the full output array. Upstream Responses clients treat
 	// an empty output on response.completed as an error (O-H3).
 	completedOutputItems []ResponsesItem
+	// completedOutputItemIndex retains assigned indices when items close in a
+	// different order; native passthrough arrays keep their own ordering.
+	completedOutputItemIndex map[string]int
+	// terminalToolItemIDs also includes IDs resolved for raw-only tool items so
+	// replay storage can use exactly the IDs returned in the terminal event.
+	terminalToolItemIDs          map[string][]string
+	preservePassthroughOutputIDs bool
 
 	streamAggregator model.StreamAggregator
 	// storedResponse stores the non-stream response
@@ -306,9 +314,6 @@ func (i *ResponseInbound) TransformResponse(ctx context.Context, response *model
 		return nil, fmt.Errorf("response is nil")
 	}
 
-	// Store the response for later retrieval
-	i.storedResponse = response
-
 	// Convert to Responses API format
 	resp := convertToResponsesAPIResponse(response)
 	if i.truncation != nil {
@@ -319,6 +324,14 @@ func (i *ResponseInbound) TransformResponse(ctx context.Context, response *model
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal responses api response: %w", err)
 	}
+
+	// Replay must retain the item IDs sent to the client without modifying the
+	// upstream response. Metrics-only passthrough keeps the upstream IDs.
+	storedResponse := *response
+	if !i.preservePassthroughOutputIDs {
+		storedResponse.RawResponsesOutputItems = alignRawFunctionCallItemIDs(response.RawResponsesOutputItems, responsesFunctionCallItemIDs(resp.Output))
+	}
+	i.storedResponse = &storedResponse
 
 	return body, nil
 }
@@ -379,6 +392,7 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 		i.toolCalls = make(map[int]*model.ToolCall)
 		i.toolCallItemStarted = make(map[int]bool)
 		i.toolCallOutputIndex = make(map[int]int)
+		i.toolCallItemID = make(map[int]string)
 	}
 
 	for _, event := range processEvents {
@@ -440,13 +454,11 @@ func (i *ResponseInbound) processStreamEvents(ctx context.Context, events []mode
 				out = append(out, i.ensureReasoningItemStarted()...)
 			}
 
-		case model.StreamEventKindToolCallStart:
+		case model.StreamEventKindToolCallStart, model.StreamEventKindToolCallDelta:
 			if event.ToolCall != nil {
-				out = append(out, i.handleToolCalls([]model.ToolCall{*event.ToolCall})...)
-			}
-
-		case model.StreamEventKindToolCallDelta:
-			if event.ToolCall != nil {
+				if _, exists := i.toolCalls[event.ToolCall.Index]; !exists && event.ContentBlock != nil && strings.HasPrefix(event.ContentBlock.ID, "fc_") {
+					i.toolCallItemID[event.ToolCall.Index] = event.ContentBlock.ID
+				}
 				out = append(out, i.handleToolCalls([]model.ToolCall{*event.ToolCall})...)
 			}
 
@@ -603,13 +615,7 @@ func (i *ResponseInbound) finalizeIncomplete() []byte {
 	i.responseCompleted = true
 	i.terminalOutcome = model.PassthroughTerminalOutcomeIncomplete
 
-	output := i.finalOutputItems()
-	if extensions := i.terminalProviderExtensions; extensions != nil && extensions.OpenAI != nil && len(extensions.OpenAI.RawResponseItems) > 0 {
-		var items []ResponsesItem
-		if err := json.Unmarshal(extensions.OpenAI.RawResponseItems, &items); err == nil {
-			output = items
-		}
-	}
+	output := i.terminalOutputItems()
 	terminal := i.enqueueEvent(&ResponsesStreamEvent{
 		Type: "response.incomplete",
 		Response: &ResponsesResponse{
@@ -787,6 +793,7 @@ func parseResponsesRawSnapshot(raw []byte) responsesRawSnapshot {
 
 func (i *ResponseInbound) adoptPassthroughCompletedOutput(items []ResponsesItem) {
 	i.completedOutputItems = append([]ResponsesItem(nil), items...)
+	i.completedOutputItemIndex = nil
 	i.hasMessageItemStarted = false
 	i.hasReasoningItemStarted = false
 	i.hasContentPartStarted = false
@@ -833,13 +840,7 @@ func (i *ResponseInbound) emitTerminalEvent() []byte {
 	default:
 		i.terminalOutcome = model.PassthroughTerminalOutcomeCompleted
 	}
-	output := i.finalOutputItems()
-	if extensions := i.terminalProviderExtensions; extensions != nil && extensions.OpenAI != nil && len(extensions.OpenAI.RawResponseItems) > 0 {
-		var items []ResponsesItem
-		if err := json.Unmarshal(extensions.OpenAI.RawResponseItems, &items); err == nil {
-			output = items
-		}
-	}
+	output := i.terminalOutputItems()
 	response := &ResponsesResponse{
 		Object:     "response",
 		ID:         i.responseID,
@@ -1097,9 +1098,6 @@ func (i *ResponseInbound) handleToolCalls(toolCalls []model.ToolCall) [][]byte {
 
 		// Initialize tool call tracking if needed
 		if _, ok := i.toolCalls[toolCallIndex]; !ok {
-			events = append(events, i.closeCurrentContentPart()...)
-			events = append(events, i.closeCurrentOutputItem()...)
-
 			i.toolCalls[toolCallIndex] = &model.ToolCall{
 				Index: toolCallIndex,
 				ID:    tc.ID,
@@ -1110,9 +1108,9 @@ func (i *ResponseInbound) handleToolCalls(toolCalls []model.ToolCall) [][]byte {
 				},
 			}
 
-			itemID := tc.ID
-			if itemID == "" {
-				itemID = generateItemID()
+			itemID := i.toolCallItemID[toolCallIndex]
+			if !strings.HasPrefix(itemID, "fc_") {
+				itemID = generateFunctionCallItemID()
 			}
 
 			item := &ResponsesItem{
@@ -1131,6 +1129,7 @@ func (i *ResponseInbound) handleToolCalls(toolCalls []model.ToolCall) [][]byte {
 
 			i.toolCallItemStarted[toolCallIndex] = true
 			i.toolCallOutputIndex[toolCallIndex] = i.outputIndex
+			i.toolCallItemID[toolCallIndex] = itemID
 			i.currentItemID = itemID
 			i.outputIndex++
 		}
@@ -1140,10 +1139,7 @@ func (i *ResponseInbound) handleToolCalls(toolCalls []model.ToolCall) [][]byte {
 
 		// Emit function_call_arguments.delta
 		if tc.Function.Arguments != "" {
-			itemID := i.toolCalls[toolCallIndex].ID
-			if itemID == "" {
-				itemID = i.currentItemID
-			}
+			itemID := i.toolCallItemID[toolCallIndex]
 
 			events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 				Type:         "response.function_call_arguments.delta",
@@ -1225,7 +1221,7 @@ func (i *ResponseInbound) closeReasoningItem() [][]byte {
 		Item:        &item,
 	}))
 
-	i.completedOutputItems = append(i.completedOutputItems, item)
+	i.recordCompletedOutputItem(i.outputIndex, item)
 	i.outputIndex++
 	i.accumulatedReasoning.Reset()
 	i.reasoningBlockSignatures = nil
@@ -1293,7 +1289,7 @@ func (i *ResponseInbound) closeMessageItem() [][]byte {
 		Item:        &item,
 	}))
 
-	i.completedOutputItems = append(i.completedOutputItems, item)
+	i.recordCompletedOutputItem(i.outputIndex, item)
 	i.outputIndex++
 	i.contentIndex = 0
 	i.accumulatedText.Reset()
@@ -1379,12 +1375,19 @@ func (i *ResponseInbound) closeCurrentOutputItem() [][]byte {
 	}
 
 	// Close any open tool call items
-	for idx, tc := range i.toolCalls {
+	indices := make([]int, 0, len(i.toolCalls))
+	for idx := range i.toolCalls {
 		if i.toolCallItemStarted[idx] {
-			itemID := tc.ID
-			if itemID == "" {
-				itemID = i.currentItemID
-			}
+			indices = append(indices, idx)
+		}
+	}
+	sort.Slice(indices, func(a, b int) bool {
+		return i.toolCallOutputIndex[indices[a]] < i.toolCallOutputIndex[indices[b]]
+	})
+	for _, idx := range indices {
+		tc := i.toolCalls[idx]
+		if i.toolCallItemStarted[idx] {
+			itemID := i.toolCallItemID[idx]
 
 			// Emit function_call_arguments.done
 			toolCallOutputIdx := i.toolCallOutputIndex[idx]
@@ -1411,12 +1414,102 @@ func (i *ResponseInbound) closeCurrentOutputItem() [][]byte {
 				Item:        &item,
 			}))
 
-			i.completedOutputItems = append(i.completedOutputItems, item)
+			i.recordCompletedOutputItem(toolCallOutputIdx, item)
 			i.toolCallItemStarted[idx] = false
 		}
 	}
 
 	return events
+}
+
+// terminalOutputItems preserves native output metadata while keeping tool item
+// IDs consistent with the IDs already emitted in this stream.
+func (i *ResponseInbound) terminalOutputItems() []ResponsesItem {
+	output := i.finalOutputItems()
+	i.terminalToolItemIDs = responsesFunctionCallItemIDs(output)
+	extensions := i.terminalProviderExtensions
+	if extensions == nil || extensions.OpenAI == nil || len(extensions.OpenAI.RawResponseItems) == 0 {
+		return output
+	}
+	var items []ResponsesItem
+	if err := json.Unmarshal(extensions.OpenAI.RawResponseItems, &items); err != nil {
+		return output
+	}
+	itemIDs := responsesFunctionCallItemIDs(output)
+	for index := range items {
+		item := &items[index]
+		if item.Type != "function_call" {
+			continue
+		}
+		if ids := itemIDs[item.CallID]; len(ids) > 0 {
+			item.ID = ids[0]
+			itemIDs[item.CallID] = ids[1:]
+		} else if !strings.HasPrefix(item.ID, "fc_") {
+			item.ID = generateFunctionCallItemID()
+		}
+	}
+	i.terminalToolItemIDs = responsesFunctionCallItemIDs(items)
+	return items
+}
+
+func responsesFunctionCallItemIDs(items []ResponsesItem) map[string][]string {
+	ids := make(map[string][]string)
+	for _, item := range items {
+		if item.Type == "function_call" {
+			ids[item.CallID] = append(ids[item.CallID], item.ID)
+		}
+	}
+	return ids
+}
+
+// alignRawFunctionCallItemIDs changes only tool item IDs. RawMessage values
+// preserve provider-specific fields and number precision for replay storage.
+func alignRawFunctionCallItemIDs(raw json.RawMessage, resolvedIDs map[string][]string) json.RawMessage {
+	if len(raw) == 0 || len(resolvedIDs) == 0 {
+		return raw
+	}
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return raw
+	}
+	itemIDs := make(map[string][]string, len(resolvedIDs))
+	for callID, ids := range resolvedIDs {
+		itemIDs[callID] = ids
+	}
+	changed := false
+	for _, item := range items {
+		var itemType, callID, itemID string
+		if json.Unmarshal(item["type"], &itemType) != nil || itemType != "function_call" {
+			continue
+		}
+		if len(item["call_id"]) > 0 && json.Unmarshal(item["call_id"], &callID) != nil {
+			continue
+		}
+		ids := itemIDs[callID]
+		if len(ids) == 0 {
+			continue
+		}
+		itemIDs[callID] = ids[1:]
+		if json.Unmarshal(item["id"], &itemID) == nil && itemID == ids[0] {
+			continue
+		}
+		item["id"], _ = json.Marshal(ids[0])
+		changed = true
+	}
+	if changed {
+		if aligned, err := json.Marshal(items); err == nil {
+			return aligned
+		}
+	}
+	return raw
+}
+
+func (i *ResponseInbound) recordCompletedOutputItem(index int, item ResponsesItem) {
+	if i.completedOutputItemIndex == nil {
+		i.completedOutputItemIndex = make(map[string]int)
+	}
+	i.completedOutputItemIndex[item.ID] = index
+	i.completedOutputItems = append(i.completedOutputItems, item)
 }
 
 // finalOutputItems returns the accumulated output items for response.completed,
@@ -1426,6 +1519,16 @@ func (i *ResponseInbound) finalOutputItems() []ResponsesItem {
 	if len(i.completedOutputItems) > 0 {
 		out := make([]ResponsesItem, len(i.completedOutputItems))
 		copy(out, i.completedOutputItems)
+		if len(i.completedOutputItemIndex) > 0 {
+			for _, item := range out {
+				if _, tracked := i.completedOutputItemIndex[item.ID]; !tracked {
+					return out
+				}
+			}
+			sort.SliceStable(out, func(a, b int) bool {
+				return i.completedOutputItemIndex[out[a].ID] < i.completedOutputItemIndex[out[b].ID]
+			})
+		}
 		return out
 	}
 	emptyText := ""
@@ -1451,7 +1554,17 @@ func (i *ResponseInbound) GetInternalResponse(ctx context.Context) (*model.Inter
 	if i.storedResponse != nil {
 		return i.storedResponse, nil
 	}
-	return i.streamAggregator.BuildAndReset(), nil
+	response := i.streamAggregator.BuildAndReset()
+	if response != nil && !i.preservePassthroughOutputIDs {
+		response.RawResponsesOutputItems = alignRawFunctionCallItemIDs(response.RawResponsesOutputItems, i.terminalToolItemIDs)
+	}
+	return response, nil
+}
+
+// PreservePassthroughOutputIDs marks a metrics-only sidecar whose encoded
+// events are discarded while upstream Responses bytes reach the client.
+func (i *ResponseInbound) PreservePassthroughOutputIDs() {
+	i.preservePassthroughOutputIDs = true
 }
 
 // formatSSEData formats data as SSE data line
@@ -2215,6 +2328,7 @@ func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesRe
 
 	// Convert usage
 	result.Usage = convertUsageToResponses(resp.Usage)
+	nativeToolItemIDs := nativeFunctionCallItemIDs(resp.RawResponsesOutputItems)
 
 	// Convert choices to output items
 	for _, choice := range resp.Choices {
@@ -2247,8 +2361,12 @@ func convertToResponsesAPIResponse(resp *model.InternalLLMResponse) *ResponsesRe
 		// Handle tool calls
 		if len(message.ToolCalls) > 0 {
 			for _, toolCall := range message.ToolCalls {
+				itemID := nativeToolItemIDs[toolCall.ID]
+				if itemID == "" {
+					itemID = generateFunctionCallItemID()
+				}
 				result.Output = append(result.Output, ResponsesItem{
-					ID:        toolCall.ID,
+					ID:        itemID,
 					Type:      "function_call",
 					CallID:    toolCall.ID,
 					Name:      toolCall.Function.Name,
@@ -2381,6 +2499,28 @@ func convertUsageToResponses(usage *model.Usage) *ResponsesUsage {
 
 func generateItemID() string {
 	return fmt.Sprintf("item_%s", lo.RandomString(16, lo.AlphanumericCharset))
+}
+
+func generateFunctionCallItemID() string {
+	return fmt.Sprintf("fc_%s", lo.RandomString(16, lo.AlphanumericCharset))
+}
+
+func nativeFunctionCallItemIDs(raw json.RawMessage) map[string]string {
+	var items []struct {
+		Type   string `json:"type"`
+		ID     string `json:"id"`
+		CallID string `json:"call_id"`
+	}
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil
+	}
+	ids := make(map[string]string)
+	for _, item := range items {
+		if item.Type == "function_call" && item.CallID != "" && strings.HasPrefix(item.ID, "fc_") {
+			ids[item.CallID] = item.ID
+		}
+	}
+	return ids
 }
 
 // validateReasoningEffort whitelists the values OpenAI's Responses API

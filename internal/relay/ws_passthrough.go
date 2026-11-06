@@ -230,6 +230,11 @@ func (ra *relayAttempt) buildWSPassthroughRequestPayload() ([]byte, error) {
 			return nil, err
 		}
 	}
+	var err error
+	body, err = openaiOutbound.NormalizeResponsesRequestFunctionCallIDs(body)
+	if err != nil {
+		return nil, err
+	}
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err

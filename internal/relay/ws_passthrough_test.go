@@ -798,3 +798,47 @@ func newTestWSConnPair(t *testing.T) (*websocket.Conn, *websocket.Conn) {
 		return nil, nil
 	}
 }
+
+func TestWSPassthroughRequestPayloadNormalizesFunctionCallIDs(t *testing.T) {
+	for _, id := range []string{"call_legacy", "item_legacy", "fc_native"} {
+		t.Run(id, func(t *testing.T) {
+			raw := []byte(`{"model":"client","native":{"counter":9007199254740993,"null":null},"input":[{"type":"function_call","id":"` + id + `","call_id":"call_pair","name":"lookup","arguments":"{}","native":{"counter":9007199254740993}},{"type":"item_reference","id":"` + id + `"},{"type":"function_call_output","call_id":"call_pair","output":"ok"},{"type":"function_call","call_id":"call_missing_id","name":"lookup","arguments":"{}"}]}`)
+			ra := &relayAttempt{relayRequest: &relayRequest{internalRequest: &transformerModel.InternalLLMRequest{Model: "upstream"}, rawBody: raw}}
+			payload, err := ra.buildWSPassthroughRequestPayload()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded struct {
+				Native json.RawMessage              `json:"native"`
+				Input  []map[string]json.RawMessage `json:"input"`
+			}
+			if err := json.Unmarshal(payload, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			var gotID string
+			if err := json.Unmarshal(decoded.Input[0]["id"], &gotID); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(gotID, "fc_") || (id == "fc_native" && gotID != id) {
+				t.Fatalf("unexpected function_call id: %q", gotID)
+			}
+			if string(decoded.Input[1]["id"]) != string(decoded.Input[0]["id"]) {
+				t.Fatalf("item_reference no longer matches function_call: %s", payload)
+			}
+			for _, index := range []int{0, 2} {
+				if string(decoded.Input[index]["call_id"]) != `"call_pair"` {
+					t.Fatalf("call/output pairing changed: %s", payload)
+				}
+			}
+			if string(decoded.Native) != `{"counter":9007199254740993,"null":null}` || string(decoded.Input[0]["native"]) != `{"counter":9007199254740993}` {
+				t.Fatalf("unknown native fields changed: %s", payload)
+			}
+			if _, exists := decoded.Input[3]["id"]; exists {
+				t.Fatalf("missing optional id was added: %s", payload)
+			}
+			if !strings.Contains(string(raw), `"id":"`+id+`"`) {
+				t.Fatal("input raw body was mutated")
+			}
+		})
+	}
+}

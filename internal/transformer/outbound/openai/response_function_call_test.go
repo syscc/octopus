@@ -68,7 +68,7 @@ func TestSanitizeResponsesRawItemsAddsItemReference(t *testing.T) {
 	// Test that sanitizeResponsesRawItems automatically adds missing item_reference
 	rawItems := json.RawMessage(`[
 		{
-			"id": "item_xyz789",
+			"id": "fc_xyz789",
 			"type": "function_call",
 			"call_id": "call_abc123",
 			"name": "get_weather",
@@ -102,8 +102,8 @@ func TestSanitizeResponsesRawItemsAddsItemReference(t *testing.T) {
 	if !ok {
 		t.Fatal("function_call_output missing item_reference after sanitization")
 	}
-	if itemRef != "item_xyz789" {
-		t.Errorf("expected item_reference=item_xyz789, got %s", itemRef)
+	if itemRef != "fc_xyz789" {
+		t.Errorf("expected item_reference=fc_xyz789, got %s", itemRef)
 	}
 }
 
@@ -113,11 +113,11 @@ func TestSanitizeResponsesRawItemsFixesNullItemReference(t *testing.T) {
 		raw  string
 	}{
 		{"null value", `[
-			{"id":"item_xyz","type":"function_call","call_id":"call_1","name":"f","arguments":"{}"},
+			{"id":"fc_xyz","type":"function_call","call_id":"call_1","name":"f","arguments":"{}"},
 			{"type":"function_call_output","call_id":"call_1","item_reference":null,"output":{"text":"ok"}}
 		]`},
 		{"empty string", `[
-			{"id":"item_xyz","type":"function_call","call_id":"call_1","name":"f","arguments":"{}"},
+			{"id":"fc_xyz","type":"function_call","call_id":"call_1","name":"f","arguments":"{}"},
 			{"type":"function_call_output","call_id":"call_1","item_reference":"","output":{"text":"ok"}}
 		]`},
 	}
@@ -129,8 +129,8 @@ func TestSanitizeResponsesRawItemsFixesNullItemReference(t *testing.T) {
 				t.Fatalf("unmarshal: %v", err)
 			}
 			ref, ok := items[1]["item_reference"].(string)
-			if !ok || ref != "item_xyz" {
-				t.Errorf("expected item_reference=item_xyz, got %v", items[1]["item_reference"])
+			if !ok || ref != "fc_xyz" {
+				t.Errorf("expected item_reference=fc_xyz, got %v", items[1]["item_reference"])
 			}
 		})
 	}

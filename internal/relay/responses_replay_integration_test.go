@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -514,6 +515,284 @@ func TestStreamingResponsesReplayPreservesRawReasoningItems(t *testing.T) {
 	for _, expected := range []string{`"id":"rs_1"`, `"encrypted_content":"enc_sig"`, `"id":"msg_1"`} {
 		if !strings.Contains(window, expected) {
 			t.Fatalf("expected replay window to contain %s, got %s", expected, window)
+		}
+	}
+}
+
+func TestHTTPReplayNormalizesFunctionCallIDAtInput903(t *testing.T) {
+	history := make([]json.RawMessage, 903, 904)
+	for i := range history {
+		history[i] = json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"history"}]}`)
+	}
+	history[0] = json.RawMessage(`{"id":"rs_native","type":"reasoning","encrypted_content":"encrypted_history","summary":[],"native":9007199254740993}`)
+	history = append(history, json.RawMessage(`{"id":"call_legacy","type":"function_call","call_id":"call_pair","name":"lookup","arguments":"{}","status":"completed","native":{"counter":9007199254740993}}`))
+	window, err := json.Marshal(history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &wsConversationState{LastResponseID: "resp_previous", ReplayWindowItems: window}
+	current := &transformerModel.InternalLLMRequest{
+		Model:              "gpt-test",
+		PreviousResponseID: stringPtr("resp_previous"),
+		RawAPIFormat:       transformerModel.APIFormatOpenAIResponse,
+		RawInputItems:      json.RawMessage(`[{"type":"function_call_output","call_id":"call_pair","output":"ok"}]`),
+	}
+	replayed := state.BuildReplayRequest(current)
+	if replayed == nil {
+		t.Fatal("BuildReplayRequest failed")
+	}
+	request, err := (&openaiOutbound.ResponseOutbound{}).TransformRequest(context.Background(), replayed, "https://example.invalid/v1", "test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer request.Body.Close()
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Input              []map[string]json.RawMessage `json:"input"`
+		PreviousResponseID string                       `json:"previous_response_id"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Input) != 905 || decoded.PreviousResponseID != "" {
+		t.Fatalf("unexpected replay input or continuation: %s", body)
+	}
+	var itemID string
+	if err := json.Unmarshal(decoded.Input[903]["id"], &itemID); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(itemID, "fc_") {
+		t.Fatalf("input[903].id = %q, expected fc_ prefix", itemID)
+	}
+	for _, index := range []int{903, 904} {
+		if string(decoded.Input[index]["call_id"]) != `"call_pair"` {
+			t.Fatalf("call/output pairing changed at input[%d]: %s", index, body)
+		}
+	}
+	if string(decoded.Input[904]["output"]) != `"ok"` || string(decoded.Input[903]["native"]) != `{"counter":9007199254740993}` {
+		t.Fatalf("function call/output native fields changed: %s", body)
+	}
+	if string(decoded.Input[0]["encrypted_content"]) != `"encrypted_history"` || string(decoded.Input[0]["native"]) != "9007199254740993" {
+		t.Fatalf("reasoning history fields changed: %s", body)
+	}
+	if !strings.Contains(string(state.ReplayWindowItems), `"id":"call_legacy"`) {
+		t.Fatal("cached replay window was mutated")
+	}
+}
+
+func TestStreamingResponsesReplayResolvesClientFunctionCallReference(t *testing.T) {
+	ctx := context.Background()
+	adapter := &openaiInbound.ResponseInbound{}
+	raw := json.RawMessage(`[{"type":"reasoning","id":"rs_native","encrypted_content":"cipher","native":9007199254740993},{"type":"function_call","id":"fc_native","call_id":"call_x","name":"lookup","arguments":"{}"}]`)
+	originalRaw := string(raw)
+	start := &transformerModel.InternalLLMResponse{
+		ID: "resp_reference", Model: "gpt-test",
+		Choices: []transformerModel.Choice{{Delta: &transformerModel.Message{
+			Role: "assistant", ToolCalls: []transformerModel.ToolCall{{ID: "call_x", Type: "function", Function: transformerModel.FunctionCall{Name: "lookup", Arguments: "{}"}}},
+		}}},
+	}
+	addedBytes, err := adapter.TransformStream(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishReason := "tool_calls"
+	finish := &transformerModel.InternalLLMResponse{
+		ID: "resp_reference", Model: "gpt-test", RawResponsesOutputItems: raw,
+		Choices: []transformerModel.Choice{{FinishReason: &finishReason}},
+		Usage:   &transformerModel.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+	}
+	terminalBytes, err := adapter.TransformStream(ctx, finish)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clientID, terminalID string
+	for _, frame := range strings.Split(string(addedBytes)+string(terminalBytes), "\n\n") {
+		if !strings.HasPrefix(frame, "data: ") {
+			continue
+		}
+		var event struct {
+			Type string `json:"type"`
+			Item *struct {
+				ID   string `json:"id"`
+				Type string `json:"type"`
+			} `json:"item"`
+			Response *struct {
+				Output []struct {
+					ID   string `json:"id"`
+					Type string `json:"type"`
+				} `json:"output"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(frame, "data: ")), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == "response.output_item.added" && event.Item != nil && event.Item.Type == "function_call" {
+			clientID = event.Item.ID
+		}
+		if event.Type == "response.completed" && event.Response != nil {
+			for _, item := range event.Response.Output {
+				if item.Type == "function_call" {
+					terminalID = item.ID
+				}
+			}
+		}
+	}
+	if clientID == "" || clientID != terminalID {
+		t.Fatalf("client added/terminal IDs differ: %q / %q", clientID, terminalID)
+	}
+	response, err := adapter.GetInternalResponse(ctx)
+	if err != nil || response == nil {
+		t.Fatalf("get cached response: response=%v err=%v", response, err)
+	}
+	state := &wsConversationState{}
+	state.ApplySuccessfulTurn(&transformerModel.InternalLLMRequest{
+		Model: "gpt-test", RawAPIFormat: transformerModel.APIFormatOpenAIResponse,
+		RawInputItems: json.RawMessage(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"lookup"}]}]`),
+	}, response)
+	next := &transformerModel.InternalLLMRequest{
+		Model: "gpt-test", PreviousResponseID: stringPtr("resp_reference"),
+		RawAPIFormat:  transformerModel.APIFormatOpenAIResponse,
+		RawInputItems: json.RawMessage(`[{"type":"item_reference","id":"` + clientID + `"}]`),
+	}
+	replayed := state.BuildReplayRequest(next)
+	if replayed == nil {
+		t.Fatal("BuildReplayRequest failed")
+	}
+	request, err := (&openaiOutbound.ResponseOutbound{}).TransformRequest(ctx, replayed, "https://example.invalid/v1", "test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer request.Body.Close()
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Input []map[string]json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	var targetID, referenceID string
+	reasoningFound := false
+	for _, item := range payload.Input {
+		switch string(item["type"]) {
+		case `"function_call"`:
+			if err := json.Unmarshal(item["id"], &targetID); err != nil {
+				t.Fatal(err)
+			}
+			if string(item["call_id"]) != `"call_x"` {
+				t.Fatalf("call_id changed: %s", body)
+			}
+		case `"item_reference"`:
+			if err := json.Unmarshal(item["id"], &referenceID); err != nil {
+				t.Fatal(err)
+			}
+		case `"reasoning"`:
+			reasoningFound = true
+			if string(item["encrypted_content"]) != `"cipher"` || string(item["native"]) != "9007199254740993" {
+				t.Fatalf("reasoning native fields changed: %s", body)
+			}
+		}
+	}
+	if !reasoningFound {
+		t.Fatal("reasoning history was dropped")
+	}
+	if targetID != clientID || referenceID != targetID {
+		t.Fatalf("replay reference has no matching client target: client=%q target=%q reference=%q", clientID, targetID, referenceID)
+	}
+	if string(raw) != originalRaw || string(finish.RawResponsesOutputItems) != originalRaw {
+		t.Fatal("upstream raw output was mutated")
+	}
+}
+
+func TestResponsesPassthroughMetricsReplayPreservesNativeFunctionCallID(t *testing.T) {
+	for _, collector := range []string{"generic", "responses"} {
+		for _, addedID := range []string{"fc_native", "call_x"} {
+			t.Run(collector+"/"+addedID, func(t *testing.T) {
+				ctx := context.Background()
+				inAdapter := &openaiInbound.ResponseInbound{}
+				ra := &relayAttempt{
+					relayRequest: &relayRequest{inAdapter: inAdapter},
+					outAdapter:   &openaiOutbound.ResponseOutbound{},
+				}
+				frames := []string{
+					`{"type":"response.created","response":{"id":"resp_sidecar","model":"gpt-test","status":"in_progress","output":[]}}`,
+					`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"` + addedID + `","call_id":"call_x","name":"lookup","arguments":""}}`,
+					`{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"` + addedID + `","delta":"{}"}`,
+					`{"type":"response.completed","response":{"id":"resp_sidecar","model":"gpt-test","status":"completed","output":[{"type":"function_call","id":"fc_native","call_id":"call_x","name":"lookup","arguments":"{}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+				}
+				rawStream := []byte("data: " + strings.Join(frames, "\n\ndata: ") + "\n\n")
+				if collector == "generic" {
+					ra.collectPassthroughMetrics(ctx, rawStream)
+				} else {
+					ra.collectOpenAIResponsesPassthroughMetrics(ctx, rawStream)
+				}
+				response, err := inAdapter.GetInternalResponse(ctx)
+				if err != nil || response == nil {
+					t.Fatalf("get sidecar cache: response=%v err=%v", response, err)
+				}
+				var cached []struct {
+					ID     string `json:"id"`
+					CallID string `json:"call_id"`
+				}
+				if err := json.Unmarshal(response.RawResponsesOutputItems, &cached); err != nil {
+					t.Fatal(err)
+				}
+				if len(cached) != 1 || cached[0].ID != "fc_native" || cached[0].CallID != "call_x" {
+					t.Fatalf("sidecar replaced wire terminal IDs: %s", response.RawResponsesOutputItems)
+				}
+				state := &wsConversationState{}
+				state.ApplySuccessfulTurn(&transformerModel.InternalLLMRequest{
+					Model: "gpt-test", RawAPIFormat: transformerModel.APIFormatOpenAIResponse,
+					RawInputItems: json.RawMessage(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"lookup"}]}]`),
+				}, response)
+				replayed := state.BuildReplayRequest(&transformerModel.InternalLLMRequest{
+					Model: "gpt-test", PreviousResponseID: stringPtr("resp_sidecar"),
+					RawAPIFormat:  transformerModel.APIFormatOpenAIResponse,
+					RawInputItems: json.RawMessage(`[{"type":"item_reference","id":"fc_native"}]`),
+				})
+				if replayed == nil {
+					t.Fatal("BuildReplayRequest failed")
+				}
+				request, err := (&openaiOutbound.ResponseOutbound{}).TransformRequest(ctx, replayed, "https://example.invalid/v1", "test-key")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer request.Body.Close()
+				body, err := io.ReadAll(request.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var payload struct {
+					Input []struct {
+						Type   string `json:"type"`
+						ID     string `json:"id"`
+						CallID string `json:"call_id"`
+					} `json:"input"`
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatal(err)
+				}
+				var targetID, referenceID string
+				for _, item := range payload.Input {
+					switch item.Type {
+					case "function_call":
+						targetID = item.ID
+						if item.CallID != "call_x" {
+							t.Fatalf("call_id changed: %s", body)
+						}
+					case "item_reference":
+						referenceID = item.ID
+					}
+				}
+				if targetID != "fc_native" || referenceID != targetID {
+					t.Fatalf("native client reference lost target: %s", body)
+				}
+			})
 		}
 	}
 }

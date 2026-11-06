@@ -86,12 +86,17 @@ func (o *ResponseOutbound) TransformRequest(ctx context.Context, request *model.
 	return req, nil
 }
 
-// TransformRequestRaw keeps the original OpenAI Responses payload intact and only rewrites
-// the top-level model to the selected upstream model.
+// TransformRequestRaw preserves native fields while correcting legacy function-call
+// item IDs and rewriting the top-level model to the selected upstream model.
 func (o *ResponseOutbound) TransformRequestRaw(ctx context.Context, rawBody []byte, modelName, baseUrl, key string, query url.Values) (*http.Request, error) {
 	if len(rawBody) == 0 {
 		return nil, fmt.Errorf("raw body is empty")
 	}
+	normalizedBody, err := NormalizeResponsesRequestFunctionCallIDs(rawBody)
+	if err != nil {
+		return nil, err
+	}
+	rawBody = normalizedBody
 	if strings.TrimSpace(modelName) != "" {
 		rewrittenBody, err := rewriteRawResponsesRequestModel(rawBody, modelName)
 		if err != nil {
@@ -179,6 +184,10 @@ type rawJSONSpan struct {
 // for every top-level field with the requested name. Nested objects/arrays and
 // escaped strings are skipped without decoding or re-encoding their contents.
 func findTopLevelStringFieldSpans(raw []byte, field string) ([]rawJSONSpan, int, bool, error) {
+	return findTopLevelFieldSpans(raw, field, true)
+}
+
+func findTopLevelFieldSpans(raw []byte, field string, requireString bool) ([]rawJSONSpan, int, bool, error) {
 	index := skipJSONWhitespace(raw, 0)
 	if index >= len(raw) || raw[index] != '{' {
 		return nil, 0, false, fmt.Errorf("failed to decode raw responses request: top-level JSON value must be an object")
@@ -220,7 +229,7 @@ func findTopLevelStringFieldSpans(raw []byte, field string) ([]rawJSONSpan, int,
 			return nil, 0, false, fmt.Errorf("failed to decode raw responses request: invalid value for %q: %w", key, err)
 		}
 		if key == field {
-			if raw[valueStart] != '"' {
+			if requireString && raw[valueStart] != '"' {
 				return nil, 0, false, fmt.Errorf("responses model must be a string")
 			}
 			spans = append(spans, rawJSONSpan{start: valueStart, end: valueEnd})
@@ -406,7 +415,7 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 					Name: streamEvent.Name,
 				},
 			}
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStart, ID: base.ID, Model: base.Model, Index: base.Index, ToolCall: &toolCall})
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStart, ID: base.ID, Model: base.Model, Index: base.Index, ToolCall: &toolCall, ContentBlock: &model.StreamContentBlock{Type: "function_call", ID: lo.FromPtr(streamEvent.ItemID)}})
 			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallDelta, ID: base.ID, Model: base.Model, Index: base.Index, ToolCall: &toolCall, Delta: &model.StreamDelta{Arguments: streamEvent.Delta}})
 		}
 
@@ -421,7 +430,7 @@ func (o *ResponseOutbound) TransformStreamEvent(ctx context.Context, eventData [
 					Name: streamEvent.Item.Name,
 				},
 			}
-			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStart, ID: base.ID, Model: base.Model, Index: base.Index, ToolCall: &toolCall})
+			events = append(events, model.StreamEvent{Kind: model.StreamEventKindToolCallStart, ID: base.ID, Model: base.Model, Index: base.Index, ToolCall: &toolCall, ContentBlock: &model.StreamContentBlock{Type: "function_call", ID: streamEvent.Item.ID}})
 		}
 
 	case "response.reasoning_summary_text.delta":
@@ -1925,10 +1934,92 @@ func ensureResponsesReasoningSummary(item *ResponsesItem) {
 	}
 }
 
+// NormalizeResponsesRequestFunctionCallIDs repairs existing invalid function-call
+// IDs in native requests. Missing optional IDs and unrelated fields are preserved.
+func NormalizeResponsesRequestFunctionCallIDs(raw []byte) ([]byte, error) {
+	spans, _, _, err := findTopLevelFieldSpans(raw, "input", false)
+	if err != nil {
+		return nil, err
+	}
+	result := raw
+	for index := len(spans) - 1; index >= 0; index-- {
+		span := spans[index]
+		input := raw[span.start:span.end]
+		if normalized, changed := normalizeResponsesRawFunctionCallIDs(input, false); changed {
+			result = replaceRawJSON(result, span.start, span.end, normalized)
+		}
+	}
+	return result, nil
+}
+
+func normalizeResponsesRawFunctionCallIDs(raw json.RawMessage, fillMissing bool) (json.RawMessage, bool) {
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(raw, &rawItems); err != nil {
+		return raw, false
+	}
+	items := make([]map[string]json.RawMessage, len(rawItems))
+	dirty := make([]bool, len(rawItems))
+	replacedIDs := make(map[string]string)
+	for index, rawItem := range rawItems {
+		if err := json.Unmarshal(rawItem, &items[index]); err != nil {
+			continue
+		}
+		item := items[index]
+		if decodeRawString(item["type"]) != "function_call" {
+			continue
+		}
+		oldID := decodeRawString(item["id"])
+		if strings.HasPrefix(oldID, "fc_") || (oldID == "" && (!fillMissing || decodeRawString(item["call_id"]) == "")) {
+			continue
+		}
+		newID := generateResponsesItemID()
+		item["id"], _ = json.Marshal(newID)
+		dirty[index] = true
+		if oldID != "" {
+			replacedIDs[oldID] = newID
+		}
+	}
+	for index, item := range items {
+		field := ""
+		switch decodeRawString(item["type"]) {
+		case "function_call_output":
+			field = "item_reference"
+		case "item_reference":
+			field = "id"
+		}
+		if field != "" {
+			if replacement, ok := replacedIDs[decodeRawString(item[field])]; ok {
+				item[field], _ = json.Marshal(replacement)
+				dirty[index] = true
+			}
+		}
+	}
+	changed := false
+	for index, modified := range dirty {
+		if modified {
+			encoded, err := json.Marshal(items[index])
+			if err != nil {
+				return raw, false
+			}
+			rawItems[index] = encoded
+			changed = true
+		}
+	}
+	if !changed {
+		return raw, false
+	}
+	encoded, err := json.Marshal(rawItems)
+	if err != nil {
+		return raw, false
+	}
+	return encoded, true
+}
+
 func sanitizeResponsesRawItems(raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
 		return nil
 	}
+	raw, _ = normalizeResponsesRawFunctionCallIDs(raw, true)
 
 	var items []map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
@@ -2196,19 +2287,19 @@ func (o *ResponseOutbound) PassthroughConfig() model.PassthroughConfig {
 	}
 }
 
-// generateResponsesItemID generates a unique ID for Responses API items (function_call, etc.).
-// Format matches OpenAI's pattern: item_<random_base62_string>
+// generateResponsesItemID generates a unique function-call item ID, independent
+// of the call_id used to pair the tool call with its output.
 func generateResponsesItemID() string {
 	b := make([]byte, 24)
 	if _, err := rand.Read(b); err != nil {
 		// fallback: use timestamp + counter
-		return fmt.Sprintf("item_%016x%08x", time.Now().UnixNano(), itemIDCounter.Add(1))
+		return fmt.Sprintf("fc_%016x%08x", time.Now().UnixNano(), itemIDCounter.Add(1))
 	}
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	for i := range b {
 		b[i] = charset[b[i]%byte(len(charset))]
 	}
-	return "item_" + string(b)
+	return "fc_" + string(b)
 }
 
 var itemIDCounter atomic.Uint64
